@@ -47,6 +47,12 @@ except Exception:  # pragma: no cover
         model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)  # loads .env into os.environ if present
+except Exception:
+    pass
+
 # ------------------------------------------------------------------------------
 # LangSmith <-> LangChain tracing env normalization (supports both legacy & V2)
 # ------------------------------------------------------------------------------

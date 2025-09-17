@@ -5,6 +5,7 @@ pydantic
 pydantic-settings
 python-dotenv
 orjson
+python-dotenv
 
 # CSV / ETL
 pandas
