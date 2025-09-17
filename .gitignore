@@ -1,0 +1,74 @@
+# ===== Python build/artifacts =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.pyo
+
+# Packaging
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+env/
+
+# ===== Tooling / tests / linters =====
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+ruff_cache/
+.pyre/
+.pytype/
+
+# ===== Editors / IDE =====
+.vscode/
+.idea/
+*.code-workspace
+
+# ===== Logs & temp =====
+logs/
+*.log
+*.tmp
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== OS crap =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Env & secrets =====
+.env
+.env.*
+!.env.example
+
+# ===== Project data =====
+# Track catalogs in Git, ale ignoruj runtime state/outbox (commitovat nechceš)
+workshops_ai/data/state/**
+!workshops_ai/data/state/.gitkeep
+workshops_ai/data/outbox/**
+!workshops_ai/data/outbox/.gitkeep
+
+# Katalogy ponech ve verzi (neignorovat)
+!workshops_ai/data/catalogs/**
+# Pokud bys exportoval i binární katalogy/artefakty, můžeš případně ignorovat:
+# workshops_ai/data/catalogs/*.parquet
+
+# ===== Embedding/model caches (lokální) =====
+.cache/
+.huggingface/
+
+# (Volitelné) Qdrant lokální data, pokud je mapuješ do repo složky:
+# qdrant_data/

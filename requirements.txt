@@ -1,0 +1,33 @@
+# Základ
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+orjson
+
+# CSV / ETL
+pandas
+python-dateutil
+tzdata
+
+# HTTP + retry + logy
+httpx
+tenacity
+structlog
+
+# RAG (volitelné, má podporu pro NumPy 2.x)
+qdrant-client[fastembed]
+fastembed
+onnxruntime
+
+# Lang řetězec
+langchain
+langchain-openai
+langgraph
+langsmith
+openai
+
+# Observability (volitelné)
+opentelemetry-sdk
+opentelemetry-exporter-otlp

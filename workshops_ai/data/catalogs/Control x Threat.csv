@@ -1,0 +1,879 @@
+Control;Threat;Value
+Cybersecurity strategy, Policies for information security and regular review of policies;Theft, infiltration, or modification of data during physical transfer;20
+Cybersecurity strategy, Policies for information security and regular review of policies;Falsification of identity, rights or permissions and their misuse;20
+Cybersecurity strategy, Policies for information security and regular review of policies;Retrieving data from improperly recycled or discarded media;20
+Cybersecurity strategy, Policies for information security and regular review of policies;Data input from untrusted sources;20
+Cybersecurity strategy, Policies for information security and regular review of policies;User error;20
+Cybersecurity strategy, Policies for information security and regular review of policies;Error of a privileged user;20
+Cybersecurity strategy, Policies for information security and regular review of policies;Error or failure of operations, maintenance, or an employee performing support services;20
+Cybersecurity strategy, Policies for information security and regular review of policies;Improper use of equipment;30
+Cybersecurity strategy, Policies for information security and regular review of policies;Incorrect disclosure of information;20
+Cybersecurity strategy, Policies for information security and regular review of policies;Use of unauthorized software;20
+Cybersecurity strategy, Policies for information security and regular review of policies;Use of unauthorized hardware;20
+Cybersecurity strategy, Policies for information security and regular review of policies;Illegal and unauthorized processing of data;30
+Cybersecurity strategy, Policies for information security and regular review of policies;Human communication failure;20
+Cybersecurity strategy, Policies for information security and regular review of policies;Social Engineering;20
+Cybersecurity strategy, Policies for information security and regular review of policies;Reputation damage;30
+Cybersecurity strategy, Policies for information security and regular review of policies;Using software that does not meet security requirements;30
+Cybersecurity strategy, Policies for information security and regular review of policies;Violation of internal policies or standards;30
+Cybersecurity strategy, Policies for information security and regular review of policies;Violation of laws or regulations;30
+Cybersecurity strategy, Policies for information security and regular review of policies;Copyright violation;30
+Cybersecurity strategy, Policies for information security and regular review of policies;Disruption of availability during an audit or other authorized security assessment;20
+Information security roles and responsibilities;Retrieving data from improperly recycled or discarded media;30
+Information security roles and responsibilities;Data input from untrusted sources;30
+Information security roles and responsibilities;Unauthorized intentional activity by users;40
+Information security roles and responsibilities;Unauthorized intentional activity by privileged users;40
+Information security roles and responsibilities;Unauthorized intentional actions by operators or employees providing support services;40
+Information security roles and responsibilities;User error;20
+Information security roles and responsibilities;Error of a privileged user;20
+Information security roles and responsibilities;Error or failure of operations, maintenance, or an employee performing support services;20
+Information security roles and responsibilities;Incorrect disclosure of information;20
+Information security roles and responsibilities;Illegal and unauthorized processing of data;20
+Information security roles and responsibilities;Lack of staff;30
+Information security roles and responsibilities;Violation of internal policies or standards;30
+Information security roles and responsibilities;Violation of laws or regulations;30
+Information security roles and responsibilities;Copyright violation;30
+Segregation of duties;Theft of digital identity;20
+Segregation of duties;Retrieving data from improperly recycled or discarded media;30
+Segregation of duties;Unauthorized intentional activity by users;40
+Segregation of duties;Unauthorized intentional activity by privileged users;40
+Segregation of duties;Unauthorized intentional actions by operators or employees providing support services;40
+Segregation of duties;User error;20
+Segregation of duties;Error of a privileged user;20
+Segregation of duties;Error or failure of operations, maintenance, or an employee performing support services;20
+Segregation of duties;Disclosure of information;30
+Segregation of duties;Incorrect disclosure of information;20
+Segregation of duties;Illegal and unauthorized processing of data;20
+Segregation of duties;Violation of internal policies or standards;30
+Segregation of duties;Violation of laws or regulations;30
+Segregation of duties;Copyright violation;30
+Management responsibilities;Coercion, extortion, corruption;20
+Management responsibilities;Retrieving data from improperly recycled or discarded media;20
+Management responsibilities;Data input from untrusted sources;30
+Management responsibilities;User error;20
+Management responsibilities;Error of a privileged user;20
+Management responsibilities;Error or failure of operations, maintenance, or an employee performing support services;20
+Management responsibilities;Disclosure of information;20
+Management responsibilities;Incorrect disclosure of information;20
+Management responsibilities;Use of unauthorized software;20
+Management responsibilities;Use of unauthorized hardware;20
+Management responsibilities;Illegal and unauthorized processing of data;20
+Management responsibilities;Human communication failure;20
+Management responsibilities;Poor planning and adaptation shortcomings;40
+Management responsibilities;Lack of staff;30
+Management responsibilities;Lack of resources;30
+Management responsibilities;Reputation damage;30
+Management responsibilities;Software design or development errors;30
+Management responsibilities;Using software that does not meet security requirements;30
+Management responsibilities;Violation of internal policies or standards;30
+Management responsibilities;Violation of laws or regulations;30
+Management responsibilities;Copyright violation;30
+Management responsibilities;Detectability – violation of anonymity or pseudonymity;20
+Management responsibilities;Identifiability;20
+Management responsibilities;Linkability;20
+Management responsibilities;Non-compliance with the legal basis - violation of the rights of the data subject;20
+Contact with authorities;Terrorist attack, sabotage, explosion;10
+Contact with authorities;Coercion, extortion, corruption;10
+Contact with authorities;The existence of a known software vulnerability;20
+Contact with authorities;Unauthorized manipulation of software or a hacker attack;10
+Contact with authorities;Malware infiltration;10
+Contact with authorities;Infiltration and modification of data – damage or loss of data;10
+Contact with authorities;Communication interception;10
+Contact with authorities;Web communication infiltration;10
+Contact with authorities;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);10
+Contact with authorities;Social Engineering;10
+Contact with authorities;Service provider failure;10
+Contact with special interest groups;Terrorist attack, sabotage, explosion;10
+Contact with special interest groups;Coercion, extortion, corruption;10
+Contact with special interest groups;The existence of a known software vulnerability;20
+Contact with special interest groups;Unauthorized manipulation of software or a hacker attack;10
+Contact with special interest groups;Malware infiltration;10
+Contact with special interest groups;Infiltration and modification of data – damage or loss of data;10
+Contact with special interest groups;Communication interception;10
+Contact with special interest groups;Web communication infiltration;10
+Contact with special interest groups;Theft of digital identity;10
+Contact with special interest groups;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);10
+Contact with special interest groups;Social Engineering;10
+Contact with special interest groups;Service provider failure;10
+Threat intelligence;Terrorist attack, sabotage, explosion;20
+Threat intelligence;Coercion, extortion, corruption;10
+Threat intelligence;The existence of a known software vulnerability;20
+Threat intelligence;Unauthorized manipulation of software or a hacker attack;10
+Threat intelligence;Malware infiltration;10
+Threat intelligence;Infiltration and modification of data – damage or loss of data;10
+Threat intelligence;Communication interception;10
+Threat intelligence;Web communication infiltration;10
+Threat intelligence;Theft of digital identity;10
+Threat intelligence;Unauthorized location detection;10
+Threat intelligence;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);10
+Threat intelligence;Unauthorized intentional activity by users;10
+Threat intelligence;Unauthorized intentional activity by privileged users;10
+Threat intelligence;Unauthorized intentional actions by operators or employees providing support services;10
+Threat intelligence;Social Engineering;10
+Threat intelligence;Service provider failure;10
+Information security in project management;Pollution, dust,  corrosion, frost;10
+Information security in project management;Water, humidity;10
+Information security in project management;Heat radiation;10
+Information security in project management;Harmful radiation, radiation, or electromagnetic pulses;10
+Information security in project management;Interference of electrical signals;10
+Information security in project management;Fire;10
+Information security in project management;Toxic substances in the area;10
+Information security in project management;Surrounding events and accidents with negative impact;10
+Information security in project management;Terrorist attack, sabotage, explosion;10
+Information security in project management;Climatic or meteorological event;10
+Information security in project management;Seismic event;10
+Information security in project management;Volcanic event;10
+Information security in project management;Pandemic / epidemic event;10
+Information security in project management;Damage caused by animals;10
+Information security in project management;Data input from untrusted sources;10
+Information security in project management;Denial of service;10
+Information security in project management;Poor planning and adaptation shortcomings;40
+Information security in project management;Lack of staff;30
+Information security in project management;Lack of resources;40
+Information security in project management;Employee strike or refusal to act;10
+Information security in project management;Software design or development errors;30
+Information security in project management;Using software that does not meet security requirements;30
+Information security in project management;Detectability – violation of anonymity or pseudonymity;20
+Information security in project management;Identifiability;20
+Information security in project management;Linkability;20
+Information security in project management;Non-compliance with the legal basis - violation of the rights of the data subject;20
+User end point devices and mobile devices security;Unauthorized use of devices and unauthorized access to devices;40
+User end point devices and mobile devices security;Physical theft or physical damage to devices or media;40
+User end point devices and mobile devices security;Theft, infiltration, or modification of data during physical transfer;40
+User end point devices and mobile devices security;Unauthorized manipulation of software or a hacker attack;20
+User end point devices and mobile devices security;Malware infiltration;30
+User end point devices and mobile devices security;Infiltration and modification of data – damage or loss of data;30
+User end point devices and mobile devices security;Communication interception;30
+User end point devices and mobile devices security;Falsification of identity, rights or permissions and their misuse;30
+User end point devices and mobile devices security;Theft of digital identity;30
+User end point devices and mobile devices security;Unauthorized location detection;50
+User end point devices and mobile devices security;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);20
+User end point devices and mobile devices security;User error;10
+User end point devices and mobile devices security;Error of a privileged user;10
+User end point devices and mobile devices security;Error or failure of operations, maintenance, or an employee performing support services;10
+User end point devices and mobile devices security;Improper use of equipment;10
+User end point devices and mobile devices security;Use of unauthorized software;20
+User end point devices and mobile devices security;Social Engineering;10
+User end point devices and mobile devices security;Using software that does not meet security requirements;10
+User end point devices and mobile devices security;Violation of internal policies or standards;10
+User end point devices and mobile devices security;Violation of laws or regulations;10
+User end point devices and mobile devices security;Copyright violation;10
+User end point devices and mobile devices security;Non-compliance with the legal basis - violation of the rights of the data subject;20
+Remote working policies and controls;Unauthorized use of devices and unauthorized access to devices;40
+Remote working policies and controls;Physical theft or physical damage to devices or media;40
+Remote working policies and controls;Theft, infiltration, or modification of data during physical transfer;40
+Remote working policies and controls;Unauthorized manipulation of software or a hacker attack;20
+Remote working policies and controls;Malware infiltration;30
+Remote working policies and controls;Infiltration and modification of data – damage or loss of data;30
+Remote working policies and controls;Communication interception;30
+Remote working policies and controls;Falsification of identity, rights or permissions and their misuse;30
+Remote working policies and controls;Theft of digital identity;30
+Remote working policies and controls;Unauthorized location detection;50
+Remote working policies and controls;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);20
+Remote working policies and controls;User error;10
+Remote working policies and controls;Error of a privileged user;10
+Remote working policies and controls;Improper use of equipment;10
+Remote working policies and controls;Use of unauthorized software;20
+Remote working policies and controls;Social Engineering;10
+Remote working policies and controls;Using software that does not meet security requirements;10
+Remote working policies and controls;Violation of internal policies or standards;10
+Remote working policies and controls;Violation of laws or regulations;10
+Remote working policies and controls;Copyright violation;10
+Remote working policies and controls;Non-compliance with the legal basis - violation of the rights of the data subject;20
+Screening (background checks);Coercion, extortion, corruption;20
+Screening (background checks);Unauthorized intentional activity by users;30
+Screening (background checks);Unauthorized intentional activity by privileged users;30
+Screening (background checks);Unauthorized intentional actions by operators or employees providing support services;30
+Screening (background checks);User error;10
+Screening (background checks);Error of a privileged user;10
+Screening (background checks);Error or failure of operations, maintenance, or an employee performing support services;10
+Screening (background checks);Disclosure of information;10
+Screening (background checks);Illegal and unauthorized processing of data;10
+Screening (background checks);Human communication failure;10
+Screening (background checks);Reputation damage;10
+Screening (background checks);Violation of internal policies or standards;10
+Screening (background checks);Violation of laws or regulations;10
+Screening (background checks);Copyright violation;10
+Screening (background checks);Non-compliance with the legal basis - violation of the rights of the data subject;10
+Terms, conditions and quailification criteria of employment;Coercion, extortion, corruption;20
+Terms, conditions and quailification criteria of employment;Unauthorized intentional activity by users;20
+Terms, conditions and quailification criteria of employment;Unauthorized intentional activity by privileged users;20
+Terms, conditions and quailification criteria of employment;Unauthorized intentional actions by operators or employees providing support services;20
+Terms, conditions and quailification criteria of employment;User error;20
+Terms, conditions and quailification criteria of employment;Error of a privileged user;20
+Terms, conditions and quailification criteria of employment;Error or failure of operations, maintenance, or an employee performing support services;20
+Terms, conditions and quailification criteria of employment;Disclosure of information;10
+Terms, conditions and quailification criteria of employment;Incorrect disclosure of information;20
+Terms, conditions and quailification criteria of employment;Use of unauthorized software;10
+Terms, conditions and quailification criteria of employment;Use of unauthorized hardware;10
+Terms, conditions and quailification criteria of employment;Illegal and unauthorized processing of data;10
+Terms, conditions and quailification criteria of employment;Human communication failure;10
+Terms, conditions and quailification criteria of employment;Employee strike or refusal to act;10
+Terms, conditions and quailification criteria of employment;Reputation damage;10
+Terms, conditions and quailification criteria of employment;Violation of internal policies or standards;10
+Terms, conditions and quailification criteria of employment;Violation of laws or regulations;10
+Terms, conditions and quailification criteria of employment;Copyright violation;10
+Terms, conditions and quailification criteria of employment;Non-compliance with the legal basis - violation of the rights of the data subject;10
+Information security awareness, education and training and security awareness development plan;Coercion, extortion, corruption;10
+Information security awareness, education and training and security awareness development plan;Theft, infiltration, or modification of data during physical transfer;40
+Information security awareness, education and training and security awareness development plan;Malware infiltration;20
+Information security awareness, education and training and security awareness development plan;Retrieving data from improperly recycled or discarded media;20
+Information security awareness, education and training and security awareness development plan;Data input from untrusted sources;20
+Information security awareness, education and training and security awareness development plan;Unauthorized intentional activity by users;20
+Information security awareness, education and training and security awareness development plan;Unauthorized intentional activity by privileged users;20
+Information security awareness, education and training and security awareness development plan;Unauthorized intentional actions by operators or employees providing support services;20
+Information security awareness, education and training and security awareness development plan;User error;40
+Information security awareness, education and training and security awareness development plan;Error of a privileged user;40
+Information security awareness, education and training and security awareness development plan;Error or failure of operations, maintenance, or an employee performing support services;40
+Information security awareness, education and training and security awareness development plan;Improper use of equipment;30
+Information security awareness, education and training and security awareness development plan;Disclosure of information;20
+Information security awareness, education and training and security awareness development plan;Incorrect disclosure of information;30
+Information security awareness, education and training and security awareness development plan;Use of unauthorized software;20
+Information security awareness, education and training and security awareness development plan;Use of unauthorized hardware;20
+Information security awareness, education and training and security awareness development plan;Illegal and unauthorized processing of data;20
+Information security awareness, education and training and security awareness development plan;Human communication failure;40
+Information security awareness, education and training and security awareness development plan;Poor planning and adaptation shortcomings;20
+Information security awareness, education and training and security awareness development plan;Employee strike or refusal to act;10
+Information security awareness, education and training and security awareness development plan;Social Engineering;50
+Information security awareness, education and training and security awareness development plan;Reputation damage;20
+Information security awareness, education and training and security awareness development plan;Software design or development errors;10
+Information security awareness, education and training and security awareness development plan;Using software that does not meet security requirements;20
+Information security awareness, education and training and security awareness development plan;Violation of internal policies or standards;20
+Information security awareness, education and training and security awareness development plan;Violation of laws or regulations;20
+Information security awareness, education and training and security awareness development plan;Copyright violation;20
+Information security awareness, education and training and security awareness development plan;Detectability – violation of anonymity or pseudonymity;10
+Information security awareness, education and training and security awareness development plan;Identifiability;10
+Information security awareness, education and training and security awareness development plan;Linkability;10
+Information security awareness, education and training and security awareness development plan;Non-compliance with the legal basis - violation of the rights of the data subject;20
+Disciplinary process;Unauthorized intentional activity by users;30
+Disciplinary process;Unauthorized intentional activity by privileged users;30
+Disciplinary process;Unauthorized intentional actions by operators or employees providing support services;30
+Disciplinary process;User error;10
+Disciplinary process;Error of a privileged user;10
+Disciplinary process;Error or failure of operations, maintenance, or an employee performing support services;10
+Disciplinary process;Improper use of equipment;10
+Disciplinary process;Disclosure of information;30
+Disciplinary process;Incorrect disclosure of information;30
+Disciplinary process;Use of unauthorized software;20
+Disciplinary process;Use of unauthorized hardware;20
+Disciplinary process;Illegal and unauthorized processing of data;30
+Disciplinary process;Human communication failure;30
+Disciplinary process;Employee strike or refusal to act;10
+Disciplinary process;Social Engineering;30
+Disciplinary process;Reputation damage;10
+Disciplinary process;Violation of internal policies or standards;20
+Disciplinary process;Violation of laws or regulations;20
+Disciplinary process;Copyright violation;20
+Disciplinary process;Non-compliance with the legal basis - violation of the rights of the data subject;10
+Responsibilities After Termination or Change of Employment;Unauthorized intentional activity by users;30
+Responsibilities After Termination or Change of Employment;Unauthorized intentional activity by privileged users;30
+Responsibilities After Termination or Change of Employment;Unauthorized intentional actions by operators or employees providing support services;30
+Responsibilities After Termination or Change of Employment;Reputation damage;20
+Acceptable use and handling of information assets;Pollution, dust,  corrosion, frost;30
+Acceptable use and handling of information assets;Water, humidity;30
+Acceptable use and handling of information assets;Heat radiation;30
+Acceptable use and handling of information assets;Harmful radiation, radiation, or electromagnetic pulses;30
+Acceptable use and handling of information assets;Interference of electrical signals;30
+Acceptable use and handling of information assets;Fire;30
+Acceptable use and handling of information assets;Unauthorized use of devices and unauthorized access to devices;30
+Acceptable use and handling of information assets;Physical theft or physical damage to devices or media;30
+Acceptable use and handling of information assets;Theft, infiltration, or modification of data during physical transfer;30
+Acceptable use and handling of information assets;Climatic or meteorological event;30
+Acceptable use and handling of information assets;Damage caused by animals;20
+Acceptable use and handling of information assets;Unauthorized manipulation of software or a hacker attack;20
+Acceptable use and handling of information assets;Malware infiltration;20
+Acceptable use and handling of information assets;Infiltration and modification of data – damage or loss of data;20
+Acceptable use and handling of information assets;Communication interception;20
+Acceptable use and handling of information assets;Unauthorized location detection;20
+Acceptable use and handling of information assets;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);20
+Acceptable use and handling of information assets;Retrieving data from improperly recycled or discarded media;30
+Acceptable use and handling of information assets;Unauthorized intentional activity by users;10
+Acceptable use and handling of information assets;Unauthorized intentional activity by privileged users;10
+Acceptable use and handling of information assets;Unauthorized intentional actions by operators or employees providing support services;10
+Acceptable use and handling of information assets;User error;20
+Acceptable use and handling of information assets;Error of a privileged user;20
+Acceptable use and handling of information assets;Error or failure of operations, maintenance, or an employee performing support services;20
+Acceptable use and handling of information assets;Improper use of equipment;30
+Acceptable use and handling of information assets;Use of unauthorized software;20
+Acceptable use and handling of information assets;Use of unauthorized hardware;20
+Acceptable use and handling of information assets;Software or service failure;10
+Acceptable use and handling of information assets;Device or system failure;10
+Acceptable use and handling of information assets;Overloading of the information system;10
+Acceptable use and handling of information assets;Telecommunication network failure;10
+Acceptable use and handling of information assets;Power system failure, power loss, or fluctuations in performance;10
+Acceptable use and handling of information assets;Failure of the cooling or ventilation system;10
+Acceptable use and handling of information assets;Office equipment failure;10
+Acceptable use and handling of information assets;Degradation of equipment or storage media (obsolescence);10
+Acceptable use and handling of information assets;Using software that does not meet security requirements;20
+Acceptable use and handling of information assets;Violation of internal policies or standards;10
+Acceptable use and handling of information assets;Violation of laws or regulations;10
+Acceptable use and handling of information assets;Copyright violation;10
+Return of information assets;Unauthorized use of devices and unauthorized access to devices;10
+Return of information assets;Retrieving data from improperly recycled or discarded media;30
+Return of information assets;Lack of resources;10
+Classification of information;User error;20
+Classification of information;Error of a privileged user;20
+Classification of information;Error or failure of operations, maintenance, or an employee performing support services;20
+Classification of information;Improper use of equipment;10
+Classification of information;Incorrect disclosure of information;20
+Classification of information;Illegal and unauthorized processing of data;10
+Classification of information;Violation of internal policies or standards;10
+Classification of information;Violation of laws or regulations;10
+Classification of information;Copyright violation;10
+Classification of information;Non-compliance with the legal basis - violation of the rights of the data subject;10
+Labelling of information;User error;20
+Labelling of information;Error of a privileged user;20
+Labelling of information;Error or failure of operations, maintenance, or an employee performing support services;20
+Labelling of information;Improper use of equipment;10
+Labelling of information;Incorrect disclosure of information;20
+Labelling of information;Illegal and unauthorized processing of data;20
+Labelling of information;Violation of internal policies or standards;10
+Labelling of information;Violation of laws or regulations;10
+Labelling of information;Copyright violation;10
+Labelling of information;Non-compliance with the legal basis - violation of the rights of the data subject;10
+Management of removable media;Unauthorized manipulation of software or a hacker attack;20
+Management of removable media;Malware infiltration;30
+Management of removable media;Infiltration and modification of data – damage or loss of data;20
+Management of removable media;Retrieving data from improperly recycled or discarded media;30
+Management of removable media;Data input from untrusted sources;20
+Management of removable media;Unauthorized intentional activity by users;10
+Management of removable media;Unauthorized intentional activity by privileged users;10
+Management of removable media;Unauthorized intentional actions by operators or employees providing support services;10
+Management of removable media;User error;10
+Management of removable media;Error of a privileged user;10
+Management of removable media;Error or failure of operations, maintenance, or an employee performing support services;10
+Management of removable media;Improper use of equipment;20
+Management of removable media;Violation of internal policies or standards;10
+Management of removable media;Violation of laws or regulations;10
+Management of removable media;Copyright violation;10
+Access control and policy;Unauthorized manipulation of software or a hacker attack;30
+Access control and policy;Malware infiltration;20
+Access control and policy;Infiltration and modification of data – damage or loss of data;30
+Access control and policy;Communication interception;20
+Access control and policy;Web communication infiltration;20
+Access control and policy;Falsification of identity, rights or permissions and their misuse;20
+Access control and policy;Theft of digital identity;20
+Access control and policy;Unauthorized intentional activity by users;30
+Access control and policy;Unauthorized intentional activity by privileged users;30
+Access control and policy;Unauthorized intentional actions by operators or employees providing support services;30
+Access control and policy;User error;20
+Access control and policy;Error of a privileged user;20
+Access control and policy;Error or failure of operations, maintenance, or an employee performing support services;20
+Access control and policy;Repudiation (Denial of activity);10
+Identity Management;Unauthorized manipulation of software or a hacker attack;30
+Identity Management;Malware infiltration;20
+Identity Management;Infiltration and modification of data – damage or loss of data;30
+Identity Management;Communication interception;20
+Identity Management;Web communication infiltration;20
+Identity Management;Falsification of identity, rights or permissions and their misuse;20
+Identity Management;Theft of digital identity;30
+Identity Management;Unauthorized intentional activity by users;30
+Identity Management;Unauthorized intentional activity by privileged users;30
+Identity Management;Unauthorized intentional actions by operators or employees providing support services;30
+Identity Management;User error;20
+Identity Management;Error of a privileged user;20
+Identity Management;Error or failure of operations, maintenance, or an employee performing support services;20
+Identity Management;Repudiation (Denial of activity);20
+User access rights management and review;Unauthorized manipulation of software or a hacker attack;40
+User access rights management and review;Malware infiltration;30
+User access rights management and review;Infiltration and modification of data – damage or loss of data;40
+User access rights management and review;Communication interception;20
+User access rights management and review;Web communication infiltration;20
+User access rights management and review;Falsification of identity, rights or permissions and their misuse;20
+User access rights management and review;Theft of digital identity;30
+User access rights management and review;Unauthorized intentional activity by users;30
+User access rights management and review;Unauthorized intentional activity by privileged users;30
+User access rights management and review;User error;20
+User access rights management and review;Repudiation (Denial of activity);10
+Privileged access rights management and review;Unauthorized manipulation of software or a hacker attack;50
+Privileged access rights management and review;Malware infiltration;40
+Privileged access rights management and review;Infiltration and modification of data – damage or loss of data;50
+Privileged access rights management and review;Communication interception;30
+Privileged access rights management and review;Web communication infiltration;30
+Privileged access rights management and review;Falsification of identity, rights or permissions and their misuse;20
+Privileged access rights management and review;Theft of digital identity;30
+Privileged access rights management and review;Unauthorized intentional activity by users;30
+Privileged access rights management and review;Unauthorized intentional activity by privileged users;40
+Privileged access rights management and review;Error of a privileged user;20
+Privileged access rights management and review;Repudiation (Denial of activity);10
+Management and use of secret authentication information and other credentials;Unauthorized manipulation of software or a hacker attack;50
+Management and use of secret authentication information and other credentials;Malware infiltration;40
+Management and use of secret authentication information and other credentials;Infiltration and modification of data – damage or loss of data;50
+Management and use of secret authentication information and other credentials;Communication interception;30
+Management and use of secret authentication information and other credentials;Web communication infiltration;30
+Management and use of secret authentication information and other credentials;Falsification of identity, rights or permissions and their misuse;20
+Management and use of secret authentication information and other credentials;Theft of digital identity;30
+Management and use of secret authentication information and other credentials;Unauthorized intentional activity by users;30
+Management and use of secret authentication information and other credentials;Unauthorized intentional activity by privileged users;40
+Management and use of secret authentication information and other credentials;Unauthorized intentional actions by operators or employees providing support services;30
+Management and use of secret authentication information and other credentials;User error;20
+Management and use of secret authentication information and other credentials;Error of a privileged user;20
+Management and use of secret authentication information and other credentials;Error or failure of operations, maintenance, or an employee performing support services;20
+Management and use of secret authentication information and other credentials;Repudiation (Denial of activity);10
+Information access restriction;Unauthorized manipulation of software or a hacker attack;40
+Information access restriction;Infiltration and modification of data – damage or loss of data;40
+Information access restriction;Web communication infiltration;20
+Information access restriction;Unauthorized or misdirected messages;20
+Information access restriction;Falsification of identity, rights or permissions and their misuse;20
+Information access restriction;Unauthorized intentional activity by users;30
+Information access restriction;Unauthorized intentional activity by privileged users;30
+Information access restriction;Unauthorized intentional actions by operators or employees providing support services;30
+Information access restriction;User error;20
+Information access restriction;Error of a privileged user;20
+Information access restriction;Error or failure of operations, maintenance, or an employee performing support services;20
+Information access restriction;Repudiation (Denial of activity);10
+Secure Authentication and multi factor authentication;Unauthorized manipulation of software or a hacker attack;50
+Secure Authentication and multi factor authentication;Infiltration and modification of data – damage or loss of data;40
+Secure Authentication and multi factor authentication;Communication interception;30
+Secure Authentication and multi factor authentication;Web communication infiltration;30
+Secure Authentication and multi factor authentication;Falsification of identity, rights or permissions and their misuse;20
+Secure Authentication and multi factor authentication;Theft of digital identity;40
+Secure Authentication and multi factor authentication;User error;20
+Secure Authentication and multi factor authentication;Error of a privileged user;20
+Secure Authentication and multi factor authentication;Repudiation (Denial of activity);10
+Network access control (NAC, 802.1x);Unauthorized use of devices and unauthorized access to devices;30
+Network access control (NAC, 802.1x);Unauthorized manipulation of software or a hacker attack;10
+Network access control (NAC, 802.1x);Malware infiltration;10
+Network access control (NAC, 802.1x);Infiltration and modification of data – damage or loss of data;10
+Network access control (NAC, 802.1x);Communication interception;20
+Network access control (NAC, 802.1x);Falsification of identity, rights or permissions and their misuse;10
+Network access control (NAC, 802.1x);Unauthorized intentional activity by users;20
+Network access control (NAC, 802.1x);Unauthorized intentional activity by privileged users;20
+Network access control (NAC, 802.1x);Unauthorized intentional actions by operators or employees providing support services;20
+Network access control (NAC, 802.1x);User error;10
+Network access control (NAC, 802.1x);Error of a privileged user;10
+Network access control (NAC, 802.1x);Error or failure of operations, maintenance, or an employee performing support services;10
+Network access control (NAC, 802.1x);Improper use of equipment;10
+Network access control (NAC, 802.1x);Use of unauthorized hardware;70
+Restricted use of privileged utility programs;Unauthorized manipulation of software or a hacker attack;10
+Restricted use of privileged utility programs;Malware infiltration;20
+Restricted use of privileged utility programs;Infiltration and modification of data – damage or loss of data;10
+Restricted use of privileged utility programs;Communication interception;10
+Restricted use of privileged utility programs;Web communication infiltration;10
+Restricted use of privileged utility programs;Unauthorized or misdirected messages;10
+Restricted use of privileged utility programs;Unauthorized intentional activity by users;10
+Restricted use of privileged utility programs;Unauthorized intentional activity by privileged users;10
+Restricted use of privileged utility programs;User error;10
+Restricted use of privileged utility programs;Error of a privileged user;10
+Restricted use of privileged utility programs;Use of unauthorized software;30
+Restricted use of privileged utility programs;Software or service failure;10
+Restricted use of privileged utility programs;Device or system failure;10
+Restricted use of privileged utility programs;Overloading of the information system;10
+Restricted use of privileged utility programs;Telecommunication network failure;10
+Restricted access to program source code;Software design or development errors;30
+Policy on the use of cryptographic controls and key management;Theft, infiltration, or modification of data during physical transfer;80
+Policy on the use of cryptographic controls and key management;Communication interception;70
+Policy on the use of cryptographic controls and key management;Web communication infiltration;20
+Policy on the use of cryptographic controls and key management;Unauthorized or misdirected messages;10
+Policy on the use of cryptographic controls and key management;Retrieving data from improperly recycled or discarded media;60
+Policy on the use of cryptographic controls and key management;Unauthorized intentional activity by users;30
+Policy on the use of cryptographic controls and key management;Unauthorized intentional activity by privileged users;10
+Policy on the use of cryptographic controls and key management;Unauthorized intentional actions by operators or employees providing support services;20
+Policy on the use of cryptographic controls and key management;Repudiation (Denial of activity);30
+Policy on the use of cryptographic controls and key management;Disclosure of information;70
+Policy on the use of cryptographic controls and key management;Detectability – violation of anonymity or pseudonymity;50
+Policy on the use of cryptographic controls and key management;Identifiability;50
+Policy on the use of cryptographic controls and key management;Linkability;50
+Physical security perimeter;Surrounding events and accidents with negative impact;70
+Physical security perimeter;Terrorist attack, sabotage, explosion;70
+Physical security perimeter;Unauthorized entry into premises;60
+Physical security perimeter;Unauthorized use of devices and unauthorized access to devices;50
+Physical security perimeter;Physical theft or physical damage to devices or media;50
+Physical security perimeter;Climatic or meteorological event;30
+Physical security perimeter;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);60
+Physical entry controls;Surrounding events and accidents with negative impact;50
+Physical entry controls;Terrorist attack, sabotage, explosion;50
+Physical entry controls;Unauthorized entry into premises;70
+Physical entry controls;Unauthorized use of devices and unauthorized access to devices;60
+Physical entry controls;Physical theft or physical damage to devices or media;60
+Physical entry controls;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);30
+Securing offices, rooms and facilities;Surrounding events and accidents with negative impact;40
+Securing offices, rooms and facilities;Terrorist attack, sabotage, explosion;40
+Securing offices, rooms and facilities;Unauthorized entry into premises;60
+Securing offices, rooms and facilities;Unauthorized use of devices and unauthorized access to devices;70
+Securing offices, rooms and facilities;Physical theft or physical damage to devices or media;70
+Securing offices, rooms and facilities;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);40
+Securing offices, rooms and facilities;Retrieving data from improperly recycled or discarded media;20
+Physical security monitoring;Surrounding events and accidents with negative impact;70
+Physical security monitoring;Terrorist attack, sabotage, explosion;70
+Physical security monitoring;Unauthorized entry into premises;80
+Physical security monitoring;Unauthorized use of devices and unauthorized access to devices;70
+Physical security monitoring;Physical theft or physical damage to devices or media;70
+Physical security monitoring;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);60
+Physical security monitoring;Retrieving data from improperly recycled or discarded media;20
+Physical security monitoring;Unauthorized intentional activity by users;20
+Physical security monitoring;Unauthorized intentional activity by privileged users;20
+Physical security monitoring;Unauthorized intentional actions by operators or employees providing support services;20
+Physical security monitoring;Error or failure of operations, maintenance, or an employee performing support services;20
+Physical security monitoring;Repudiation (Denial of activity);20
+Physical security monitoring;Improper use of equipment;10
+Redundancy of communication networks and systems;Pollution, dust,  corrosion, frost;20
+Redundancy of communication networks and systems;Water, humidity;20
+Redundancy of communication networks and systems;Heat radiation;20
+Redundancy of communication networks and systems;Harmful radiation, radiation, or electromagnetic pulses;20
+Redundancy of communication networks and systems;Interference of electrical signals;20
+Redundancy of communication networks and systems;Fire;20
+Redundancy of communication networks and systems;Surrounding events and accidents with negative impact;20
+Redundancy of communication networks and systems;Terrorist attack, sabotage, explosion;20
+Redundancy of communication networks and systems;Physical theft or physical damage to devices or media;20
+Redundancy of communication networks and systems;Damage caused by animals;20
+Redundancy of communication networks and systems;Software or service failure;60
+Redundancy of communication networks and systems;Device or system failure;60
+Redundancy of communication networks and systems;Overloading of the information system;60
+Redundancy of communication networks and systems;Telecommunication network failure;60
+Redundancy of communication networks and systems;Power system failure, power loss, or fluctuations in performance;60
+Redundancy of communication networks and systems;Failure of the cooling or ventilation system;60
+Redundancy of communication networks and systems;Office equipment failure;60
+Redundancy of communication networks and systems;Disruption of availability during an audit or other authorized security assessment;20
+Protecting against physical and environmental threats;Pollution, dust,  corrosion, frost;70
+Protecting against physical and environmental threats;Water, humidity;70
+Protecting against physical and environmental threats;Heat radiation;70
+Protecting against physical and environmental threats;Fire;70
+Protecting against physical and environmental threats;Toxic substances in the area;60
+Protecting against physical and environmental threats;Surrounding events and accidents with negative impact;50
+Protecting against physical and environmental threats;Terrorist attack, sabotage, explosion;50
+Protecting against physical and environmental threats;Climatic or meteorological event;50
+Protecting against physical and environmental threats;Seismic event;50
+Protecting against physical and environmental threats;Volcanic event;50
+Protecting against physical and environmental threats;Damage caused by animals;50
+Working in secure areas;Unauthorized use of devices and unauthorized access to devices;40
+Working in secure areas;Physical theft or physical damage to devices or media;40
+Working in secure areas;Error or failure of operations, maintenance, or an employee performing support services;70
+Working in secure areas;Improper use of equipment;60
+Equipment siting and protection;Pollution, dust,  corrosion, frost;70
+Equipment siting and protection;Water, humidity;70
+Equipment siting and protection;Heat radiation;70
+Equipment siting and protection;Harmful radiation, radiation, or electromagnetic pulses;70
+Equipment siting and protection;Interference of electrical signals;70
+Equipment siting and protection;Fire;70
+Equipment siting and protection;Toxic substances in the area;60
+Equipment siting and protection;Surrounding events and accidents with negative impact;40
+Equipment siting and protection;Terrorist attack, sabotage, explosion;50
+Equipment siting and protection;Unauthorized use of devices and unauthorized access to devices;40
+Equipment siting and protection;Physical theft or physical damage to devices or media;40
+Equipment siting and protection;Climatic or meteorological event;50
+Equipment siting and protection;Seismic event;50
+Equipment siting and protection;Volcanic event;50
+Equipment siting and protection;Damage caused by animals;60
+Supporting utilities security and controls;Power system failure, power loss, or fluctuations in performance;80
+Supporting utilities security and controls;Failure of the cooling or ventilation system;80
+Cabling security;Harmful radiation, radiation, or electromagnetic pulses;20
+Cabling security;Interference of electrical signals;20
+Cabling security;Device or system failure;40
+Cabling security;Telecommunication network failure;40
+Cabling security;Power system failure, power loss, or fluctuations in performance;40
+Cabling security;Failure of the cooling or ventilation system;40
+Cabling security;Office equipment failure;40
+Equipment maintenance;Pollution, dust,  corrosion, frost;70
+Equipment maintenance;Device or system failure;40
+Equipment maintenance;Telecommunication network failure;40
+Equipment maintenance;Power system failure, power loss, or fluctuations in performance;40
+Equipment maintenance;Failure of the cooling or ventilation system;40
+Equipment maintenance;Office equipment failure;40
+Storage media security;Unauthorized use of devices and unauthorized access to devices;40
+Storage media security;Physical theft or physical damage to devices or media;40
+Storage media security;Retrieving data from improperly recycled or discarded media;30
+Storage media security;Error or failure of operations, maintenance, or an employee performing support services;30
+Storage media security;Degradation of equipment or storage media (obsolescence);20
+Security of equipment and assets off-premises;Unauthorized use of devices and unauthorized access to devices;30
+Security of equipment and assets off-premises;Physical theft or physical damage to devices or media;30
+Security of equipment and assets off-premises;Theft, infiltration, or modification of data during physical transfer;30
+Secure disposal or re-use of equipment;Unauthorized use of devices and unauthorized access to devices;10
+Secure disposal or re-use of equipment;Retrieving data from improperly recycled or discarded media;60
+Secure disposal or re-use of equipment;Degradation of equipment or storage media (obsolescence);30
+Secure disposal or re-use of equipment;Lack of resources;10
+Clear desk and clear screen policy;Physical theft or physical damage to devices or media;40
+Clear desk and clear screen policy;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);40
+Documented operating procedures;User error;30
+Documented operating procedures;Error of a privileged user;50
+Documented operating procedures;Error or failure of operations, maintenance, or an employee performing support services;50
+Documented operating procedures;Lack of staff;20
+Documented operating procedures;Disruption of availability during an audit or other authorized security assessment;20
+Capacity management;Software or service failure;30
+Capacity management;Device or system failure;30
+Capacity management;Overloading of the information system;70
+Capacity management;Telecommunication network failure;30
+Capacity management;Power system failure, power loss, or fluctuations in performance;30
+Capacity management;Failure of the cooling or ventilation system;30
+Capacity management;Office equipment failure;30
+Four-eyes principle (principle of dual control);Unauthorized intentional activity by users;70
+Four-eyes principle (principle of dual control);Unauthorized intentional activity by privileged users;70
+Four-eyes principle (principle of dual control);Unauthorized intentional actions by operators or employees providing support services;70
+Four-eyes principle (principle of dual control);Repudiation (Denial of activity);40
+Separation of development, testing and operational environments;Software design or development errors;30
+Controls against malware;The existence of a known software vulnerability;20
+Controls against malware;Unauthorized manipulation of software or a hacker attack;40
+Controls against malware;Malware infiltration;70
+Configuration management, configuration management database (CMDB);The existence of a known software vulnerability;10
+Configuration management, configuration management database (CMDB);Unauthorized manipulation of software or a hacker attack;10
+Configuration management, configuration management database (CMDB);Malware infiltration;10
+Configuration management, configuration management database (CMDB);Infiltration and modification of data – damage or loss of data;10
+Configuration management, configuration management database (CMDB);Communication interception;10
+Configuration management, configuration management database (CMDB);Web communication infiltration;10
+Configuration management, configuration management database (CMDB);Unauthorized or misdirected messages;40
+Configuration management, configuration management database (CMDB);User error;30
+Configuration management, configuration management database (CMDB);Error of a privileged user;30
+Configuration management, configuration management database (CMDB);Error or failure of operations, maintenance, or an employee performing support services;30
+System hardening (hardening compliance) ;The existence of a known software vulnerability;20
+System hardening (hardening compliance) ;Unauthorized manipulation of software or a hacker attack;20
+System hardening (hardening compliance) ;Malware infiltration;20
+System hardening (hardening compliance) ;Infiltration and modification of data – damage or loss of data;20
+System hardening (hardening compliance) ;Communication interception;20
+System hardening (hardening compliance) ;Web communication infiltration;20
+System hardening (hardening compliance) ;Unauthorized or misdirected messages;20
+System hardening (hardening compliance) ;User error;20
+System hardening (hardening compliance) ;Error of a privileged user;20
+System hardening (hardening compliance) ;Error or failure of operations, maintenance, or an employee performing support services;20
+Information deletion - physical disposal (e.g. shredder, drill, hammer, degaussing, HDD/CD/DVD shredder);Retrieving data from improperly recycled or discarded media;80
+Information deletion - physical disposal (e.g. shredder, drill, hammer, degaussing, HDD/CD/DVD shredder);Degradation of equipment or storage media (obsolescence);50
+Information deletion - secure electronic information disposal (e.g. software shredder);Infiltration and modification of data – damage or loss of data;20
+Information deletion - secure electronic information disposal (e.g. software shredder);Retrieving data from improperly recycled or discarded media;70
+Data masking (e.g. anonymization and tokenization);Infiltration and modification of data – damage or loss of data;20
+Data masking (e.g. anonymization and tokenization);Retrieving data from improperly recycled or discarded media;50
+Data masking (e.g. anonymization and tokenization);Detectability – violation of anonymity or pseudonymity;60
+Data masking (e.g. anonymization and tokenization);Identifiability;60
+Data masking (e.g. anonymization and tokenization);Linkability;60
+Data leakage prevention, Data loss prevention system (DLP);Unauthorized intentional activity by users;50
+Data leakage prevention, Data loss prevention system (DLP);Unauthorized intentional activity by privileged users;50
+Data leakage prevention, Data loss prevention system (DLP);Unauthorized intentional actions by operators or employees providing support services;50
+Data leakage prevention, Data loss prevention system (DLP);User error;30
+Data leakage prevention, Data loss prevention system (DLP);Error of a privileged user;30
+Data leakage prevention, Data loss prevention system (DLP);Error or failure of operations, maintenance, or an employee performing support services;30
+Data leakage prevention, Data loss prevention system (DLP);Disclosure of information;50
+Data leakage prevention, Data loss prevention system (DLP);Incorrect disclosure of information;70
+Data leakage prevention, Data loss prevention system (DLP);Violation of internal policies or standards;30
+Data leakage prevention, Data loss prevention system (DLP);Violation of laws or regulations;20
+Data leakage prevention, Data loss prevention system (DLP);Copyright violation;20
+Data leakage prevention, Data loss prevention system (DLP);Detectability – violation of anonymity or pseudonymity;20
+Information backup;Infiltration and modification of data – damage or loss of data;60
+Information backup;Degradation of equipment or storage media (obsolescence);50
+Event logging and secure log management;The existence of a known software vulnerability;30
+Event logging and secure log management;Unauthorized manipulation of software or a hacker attack;30
+Event logging and secure log management;Malware infiltration;30
+Event logging and secure log management;Infiltration and modification of data – damage or loss of data;30
+Event logging and secure log management;Communication interception;30
+Event logging and secure log management;Web communication infiltration;30
+Event logging and secure log management;Unauthorized or misdirected messages;30
+Event logging and secure log management;Falsification of identity, rights or permissions and their misuse;30
+Event logging and secure log management;Theft of digital identity;30
+Event logging and secure log management;Data input from untrusted sources;30
+Event logging and secure log management;Unauthorized intentional activity by users;30
+Event logging and secure log management;Unauthorized intentional activity by privileged users;30
+Event logging and secure log management;Unauthorized intentional actions by operators or employees providing support services;30
+Event logging and secure log management;Repudiation (Denial of activity);50
+Event logging and secure log management;Improper use of equipment;50
+Event logging and secure log management;Disclosure of information;30
+Event logging and secure log management;Incorrect disclosure of information;30
+Event logging and secure log management;Use of unauthorized software;30
+Event logging and secure log management;Use of unauthorized hardware;30
+Event logging and secure log management;Illegal and unauthorized processing of data;30
+Event logging and secure log management;Denial of service;20
+Event logging and secure log management;Software or service failure;10
+Event logging and secure log management;Device or system failure;10
+Event logging and secure log management;Overloading of the information system;10
+Event logging and secure log management;Telecommunication network failure;10
+Event logging and secure log management;Power system failure, power loss, or fluctuations in performance;10
+Event logging and secure log management;Failure of the cooling or ventilation system;10
+Event logging and secure log management;Degradation of equipment or storage media (obsolescence);10
+Clock synchronisation;Unauthorized manipulation of software or a hacker attack;10
+Clock synchronisation;Malware infiltration;10
+Clock synchronisation;Infiltration and modification of data – damage or loss of data;10
+Clock synchronisation;Communication interception;10
+Clock synchronisation;Web communication infiltration;10
+Clock synchronisation;Unauthorized or misdirected messages;10
+Clock synchronisation;Unauthorized intentional activity by users;10
+Clock synchronisation;Unauthorized intentional activity by privileged users;10
+Clock synchronisation;Unauthorized intentional actions by operators or employees providing support services;10
+Clock synchronisation;Repudiation (Denial of activity);20
+Security monitoring (Monitoring activities);The existence of a known software vulnerability;50
+Security monitoring (Monitoring activities);Unauthorized manipulation of software or a hacker attack;70
+Security monitoring (Monitoring activities);Malware infiltration;70
+Security monitoring (Monitoring activities);Infiltration and modification of data – damage or loss of data;70
+Security monitoring (Monitoring activities);Communication interception;70
+Security monitoring (Monitoring activities);Web communication infiltration;70
+Security monitoring (Monitoring activities);Unauthorized or misdirected messages;70
+Security monitoring (Monitoring activities);Falsification of identity, rights or permissions and their misuse;70
+Security monitoring (Monitoring activities);Theft of digital identity;50
+Security monitoring (Monitoring activities);Data input from untrusted sources;60
+Security monitoring (Monitoring activities);Unauthorized intentional activity by users;70
+Security monitoring (Monitoring activities);Unauthorized intentional activity by privileged users;70
+Security monitoring (Monitoring activities);Unauthorized intentional actions by operators or employees providing support services;70
+Security monitoring (Monitoring activities);Repudiation (Denial of activity);60
+Security monitoring (Monitoring activities);Improper use of equipment;60
+Security monitoring (Monitoring activities);Disclosure of information;30
+Security monitoring (Monitoring activities);Incorrect disclosure of information;30
+Security monitoring (Monitoring activities);Use of unauthorized software;50
+Security monitoring (Monitoring activities);Use of unauthorized hardware;50
+Security monitoring (Monitoring activities);Illegal and unauthorized processing of data;50
+Security monitoring (Monitoring activities);Denial of service;20
+Security monitoring (Monitoring activities);Software or service failure;20
+Security monitoring (Monitoring activities);Device or system failure;20
+Security monitoring (Monitoring activities);Overloading of the information system;20
+Security monitoring (Monitoring activities);Telecommunication network failure;20
+Security monitoring (Monitoring activities);Power system failure, power loss, or fluctuations in performance;20
+Security monitoring (Monitoring activities);Failure of the cooling or ventilation system;20
+Security monitoring (Monitoring activities);Degradation of equipment or storage media (obsolescence);20
+Intrusion detection system (IDS) and intrusion prevention system (IPS);The existence of a known software vulnerability;30
+Intrusion detection system (IDS) and intrusion prevention system (IPS);Unauthorized manipulation of software or a hacker attack;30
+Intrusion detection system (IDS) and intrusion prevention system (IPS);Malware infiltration;30
+Intrusion detection system (IDS) and intrusion prevention system (IPS);Infiltration and modification of data – damage or loss of data;30
+Intrusion detection system (IDS) and intrusion prevention system (IPS);Communication interception;30
+Intrusion detection system (IDS) and intrusion prevention system (IPS);Web communication infiltration;30
+Intrusion detection system (IDS) and intrusion prevention system (IPS);Unauthorized or misdirected messages;30
+Intrusion detection system (IDS) and intrusion prevention system (IPS);Unauthorized intentional activity by users;30
+Intrusion detection system (IDS) and intrusion prevention system (IPS);Unauthorized intentional activity by privileged users;30
+Intrusion detection system (IDS) and intrusion prevention system (IPS);Unauthorized intentional actions by operators or employees providing support services;30
+Installation of software on operational systems procedures;Use of unauthorized software;30
+Device installation in networks and information systems procedures;Use of unauthorized hardware;30
+Management of technical vulnerabilities;The existence of a known software vulnerability;70
+Application of public and vendor-provided lists for identifying vulnerabilities in IT assets;The existence of a known software vulnerability;30
+Vulnerability scaner (tool);The existence of a known software vulnerability;50
+Controls during audit testing of IS;Use of unauthorized software;20
+Controls during audit testing of IS;Denial of service;20
+Controls during audit testing of IS;Overloading of the information system;20
+Controls during audit testing of IS;Disruption of availability during an audit or other authorized security assessment;70
+Network Controls;Unauthorized manipulation of software or a hacker attack;30
+Network Controls;Malware infiltration;30
+Network Controls;Infiltration and modification of data – damage or loss of data;30
+Network Controls;Communication interception;40
+Network Controls;Web communication infiltration;40
+Network Controls;Unauthorized or misdirected messages;40
+Network Controls;Unauthorized intentional activity by users;20
+Network Controls;Unauthorized intentional activity by privileged users;20
+Network Controls;Denial of service;40
+Network Controls;Service provider failure;20
+Security of network services;Unauthorized manipulation of software or a hacker attack;30
+Security of network services;Communication interception;40
+Security of network services;Web communication infiltration;40
+Security of network services;Unauthorized or misdirected messages;40
+Security of network services;Unauthorized intentional activity by users;20
+Security of network services;Unauthorized intentional activity by privileged users;20
+Security of network services;Denial of service;50
+Security of network services;Service provider failure;40
+DNS security;Communication interception;30
+DNS security;Unauthorized or misdirected messages;50
+Firewall;The existence of a known software vulnerability;20
+Firewall;Unauthorized manipulation of software or a hacker attack;50
+Firewall;Malware infiltration;40
+Firewall;Infiltration and modification of data – damage or loss of data;30
+Firewall;Communication interception;40
+Firewall;Web communication infiltration;40
+Firewall;Unauthorized or misdirected messages;40
+Maintaining a list of input/output points in network;Communication interception;10
+Maintaining a list of input/output points in network;Web communication infiltration;10
+Maintaining a list of input/output points in network;Unauthorized or misdirected messages;20
+Maintaining a list of input/output points in network;User error;10
+Maintaining a list of input/output points in network;Error of a privileged user;10
+Maintaining a list of input/output points in network;Error or failure of operations, maintenance, or an employee performing support services;10
+Segregation in networks;Unauthorized manipulation of software or a hacker attack;20
+Segregation in networks;Malware infiltration;20
+Segregation in networks;Infiltration and modification of data – damage or loss of data;20
+Segregation in networks;Communication interception;20
+Segregation in networks;Web communication infiltration;10
+Segregation in networks;Unauthorized or misdirected messages;20
+Segregation in networks;User error;10
+Segregation in networks;Error of a privileged user;10
+Segregation in networks;Error or failure of operations, maintenance, or an employee performing support services;10
+Segregation in networks;Telecommunication network failure;10
+Web filtering;Malware infiltration;20
+Web filtering;Infiltration and modification of data – damage or loss of data;10
+Web filtering;Communication interception;10
+Web filtering;Web communication infiltration;20
+Web filtering;User error;10
+Web filtering;Error of a privileged user;10
+Web filtering;Error or failure of operations, maintenance, or an employee performing support services;10
+Protection against DoS and DDoS attacks;Denial of service;80
+Blocking communication and connection through unauthorized ports;Unauthorized manipulation of software or a hacker attack;20
+Blocking communication and connection through unauthorized ports;Malware infiltration;20
+Blocking communication and connection through unauthorized ports;Infiltration and modification of data – damage or loss of data;10
+Blocking communication and connection through unauthorized ports;Communication interception;20
+Blocking communication and connection through unauthorized ports;Web communication infiltration;20
+Blocking communication and connection through unauthorized ports;Unauthorized or misdirected messages;10
+Content filtering;Malware infiltration;20
+Content filtering;Infiltration and modification of data – damage or loss of data;10
+Content filtering;Communication interception;10
+Content filtering;Web communication infiltration;10
+Content filtering;User error;10
+Content filtering;Error of a privileged user;10
+Content filtering;Error or failure of operations, maintenance, or an employee performing support services;10
+Information transfer policies, procedures and agreements;Infiltration and modification of data – damage or loss of data;10
+Information transfer policies, procedures and agreements;Communication interception;20
+Information transfer policies, procedures and agreements;Web communication infiltration;20
+Information transfer policies, procedures and agreements;Unauthorized or misdirected messages;30
+Email security (DMARC, SPF, DKIM);Unauthorized or misdirected messages;50
+S/MIME - Email encryption;Communication interception;60
+S/MIME - Email encryption;Falsification of identity, rights or permissions and their misuse;30
+S/MIME - Email encryption;Disclosure of information;50
+Confidentiality or nondisclosure agreements (NDA);Unauthorized intentional actions by operators or employees providing support services;30
+Confidentiality or nondisclosure agreements (NDA);Error or failure of operations, maintenance, or an employee performing support services;20
+Confidentiality or nondisclosure agreements (NDA);Service provider failure;20
+Securing application services on public networks;Unauthorized manipulation of software or a hacker attack;20
+Securing application services on public networks;Malware infiltration;20
+Securing application services on public networks;Infiltration and modification of data – damage or loss of data;20
+Securing application services on public networks;Communication interception;30
+Securing application services on public networks;Web communication infiltration;30
+Securing application services on public networks;Unauthorized or misdirected messages;20
+Protecting application services transactions;Unauthorized manipulation of software or a hacker attack;20
+Protecting application services transactions;Malware infiltration;20
+Protecting application services transactions;Infiltration and modification of data – damage or loss of data;20
+Protecting application services transactions;Communication interception;30
+Protecting application services transactions;Web communication infiltration;30
+Protecting application services transactions;Unauthorized or misdirected messages;20
+Secure SW development life cycle policy;Software design or development errors;60
+Secure system Architecture and Engineering Principles;Infiltration and modification of data – damage or loss of data;20
+Secure system Architecture and Engineering Principles;Illegal and unauthorized processing of data;10
+Secure system Architecture and Engineering Principles;Poor planning and adaptation shortcomings;20
+Secure system Architecture and Engineering Principles;Software design or development errors;80
+Secure development environment and separation of environments;Software design or development errors;40
+Secure coding;Software design or development errors;50
+Outsourced development;Software design or development errors;40
+Security Testing in Development and Acceptance;Software design or development errors;80
+Protection of test data;Software design or development errors;30
+Information security policy for supplier relationships;Service provider failure;50
+Addressing security within supplier agreements (SLA);Service provider failure;60
+Information and communication technology supply chain security management;Service provider failure;50
+Monitoring, Review and Change Management of Supplier Services;Service provider failure;30
+Information security for use of cloud services;Service provider failure;50
+Risk analysis of supplier services;Service provider failure;30
+Redundancy of information processing facilities;Pollution, dust,  corrosion, frost;60
+Redundancy of information processing facilities;Water, humidity;60
+Redundancy of information processing facilities;Heat radiation;60
+Redundancy of information processing facilities;Harmful radiation, radiation, or electromagnetic pulses;60
+Redundancy of information processing facilities;Interference of electrical signals;60
+Redundancy of information processing facilities;Fire;60
+Redundancy of information processing facilities;Toxic substances in the area;60
+Redundancy of information processing facilities;Surrounding events and accidents with negative impact;60
+Redundancy of information processing facilities;Terrorist attack, sabotage, explosion;60
+Redundancy of information processing facilities;Physical theft or physical damage to devices or media;50
+Redundancy of information processing facilities;Climatic or meteorological event;60
+Redundancy of information processing facilities;Seismic event;60
+Redundancy of information processing facilities;Volcanic event;60
+Redundancy of information processing facilities;Damage caused by animals;20
+Redundancy of information processing facilities;Software or service failure;60
+Redundancy of information processing facilities;Device or system failure;60
+Redundancy of information processing facilities;Overloading of the information system;60
+Redundancy of information processing facilities;Telecommunication network failure;60
+Redundancy of information processing facilities;Power system failure, power loss, or fluctuations in performance;60
+Redundancy of information processing facilities;Failure of the cooling or ventilation system;60
+Redundancy of information processing facilities;Office equipment failure;60
+Redundancy of information processing facilities;Disruption of availability during an audit or other authorized security assessment;60
+Compliance - Identification of applicable legislation, contractual and regulatory requirements including cryptographic controls;Violation of internal policies or standards;40
+Compliance - Identification of applicable legislation, contractual and regulatory requirements including cryptographic controls;Violation of laws or regulations;40
+Compliance - Intellectual property rights;Copyright violation;40
+Compliance - Protection of records;Violation of internal policies or standards;30
+Compliance - Protection of records;Violation of laws or regulations;30
+Compliance - Protection of records;Non-compliance with the legal basis - violation of the rights of the data subject;30
+Compliance - Privacy and protection of personally identifiable information;Violation of laws or regulations;30
+Compliance - Privacy and protection of personally identifiable information;Detectability – violation of anonymity or pseudonymity;30
+Compliance - Privacy and protection of personally identifiable information;Identifiability;30
+Compliance - Privacy and protection of personally identifiable information;Linkability;30
+Compliance - Privacy and protection of personally identifiable information;Non-compliance with the legal basis - violation of the rights of the data subject;30
+Independent review of information security;Violation of internal policies or standards;10
+Independent review of information security;Violation of laws or regulations;10
+Compliance with security policies and standards;Using software that does not meet security requirements;30
+Compliance with security policies and standards;Violation of internal policies or standards;30
+Honeypot, Honeytrap;Unauthorized manipulation of software or a hacker attack;20
+Cyber risk insurance or theft insurance;Infiltration and modification of data – damage or loss of data;20
+Cyber risk insurance or theft insurance;Non-compliance with the legal basis - violation of the rights of the data subject;30
+Cyber risk insurance or theft insurance;Disruption of availability during an audit or other authorized security assessment;20
+Implementation of electronic signature;Repudiation (Denial of activity);80

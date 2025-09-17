@@ -1,0 +1,20 @@
+Name;Notes;Is dependent;EN Name;EN Notes;SK Name;SK Notes
+Electronic data/Business process;;FALSE;Electronic data/Business process;;Elektronické dáta/Biznis proces;
+Paper data;;FALSE;Paper data;;Papierové dáta;
+Information system;;TRUE;Information system;;Informaènı systém;
+Server infrastructure;;FALSE;Server infrastructure;;Serverová infraštruktúra;
+Network infrastructure ;;FALSE;Network infrastructure ;;Sieová infraštruktúra ;
+Virtualization platform;;FALSE;Virtualization platform;;Virtualizaèná platforma;
+Operating system ;;FALSE;Operating system ;;Operaènı systém ;
+Application software;;FALSE;Application software;;Aplikaènı softvér;
+Cloud services;;FALSE;Cloud services;;Cloudové sluby;
+Data storage;;FALSE;Data storage;;Dátové úloiská;
+Equipment, machines;;FALSE;Equipment, machines;;Zaradenie, stroje;
+IoT;;FALSE;IoT;;IoT;
+PC;;FALSE;PC;;PC;
+Laptop;;FALSE;Laptop;;Notebook;
+Mobile devices;;FALSE;Mobile devices;;Mobilné zariadenia;
+Portable data media;;FALSE;Portable data media;;Prenosné dátové médiá;
+Location;;FALSE;Location;;Lokalita;
+Staff;;FALSE;Staff;;Personál;
+Other;;FALSE;Other;;Iné;
