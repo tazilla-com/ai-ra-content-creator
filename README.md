@@ -27,32 +27,64 @@ pip install --no-cache-dir -r requirements.txt -c constraints.txt
 
 Create .env in project root (or export in your shell):
 
-# === LLM / OpenAI ===
-OPENAI_API_KEY=sk-your-real-key
-LLM_MODEL=gpt-4o-mini
-OPENAI_TIMEOUT_SEC=60
-OPENAI_MAX_RETRIES=3
+# ====================== Runtime / App ======================
+WORKSHOPS_AI_ENV=dev # prod or dev
+WORKSHOPS_AI_VERSION=1.0.0
+WORKSHOPS_AI_LOG_LEVEL=INFO
 
-# === Backend (CSV) ===
-BACKEND_KIND=csv
-DATA_ROOT=./data
-CSV_CATALOG_DIR=./data/catalogs
-CSV_STATE_DIR=./data/state
-CSV_DELIMITER=;
-CSV_ENCODING=utf-8
+WORKSHOPS_AI_CORS_ORIGINS=["*"]
 
-# === FastAPI ===
-APP_HOST=127.0.0.1
+# Timeouts / limits 
+WORKSHOPS_AI_CHAT_TIMEOUT_SEC=20
+WORKSHOPS_AI_MAX_MESSAGE_LEN=4000
+WORKSHOPS_AI_WS_TIMEOUT_SEC=75
+
+# ======================== Security =========================
+# API-key autentization (for HTTP and WS)
+WORKSHOPS_AI_SECURITY__ENABLE_API_KEY=true
+WORKSHOPS_AI_SECURITY__API_KEYS=["PKHYk5Fex7GNMOaDVqtowwebiYc9o3TfqNM4KROmVVp2p1VjcILtqpBhMSNi1YD7","waPxELBmZfoP0gVP8USh6OMWOdMn_D4iNRIa3j-lDhOGZWtg11IsmdH3Cqi1oW3a"]
+
+# JWT autentization (HTTP Bearer)
+WORKSHOPS_AI_SECURITY__ENABLE_JWT=true
+WORKSHOPS_AI_SECURITY__JWT_ALGORITHM=HS256
+WORKSHOPS_AI_SECURITY__JWT_SECRET=Oa5pK7qZ3wY8fT1nV4rH9mD2sC6xB0uP3jL7eQ1yN5gR8tW2kF6vA9zJ4iM0oU5
+WORKSHOPS_AI_SECURITY__JWT_ISSUER=https://auth.example.com
+WORKSHOPS_AI_SECURITY__JWT_AUDIENCE=workshops-ai
+
+# ====================== Data roots (CSV) ===================
+WORKSHOPS_AI_DATA_DIR=./data
+WORKSHOPS_AI_CAT_DIR=./data/catalogs
+WORKSHOPS_AI_STATE_DIR=./data/state
+
+# ========== Export ChangeSets (Tazila) ==============
+WORKSHOPS_AI_TAZILA__MODE=file   # file or http
+WORKSHOPS_AI_TAZILA__OUTBOX_PATH=./data/outbox
+WORKSHOPS_AI_TAZILA__ENDPOINT=https://backend.example.com/changesets
+WORKSHOPS_AI_TAZILA__AUTH_TOKEN=change-me-bearer-token
+WORKSHOPS_AI_TAZILA__TIMEOUT_SEC=30
+
+# ====================== Redis / Ratelimit ==================
+# Redis for sessions/ratelimit 
+WORKSHOPS_AI_REDIS__URL=redis://redis:6379/0
+WORKSHOPS_AI_RATELIMIT__ENABLED=true
+WORKSHOPS_AI_RATELIMIT__PER_MINUTE=120
+
+# ===================== FastAPI server ======================
+APP_HOST=0.0.0.0
 APP_PORT=8000
-CORS_ORIGINS="*"
-LOG_LEVEL=INFO
-WS_EVENT_TIMEOUT_S=75
+ENABLE_DOCS=false
 
-# === LangChain / LangSmith (optional) ===
-LANGCHAIN_TRACING_V2=true
-LANGCHAIN_ENDPOINT=https://api.smith.langchain.com
-LANGCHAIN_API_KEY=lsv2-...             # optional
-LANGCHAIN_PROJECT=workshops-ai          # optional
+# ==================== LLM / OpenAI =========================
+OPENAI_API_KEY=
+LLM_MODEL=gpt-4o-mini
+LLM_TEMPERATURE=0.0
+
+# ======== LangChain / LangSmith tracing (prod default off) ========
+LANGCHAIN_TRACING_V2=false
+# LANGCHAIN_ENDPOINT=   
+LANGCHAIN_API_KEY=
+LANGCHAIN_PROJECT=workshops-ai
+
 
 
 4) Run

@@ -1,11 +1,11 @@
 # File: workshops_ai/backend/csv_backend.py
 # CSV-based backend (MVP) implementing BackendPort for read-only asset workflows.
-# - Reads state from data/state/assets.csv
-# - Reads catalogs from data/catalogs (validates assetType against "Asset type.csv")
+# - Reads state from <settings.paths.state_dir>/assets.csv
+# - Reads catalogs from <settings.paths.catalogs_dir> (validates assetType against "Asset type.csv")
 # - Strict, defensive parsing with mtime-based hot reload
 # - No external deps (stdlib csv); Pydantic v2 for domain validation
 #
-# Files:
+# Files (relative to configured paths):
 #   catalogs/Asset type.csv
 #   catalogs/Asset type x Threat.csv  (not used by AssetAgent MVP; prewired for later)
 #   state/assets.csv
@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import csv
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -32,6 +31,7 @@ from workshops_ai.backend.port import (
     BackendPort,
     BackendValidationError,
 )
+from workshops_ai.settings import get_settings
 
 __all__ = ["CsvBackend"]
 
@@ -65,13 +65,13 @@ except Exception:  # pragma: no cover
 
 
 # --------------------------------------------------------------------------------------
-# Paths & config
+# Paths & config (centralized via settings)
 # --------------------------------------------------------------------------------------
 
-_PKG_ROOT = Path(__file__).resolve().parents[1]  # workshops_ai/
-_DATA_DIR = Path(os.getenv("WORKSHOPS_AI_DATA_DIR", _PKG_ROOT / "data")).resolve()
-_STATE_DIR = Path(os.getenv("WORKSHOPS_AI_STATE_DIR", _DATA_DIR / "state")).resolve()
-_CAT_DIR = Path(os.getenv("WORKSHOPS_AI_CAT_DIR", _DATA_DIR / "catalogs")).resolve()
+_s = get_settings()
+_DATA_DIR = Path(_s.paths.data_dir).resolve()
+_STATE_DIR = Path(_s.paths.state_dir).resolve()
+_CAT_DIR = Path(_s.paths.catalogs_dir).resolve()
 
 _ASSETS_STATE_FILE = _STATE_DIR / "assets.csv"
 _CAT_ASSET_TYPE_FILE = _CAT_DIR / "Asset type.csv"

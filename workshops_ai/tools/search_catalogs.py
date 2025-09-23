@@ -7,8 +7,8 @@
 #   - Safe: never raises for missing catalogs; returns empty results instead.
 #
 # Catalogs (expected locations; resilient if absent):
-#   data/catalogs/Asset type.csv
-#   data/catalogs/Asset type x Threat.csv
+#   <settings.paths.catalogs_dir>/Asset type.csv
+#   <settings.paths.catalogs_dir>/Asset type x Threat.csv
 #   (Placeholders for future: Impacts.csv, Threats.csv, Controls.csv)
 #
 # API (stable, small):
@@ -17,19 +17,16 @@
 #   explain_asset_type(code: str) -> dict|None
 #   mapped_threats_for_asset_type(asset_type_code: str) -> list[str]
 #   generic_search(file_name: str, q: str|None, *, fields: list[str]|None = None, limit=50) -> list[dict]
-#
-# Notes:
-#   - All codes are canonical EN (do not localize here).
-#   - Designed for agents’ “explain” intent and UI auto-complete aids.
-#   - Telemetry is best-effort and never blocks.
+
 
 from __future__ import annotations
 
 import csv
-import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Optional
+
+from workshops_ai.settings import get_settings
 
 # Optional telemetry (best-effort)
 try:  # pragma: no cover
@@ -39,12 +36,11 @@ except Exception:  # pragma: no cover
         return None
 
 # --------------------------------------------------------------------------------------
-# Paths
+# Paths (centralized via settings)
 # --------------------------------------------------------------------------------------
 
-_PKG_ROOT = Path(__file__).resolve().parents[1]  # workshops_ai/
-_DATA_DIR = Path(os.getenv("WORKSHOPS_AI_DATA_DIR", _PKG_ROOT / "data")).resolve()
-_CAT_DIR = Path(os.getenv("WORKSHOPS_AI_CAT_DIR", _DATA_DIR / "catalogs")).resolve()
+_SETTINGS = get_settings()
+_CAT_DIR = Path(_SETTINGS.paths.catalogs_dir).resolve()
 
 _CAT_ASSET_TYPE_FILE = _CAT_DIR / "Asset type.csv"
 _CAT_AT_X_THREAT_FILE = _CAT_DIR / "Asset type x Threat.csv"
@@ -84,17 +80,28 @@ class _CsvCache:
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
+    # Try utf-8-sig first (handles BOM); fall back to utf-8 then cp1250 for EU exports
+    for enc in ("utf-8-sig", "utf-8", "cp1250"):
+        try:
+            with path.open("r", encoding=enc, newline="") as f:
+                reader = csv.DictReader(f)
+                # Normalize headers (strip whitespace/BOM remnants)
+                if reader.fieldnames:
+                    reader.fieldnames = [h.strip() for h in reader.fieldnames]
+                out: list[dict[str, str]] = []
+                for row in reader:
+                    # Trim values; keep strings only (csv gives str or None)
+                    clean = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+                    out.append(clean)
+                return out
+        except UnicodeDecodeError:
+            continue
+    # Last resort: try reading raw and let csv handle whatever it can
+    with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
         reader = csv.DictReader(f)
-        # Normalize headers (strip whitespace/BOM remnants)
         if reader.fieldnames:
             reader.fieldnames = [h.strip() for h in reader.fieldnames]
-        out: list[dict[str, str]] = []
-        for row in reader:
-            # Trim values; keep strings only (csv gives str or None)
-            clean = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
-            out.append(clean)
-        return out
+        return [{k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()} for row in reader]
 
 
 def _first_present_column(rows: list[dict[str, str]], candidates: Iterable[str]) -> Optional[str]:
@@ -129,7 +136,7 @@ def list_asset_types() -> list[str]:
     if not rows:
         return []
     # Header heuristics (prefer code-like names)
-    col = _first_present_column(rows, ("code", "asset_type", "type", "Asset type", "name")) or next(iter(rows[0].keys()))
+    col = _first_present_column(rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name")) or next(iter(rows[0].keys()))
     seen: set[str] = set()
     out: list[str] = []
     for r in rows:
@@ -146,7 +153,7 @@ def search_asset_types(q: str | None, *, limit: int = 50) -> list[str]:
     if not rows:
         return []
     qn = (q or "").casefold()
-    code_col = _first_present_column(rows, ("code", "asset_type", "type", "Asset type", "name")) or next(iter(rows[0].keys()))
+    code_col = _first_present_column(rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name")) or next(iter(rows[0].keys()))
     # If there is a separate 'name' column, include it in matching
     name_col = _first_present_column(rows, ("name", "Name", "label", "Label"))
 
@@ -175,7 +182,7 @@ def explain_asset_type(code: str) -> dict[str, str] | None:
     rows = _asset_types.load()
     if not rows:
         return None
-    col = _first_present_column(rows, ("code", "asset_type", "type", "Asset type", "name")) or next(iter(rows[0].keys()))
+    col = _first_present_column(rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name")) or next(iter(rows[0].keys()))
     needle = code.strip()
     for r in rows:
         if (r.get(col) or "").strip() == needle:
@@ -222,7 +229,7 @@ def mapped_threats_for_asset_type(asset_type_code: str) -> list[str]:
 
 def generic_search(file_name: str, q: str | None, *, fields: list[str] | None = None, limit: int = 50) -> list[dict[str, str]]:
     """
-    Generic read-only search over an arbitrary catalog CSV in data/catalogs/.
+    Generic read-only search over an arbitrary catalog CSV in <settings.paths.catalogs_dir>/.
     - q=None returns first `limit` rows.
     - If `fields` is specified, only those columns are searched (missing are ignored).
     - Otherwise, searches all columns.

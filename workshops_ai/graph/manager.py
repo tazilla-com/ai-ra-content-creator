@@ -7,14 +7,14 @@
 # - Contract-first: route_chat(UIRequest) -> UIResponse (strict Pydantic types).
 # - Tool-gating by active_tab (security-by-design; no cross-tab calls).
 # - Lightweight intent detector (read | propose | change | explain) – conservative default is "read".
-# - Per-request telemetry (best-effort), structured messages in user locale (English by default here).
+# - Per-request telemetry (best-effort), structured messages in user locale (English/Slovak handled by agent).
 # - Defensive imports (avoid cycles). If the agent isn’t wired yet, return a graceful UIResponse.
 # - Assets are **EMIT-ONLY**: the agent may emit WS events and write ChangeSets to an outbox;
 #   there are no direct writes to a production backend in this MVP.
 #
-# Next steps:
-# - Add Threat/Impact/Control agents and extend TOOL_GATES + dispatch_*.
-# - Plug LangGraph graph if/when stateful nodes are required (the function surface stays unchanged).
+# NOTE (pass-through):
+# - The router forwards the UIRequest object **as-is** to the agent; it does not reconstruct,
+#   strip, or transform fields like language/number_of_assets/policy/etc.
 
 from __future__ import annotations
 
@@ -58,6 +58,10 @@ async def route_chat(req: UIRequest) -> UIResponse:
     """
     Main router entrypoint.
     For the 'assets' MVP the agent works in EMIT-ONLY mode (WS + outbox); it is not side-effect-free.
+
+    IMPORTANT:
+    - This function forwards the incoming `UIRequest` instance **unchanged** to the agent.
+      No field is dropped or rewritten (incl. language, number_of_assets, policy, website_content, etc.).
     """
     _audit_in(req)
 
@@ -122,6 +126,7 @@ async def _dispatch_assets(req: UIRequest, intent: Intent) -> UIResponse:
 
     # IMPORTANT: do NOT force read-only anymore; pass the inferred intent through.
     try:
+        # Pass the **original req object** unchanged.
         result = await asset_run(req, intent)
     except Exception as e:
         telemetry_log("manager.asset_agent_runtime_error", {"error": str(e)})
@@ -194,6 +199,10 @@ def _audit_in(req: UIRequest) -> None:
                 "active_tab": req.active_tab,
                 "has_selection": bool(req.selection),
                 "staging": req.staging,
+                # extra context (optional) for observability:
+                "language": getattr(req, "language", None),
+                "number_of_assets": getattr(req, "number_of_assets", None),
+                "emit_changes_enabled": getattr(getattr(req, "policy", None), "emit_changes_enabled", True),
             },
         )
     except Exception:

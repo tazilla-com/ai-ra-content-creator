@@ -4,11 +4,15 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
-import os
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, ConfigDict
+
+from workshops_ai.settings import get_settings
+
+# --- Security dependency (API key / JWT via central security) ---
+from workshops_ai.app.security import require_auth  # HTTP dependency; WS uses verify_ws_auth
 
 # Telemetry (best-effort, no-op if missing)
 try:
@@ -17,7 +21,8 @@ except Exception:  # pragma: no cover
     def telemetry_log(event: str, payload: dict) -> None:  # type: ignore
         return
 
-router = APIRouter()
+settings = get_settings()
+router = APIRouter(dependencies=[Depends(require_auth)])
 
 # ---------------------------------------------------------------------------
 # UI contract models
@@ -25,8 +30,10 @@ router = APIRouter()
 
 ActiveTab = Literal["assets", "impacts", "threats", "controls"]
 
+
 class Selection(BaseModel):
     asset_id: Optional[str] = None
+
 
 class ChatRequest(BaseModel):
     org_id: str
@@ -37,24 +44,25 @@ class ChatRequest(BaseModel):
     user_id: str
     model_config = ConfigDict(extra="ignore")
 
+
 class ChatResponse(BaseModel):
     messages: List[str]
     proposals: Optional[Dict[str, Any]] = None
     staging: Dict[str, Any] = Field(default_factory=lambda: {"needs_commit": False})
 
+
 # ---------------------------------------------------------------------------
 # Manager/Router resolver
 # ---------------------------------------------------------------------------
 
-# Default to YOUR manager:
+# Default to your manager:
 #   workshops_ai/graph/manager.py -> async def route_chat(UIRequest) -> UIResponse
 _DEFAULT_SPEC = "workshops_ai.graph.manager:route_chat"
 
-# Optional env override:
-#   AI_MANAGER="module:attr"   e.g. AI_MANAGER="workshops_ai.graph.manager:route_chat"
-_SPEC = os.getenv("AI_MANAGER", _DEFAULT_SPEC)
+# Prefer central settings; fall back to default
+_SPEC = getattr(settings, "ai_manager_spec", None) or _DEFAULT_SPEC
 
-# Fallback candidates if env/default fails (kept for compatibility)
+# Fallback candidates if settings/default fails (kept for compatibility)
 _FALLBACKS = [
     "workshops_ai.agents.manager:get_manager",
     "workshops_ai.agents.router:router",
@@ -64,13 +72,17 @@ _FALLBACKS = [
 
 _manager_singleton: Any = None
 
+
 def _load_from_spec(spec: str) -> Any:
     mod_name, _, attr_str = spec.partition(":")
     if not mod_name:
         raise RuntimeError("Invalid AI manager spec (missing module).")
     module = importlib.import_module(mod_name)
     candidates = [a.strip() for a in (attr_str or "").split(",") if a.strip()] or [
-        "route_chat", "get_manager", "router", "manager"
+        "route_chat",
+        "get_manager",
+        "router",
+        "manager",
     ]
     last_err: Exception | None = None
     for name in candidates:
@@ -83,7 +95,10 @@ def _load_from_spec(spec: str) -> Any:
         if name == "get_manager" and callable(obj):
             return obj()
         return obj
-    raise RuntimeError(f"Could not resolve any of {candidates} in {mod_name}. Last error: {last_err}")
+    raise RuntimeError(
+        f"Could not resolve any of {candidates} in {mod_name}. Last error: {last_err}"
+    )
+
 
 def _resolve_manager() -> Any:
     global _manager_singleton
@@ -92,7 +107,7 @@ def _resolve_manager() -> Any:
 
     last_err: Exception | None = None
 
-    # 1) Env/default spec
+    # 1) Settings/default spec
     try:
         _manager_singleton = _load_from_spec(_SPEC)
         return _manager_singleton
@@ -109,6 +124,7 @@ def _resolve_manager() -> Any:
             continue
 
     raise RuntimeError(f"Manager/Router not found (spec='{_SPEC}'). Last error: {last_err}")
+
 
 # ---------------------------------------------------------------------------
 # Invocation helpers
@@ -140,7 +156,10 @@ async def _invoke_manager(manager: Any, payload: dict) -> Any:
         res = manager(payload)
         return await res if inspect.isawaitable(res) else res
 
-    raise TypeError("Manager/Router is not invocable (expected async function, ainvoke/invoke, or callable).")
+    raise TypeError(
+        "Manager/Router is not invocable (expected async function, ainvoke/invoke, or callable)."
+    )
+
 
 def _as_list_messages(val: Any) -> List[str]:
     if val is None:
@@ -150,6 +169,7 @@ def _as_list_messages(val: Any) -> List[str]:
     if isinstance(val, list):
         return [v if isinstance(v, str) else str(v) for v in val]
     return [str(val)]
+
 
 def _normalize_to_chat_response(res: Any) -> ChatResponse:
     """
@@ -161,12 +181,15 @@ def _normalize_to_chat_response(res: Any) -> ChatResponse:
 
     if isinstance(res, dict):
         return ChatResponse(
-            messages=_as_list_messages(res.get("messages") or res.get("message") or res.get("text")),
+            messages=_as_list_messages(
+                res.get("messages") or res.get("message") or res.get("text")
+            ),
             proposals=res.get("proposals"),
             staging=res.get("staging") or {"needs_commit": False},
         )
 
     return ChatResponse(messages=_as_list_messages(res), staging={"needs_commit": False})
+
 
 # ---------------------------------------------------------------------------
 # Route
@@ -174,23 +197,52 @@ def _normalize_to_chat_response(res: Any) -> ChatResponse:
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
-    # audit/telemetry best-effort
+    # 1) Input hardening – length guard (from centralized settings)
+    max_len = int(getattr(settings.chat, "max_message_len", 0) or 0)
+    if max_len and len(req.message) > max_len:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Message too long (>{max_len} chars).",
+        )
+
+    # 2) Audit/telemetry (best-effort)
     try:
-        telemetry_log("chat.request", {
-            "org_id": req.org_id, "user_id": req.user_id, "active_tab": req.active_tab, "staging": req.staging
-        })
+        telemetry_log(
+            "chat.request",
+            {
+                "org_id": req.org_id,
+                "user_id": req.user_id,
+                "active_tab": req.active_tab,
+                "staging": req.staging,
+            },
+        )
     except Exception:
         pass
 
-    # resolve & invoke your manager/router
+    # 3) Resolve & invoke your manager/router with timeout
     try:
         manager = _resolve_manager()
     except Exception as e:
-        return ChatResponse(messages=[f"Agent not available: {e}"], staging={"needs_commit": False})
+        return ChatResponse(
+            messages=[f"Agent not available: {e}"],
+            staging={"needs_commit": False},
+        )
 
     try:
-        raw = await _invoke_manager(manager, req.model_dump())
+        timeout = int(getattr(settings.chat, "timeout_sec", 0) or 0) or None
+        raw = await asyncio.wait_for(
+            _invoke_manager(manager, req.model_dump()),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return ChatResponse(
+            messages=[f"Timed out after {getattr(settings.chat, 'timeout_sec', 0)}s"],
+            staging={"needs_commit": False},
+        )
     except Exception as e:
-        return ChatResponse(messages=[f"Agent failed: {type(e).__name__}: {e}"], staging={"needs_commit": False})
+        return ChatResponse(
+            messages=[f"Agent failed: {type(e).__name__}: {e}"],
+            staging={"needs_commit": False},
+        )
 
     return _normalize_to_chat_response(raw)

@@ -8,9 +8,21 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Literal, Optional
+from uuid import UUID
 
-from pydantic import BaseModel, Field, StrictBool, StrictStr, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    HttpUrl,
+    field_validator,
+)
 from pydantic.config import ConfigDict
+
+# Agent event model used for optional synchronous event echo in UIResponse
+from workshops_ai.models.agent_event import AgentEvent
 
 # ---------------------------------------------------------------------------
 # Shared / aliases
@@ -34,18 +46,72 @@ class Selection(BaseModel):
     )
 
 
+class PolicyConfig(BaseModel):
+    """Policy switches for runtime behavior."""
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    emit_changes_enabled: StrictBool = Field(
+        default=True,
+        description="If false, the agent must not emit WS events nor submit changesets (dry-run).",
+    )
+
+
+class OrganizationProfile(BaseModel):
+    """
+    Free-form organization profile. Intentionally allows arbitrary keys so that
+    backend can pass rich org context without schema churn.
+    """
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
+
+
+class ServiceItem(BaseModel):
+    """Company service description used to enrich asset proposals."""
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: StrictStr
+    description: Optional[StrictStr] = None
+    sector: Optional[StrictStr] = None  # canonicalization is handled by the agent
+
+
+class ExistingAssetIn(BaseModel):
+    """
+    Pre-existing asset snippet coming from the wizard/back-end, used as context
+    for AssetAgent reasoning or deduplication checks.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    id: Optional[UUID] = None
+    name: StrictStr
+    description: Optional[StrictStr] = None
+    isPrimary: Optional[bool] = None
+    confidentiality: Optional[StrictStr] = None
+    integrity: Optional[StrictStr] = None
+    availability: Optional[StrictStr] = None
+    assetType: Optional[StrictStr] = None
+    org_id: Optional[StrictStr] = None
+
+
+class WebsitePage(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    url: HttpUrl
+    content: Optional[StrictStr] = None
+    page_type: Optional[StrictStr] = None  # e.g. "home", "services", "contact"
+
+
+class WebsiteContent(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    base_url: HttpUrl
+    pages: list[WebsitePage] = Field(default_factory=list)
+    errors: list[StrictStr] = Field(default_factory=list)
+
+
 class UIRequest(BaseModel):
     """
-    Chat input contract from UI.
-    Example:
-    {
-      "org_id": "acme",
-      "active_tab": "assets",
-      "selection": {"asset_id": "asset-123"},
-      "message": "list search:db type:Server",
-      "staging": false,
-      "user_id": "u-42"
-    }
+    Chat input contract from UI / wizard. Minimal required: org_id, active_tab.
+    Everything else is optional here to keep backward compatibility; upstream
+    wizard may require session_id/language on its side.
     """
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, validate_assignment=True)
 
@@ -60,13 +126,54 @@ class UIRequest(BaseModel):
         default=False,
         description="If true, user expects staging semantics (used by non-asset agents).",
     )
-    user_id: StrictStr = Field(..., min_length=1, description="Authenticated user identifier.")
+    user_id: Optional[StrictStr] = Field(default=None, description="Authenticated user identifier.")
+
+    # Wizard / context enrichment (all optional)
+    session_id: Optional[StrictStr] = Field(default=None, description="Client session identifier.")
+    language: Optional[StrictStr] = Field(
+        default=None,
+        description="IETF language tag like 'cs', 'sk', 'en-US'.",
+    )
+    number_of_assets: Optional[StrictInt] = Field(
+        default=None, ge=1, le=1000,
+        description="Agent hint for list/summary limits.",
+    )
+    user_instructions: Optional[StrictStr] = Field(
+        default=None,
+        description="Free-form user guidance for the agent.",
+    )
+    organization_profile: Optional[OrganizationProfile] = Field(
+        default=None,
+        description="Organization profile (free-form).",
+    )
+    services: Optional[list[ServiceItem]] = Field(
+        default=None,
+        description="List of company services to inform asset proposals.",
+    )
+    existing_assets: Optional[list[ExistingAssetIn]] = Field(
+        default=None,
+        description="Already known assets; used for deduplication/context.",
+    )
+    url: Optional[HttpUrl] = Field(default=None, description="Primary organization URL.")
+    website_content: Optional[WebsiteContent] = Field(
+        default=None,
+        description="Fetched website content (pages, errors).",
+    )
+    policy: Optional[PolicyConfig] = Field(
+        default=None,
+        description="Runtime policy switches (e.g., dry-run emission gate).",
+    )
 
     @field_validator("message")
     @classmethod
     def _message_not_none(cls, v: str) -> str:
         # Allow empty string (e.g., pure selection-driven actions), but never None
         return "" if v is None else v
+
+    @field_validator("language")
+    @classmethod
+    def _normalize_lang(cls, v: Optional[str]) -> Optional[str]:
+        return v.strip() if isinstance(v, str) else v
 
 
 # ---------------------------------------------------------------------------
@@ -90,12 +197,6 @@ class StagingState(BaseModel):
 class UIResponse(BaseModel):
     """
     Chat output contract to UI.
-    Example:
-    {
-      "messages": ["Nalezeno aktiv: 3 (hledáno: \"db\")."],
-      "proposals": {"assets": [...]},
-      "staging": {"needs_commit": false}
-    }
     """
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, validate_assignment=True)
 
@@ -112,6 +213,10 @@ class UIResponse(BaseModel):
         default_factory=lambda: StagingState(needs_commit=False),
         description="Staging state for commit/diff UX.",
     )
+    agent_events: Optional[list[AgentEvent]] = Field(
+        default=None,
+        description="Optional synchronous echo of agent events returned with the response.",
+    )
 
     @field_validator("messages")
     @classmethod
@@ -125,6 +230,12 @@ class UIResponse(BaseModel):
 __all__ = [
     "ActiveTab",
     "Selection",
+    "PolicyConfig",
+    "OrganizationProfile",
+    "ServiceItem",
+    "ExistingAssetIn",
+    "WebsitePage",
+    "WebsiteContent",
     "UIRequest",
     "StagingState",
     "UIResponse",

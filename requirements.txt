@@ -1,4 +1,4 @@
-# Základ
+# Basic
 fastapi
 uvicorn[standard]
 pydantic
@@ -16,9 +16,8 @@ httpx
 tenacity
 structlog
 
-# RAG (volitelné, má podporu pro NumPy 2.x)
+# RAG 
 qdrant-client[fastembed]
-fastembed
 onnxruntime
 
 # Lang řetězec
@@ -31,3 +30,9 @@ openai
 # Observability (volitelné)
 opentelemetry-sdk
 opentelemetry-exporter-otlp
+
+# Security / Auth
+PyJWT[crypto]
+
+# Infra / storage
+redis

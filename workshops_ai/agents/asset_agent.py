@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import os
 import re
 import logging
 from dataclasses import dataclass
@@ -30,14 +29,27 @@ from workshops_ai.models.changeset import (
     ActionSetAssetMeta,
     ChangeSet,
 )
-
 from workshops_ai.agents.utils.changeset_builder import build_changeset
+
+# New: context utilities (seed heuristics / summaries)
+from workshops_ai.agents.utils.context_enricher import (
+    summarize_org_profile,
+    extract_seed_candidates,
+    dedupe_against_existing,
+    limit_results,
+)
 
 # Outbox submit (async, non-blocking for WS/LLM loop)
 from workshops_ai.app.services.tazila_client import asubmit_changeset  # type: ignore
 
 # WS change events (raw JSON broadcast via WsHub → /ws)
 from workshops_ai.app.services.change_events import aemit_change_event
+
+# New: HTTP echo of events (AgentEvent schema)
+from workshops_ai.models.agent_event import AgentEvent
+
+# Centralized settings 
+from workshops_ai.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +71,71 @@ except Exception:  # pragma: no cover
 
 Intent = Literal["read", "explain"]
 READ_PAGE_LIMIT = 100
+_ALLOWED_TOOLS = {"create_asset", "set_asset_meta"}
+_REPAIR_HINT = (
+    "Your previous output did not match the schema/rules. "
+    "Return exactly ONE tool call (create_asset or set_asset_meta) OR a single <control>...</control> line. "
+    "When calling a tool, include strictly valid JSON args per the tool schema. "
+    "Do not include any extra text besides the one short human sentence and optional <control> tag."
+)
+
+
+# --------------------------------------------------------------------------------------
+# Language helpers (base = 'sk' or 'en')
+# --------------------------------------------------------------------------------------
+
+def _pref_lang(req: UIRequest) -> str:
+    """
+    Choose response language: 'sk' or 'en'.
+    - 'sk' if req.language startswith 'sk' OR 'cs' (map Czech → Slovak base as requested).
+    - 'en' if req.language startswith 'en'.
+    - default 'en' if not provided/unknown.
+    """
+    lang = (getattr(req, "language", None) or "").strip().lower()
+    if lang.startswith("sk") or lang.startswith("cs"):
+        return "sk"
+    if lang.startswith("en"):
+        return "en"
+    return "en"
+
+_T = {
+    "en": {
+        "explain_1": "I’m your AssetAgent. Tell me in plain language what you want to do with assets.",
+        "explain_2": "• “Create a CRM asset as primary, type Information system …”",
+        "explain_3": "• “Update asset asset-db-001: rename to Customer DB and set primary=false.”",
+        "explain_4": "• “List primary Application software containing ‘crm’.”",
+        "explain_5": "Every change is broadcast via WS and submitted to the backend outbox as a single-action ChangeSet.",
+        "hint_generic": "Tell me what you’d like to do with assets (create, update, list, detail).",
+        "need_id": "Please provide an asset ID to show its detail.",
+        "not_found": "I couldn't find an asset with ID “{id}”.",
+        "detail_intro": "Here’s the asset detail for “{name}”.",
+        "list_found": "I found {n} item(s){suffix}.",
+        "ok": "OK.",
+        "done": "Done — {n} change(s) queued to the outbox.",
+        "invalid_change": "I couldn't build a valid change from that request. Try: “Create an asset …” or “Update asset …”.",
+        "seed_intro": "Here are initial asset candidates based on your services/website.",
+    },
+    "sk": {
+        "explain_1": "Som tvoj AssetAgent. Povedz mi jednoducho, čo chceš s aktívami urobiť.",
+        "explain_2": "• „Vytvor CRM ako primárne, typ Information system …“",
+        "explain_3": "• „Aktualizuj asset asset-db-001: premenuj na Customer DB a nastav primary=false.“",
+        "explain_4": "• „Vypíš primárne Application software obsahujúce ‘crm’.“",
+        "explain_5": "Každá zmena sa posiela cez WS a ukladá do outboxu backendu ako single-action ChangeSet.",
+        "hint_generic": "Napíš, čo chceš s aktívami spraviť (vytvoriť, upraviť, vypísať, detail).",
+        "need_id": "Uveď prosím ID assetu, aby som zobrazil detail.",
+        "not_found": "Nenašiel som asset s ID „{id}“.",
+        "detail_intro": "Tu je detail assetu „{name}“.",
+        "list_found": "Našiel som {n} položiek{suffix}.",
+        "ok": "OK.",
+        "done": "Hotovo — {n} zmien odoslaných do outboxu.",
+        "invalid_change": "Nepodarilo sa vytvoriť platnú zmenu. Skús: „Vytvor asset …“ alebo „Uprav asset …“.",
+        "seed_intro": "Tu sú počiatoční kandidáti aktív podľa vašich služieb/webu.",
+    },
+}
+
+def _t(lang: str, key: str, **kwargs) -> str:
+    base = _T.get(lang, _T["en"]).get(key, _T["en"].get(key, key))
+    return base.format(**kwargs)
 
 
 # --------------------------------------------------------------------------------------
@@ -120,19 +197,24 @@ set_asset_meta_tool.args_schema = SetAssetMetaArgs
 
 
 def _llm() -> ChatOpenAI:
+    """
+    Construct the LLM client strictly from centralized settings.
+    """
     if not _HAS_LLM:
         raise RuntimeError("LangChain/OpenAI not installed")
-    if not (os.getenv("OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_API_KEY")):
-        raise RuntimeError("OPENAI_API_KEY/AZURE_OPENAI_API_KEY not configured")
-    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-    temperature = float(os.getenv("LLM_TEMPERATURE", "0.0"))
-    timeout = int(os.getenv("OPENAI_TIMEOUT_SEC", "60"))
-    max_retries = int(os.getenv("OPENAI_MAX_RETRIES", "3"))
+
+    s = get_settings()
+    # Using OpenAI client from env configured by Settings; keys are read by the SDK internally.
+    model = getattr(s, "llm_model", None) or "gpt-4o-mini"
+    temperature = float(getattr(s, "llm_temperature", 0.0))
+    timeout = int(getattr(s, "http_timeout_sec", 60))
+    max_retries = int(getattr(s, "openai_max_retries", 3))
+
     return ChatOpenAI(model=model, temperature=temperature, timeout=timeout, max_retries=max_retries)  # type: ignore[call-arg]
 
 
 LC_SYSTEM_PROMPT = """You are AssetAgent for the 'assets' tab (EMIT-ONLY WRITES).
-You operate in Czech when the user writes Czech; otherwise English.
+Respond strictly in language: {lang}.
 
 GOALS:
 1) Always start with ONE short, human-friendly sentence (this will be shown in chat).
@@ -152,14 +234,21 @@ RULES:
 - Never propose impacts/threats/controls here.
 - Keep messages concise: one short sentence. The <control> tag is separate and NOT part of the chat output.
 
+CONTEXT (use for better suggestions; do not leak raw PII):
+<instructions>{user_instructions}</instructions>
+<org_profile>{org_profile_summary}</org_profile>
+<known_assets_count>{known_assets_count}</known_assets_count>
+<website_seed_candidates>{website_seed_candidates}</website_seed_candidates>
+
 IMPORTANT:
 - This agent emits ChangeSet JSON and WS events; it doesn’t apply changes directly.
 - Reading uses CSV/state only; newly created/updated assets may not immediately appear in lists.
+{repair_clause}
 """
 
 
 # --------------------------------------------------------------------------------------
-# Presentation models for proposals (list/detail)
+# Presentation models for proposals (list/detail/seed)
 # --------------------------------------------------------------------------------------
 
 class AssetPreview(BaseModel):
@@ -184,44 +273,73 @@ async def run(req: UIRequest, intent: Intent) -> UIResponse:
     """AI agent: list/detail + NL→Actions (assets-only) with immediate outbox submit."""
     _audit_in(req, intent)
 
-    if intent == "explain":
-        return _explain_response()
-
+    lang = _pref_lang(req)
     msg = (req.message or "").strip()
 
-    # 1) Invoke LLM; if unavailable, gracefully fall back to read-only heuristics.
+    if intent == "explain":
+        return _explain_response(lang)
+
+    # Build context for prompt (summaries + seed terms)
+    org_summary = summarize_org_profile(getattr(req, "organization_profile", None))
+    raw_seeds = extract_seed_candidates(getattr(req, "services", None), getattr(req, "website_content", None))
+    seeds = dedupe_against_existing(raw_seeds, getattr(req, "existing_assets", None))
+    seed_labels = ", ".join([c["name"] for c in seeds]) if seeds else ""
+
+    # 1) Invoke LLM; if unavailable, gracefully fall back to read-only + seed proposals.
     try:
-        ai_msg = await _ai_invoke(msg)
+        ai_msg = await _ai_invoke(req, msg, lang, org_summary, seed_labels, repair=False)
+        if _needs_repair(ai_msg):
+            telemetry_log("asset_agent.repair_retry", {"reason": "schema/rules mismatch"})
+            ai_msg = await _ai_invoke(req, msg, lang, org_summary, seed_labels, repair=True)
     except Exception as e:
         telemetry_log("asset_agent.llm_unavailable", {"error": str(e)})
-        # Fallback to a simple read control (still respond with a short human sentence)
         parsed = _interpret_ai_read_control(_fallback_read_control(msg))
-        return await _handle_read_controls(req, parsed, ai_fallback_text="Here’s what I can show you right now.")
+        # Seed proposals on fallback when no explicit READ_DETAIL
+        if not parsed or parsed[0] != "READ_DETAIL":
+            limit = getattr(req, "number_of_assets", None)
+            proposed = limit_results(seeds, limit)
+            if proposed:
+                return UIResponse(
+                    messages=[_t(lang, "seed_intro")],
+                    proposals={"seed_assets": proposed},
+                    staging={"needs_commit": False},
+                )
+        return await _handle_read_controls(req, parsed, ai_fallback_text=_t(lang, "hint_generic"))
 
     # 1a) If tools were called, emit WS events and immediately submit a single-action ChangeSet
     tool_calls = _normalize_tool_calls(ai_msg)
     if tool_calls:
-        submitted = await _handle_tool_calls(req, tool_calls)
+        # enforce exactly ONE tool call
+        tool_calls = tool_calls[:1]
+        submitted, events = await _handle_tool_calls(req, tool_calls)
         if submitted > 0:
             return UIResponse(
-                messages=[f"Done — {submitted} change(s) queued to the outbox."],
+                messages=[_t(lang, "done", n=submitted)],
                 proposals=None,
                 staging={"needs_commit": False},
+                agent_events=events,  # HTTP echo
             )
-        # Tools were present but nothing valid was created
         return UIResponse(
-            messages=["I couldn't build a valid change from that request. Try: “Create an asset …” or “Update asset …”."],
+            messages=[_t(lang, "invalid_change")],
             proposals=None,
             staging={"needs_commit": False},
         )
 
-    # 1b) No tools: parse hidden control tag and show only the human sentence
+    # 1b) No tools: parse hidden control tag and show only the human sentence (+ optional seeds)
     raw_content = (getattr(ai_msg, "content", None) or "").strip()
     control_text, human_text = _extract_control_tag_and_human_text(raw_content)
 
     if not control_text or control_text.upper().startswith("NONE"):
-        # Just a friendly sentence, no read instruction — return it as-is.
-        return UIResponse(messages=[human_text or "OK."], proposals=None, staging={"needs_commit": False})
+        # Offer seed candidates if any
+        limit = getattr(req, "number_of_assets", None)
+        proposed = limit_results(seeds, limit)
+        if proposed:
+            return UIResponse(
+                messages=[human_text or _t(lang, "seed_intro")],
+                proposals={"seed_assets": proposed},
+                staging={"needs_commit": False},
+            )
+        return UIResponse(messages=[human_text or _t(lang, "ok")], proposals=None, staging={"needs_commit": False})
 
     # Interpret hidden READ_* control and return human sentence + proposals
     parsed = _interpret_ai_read_control(control_text)
@@ -232,12 +350,28 @@ async def run(req: UIRequest, intent: Intent) -> UIResponse:
 # AI helpers
 # --------------------------------------------------------------------------------------
 
-async def _ai_invoke(message: str):
+async def _ai_invoke(
+    req: UIRequest,
+    message: str,
+    lang: str,
+    org_profile_summary: str,
+    website_seed_labels: str,
+    *,
+    repair: bool,
+):
     # Bind tools for schema exposure; we parse tool calls ourselves.
     llm = _llm().bind_tools([create_asset_tool, set_asset_meta_tool])  # type: ignore[attr-defined]
+    sys_prompt = LC_SYSTEM_PROMPT.format(
+        lang=lang,
+        user_instructions=(getattr(req, "user_instructions", "") or "").strip(),
+        org_profile_summary=org_profile_summary or "n/a",
+        known_assets_count=len(getattr(req, "existing_assets", []) or []),
+        website_seed_candidates=website_seed_labels or "n/a",
+        repair_clause=("\nREPAIR:\n" + _REPAIR_HINT if repair else ""),
+    )
     return await llm.ainvoke(  # type: ignore[call-arg]
         [
-            SystemMessage(content=LC_SYSTEM_PROMPT),  # type: ignore[arg-type]
+            SystemMessage(content=sys_prompt),  # type: ignore[arg-type]
             HumanMessage(content=message or "list assets"),  # type: ignore[arg-type]
         ]
     )
@@ -272,6 +406,45 @@ def _normalize_tool_calls(ai_msg: Any) -> list[dict[str, Any]]:
 
     return calls
 
+def _needs_repair(ai_msg: Any) -> bool:
+    """
+    Heuristic schema/rules validation for the AI message.
+    Triggers a single repair retry if:
+      - more than one tool call,
+      - unknown tool name,
+      - required tool args missing or invalid by args_schema,
+      - content neither has a valid single tool call nor a <control> tag.
+    """
+    calls = _normalize_tool_calls(ai_msg)
+    if calls:
+        if len(calls) != 1:
+            return True
+        name = (calls[0].get("name") or "").strip()
+        if name not in _ALLOWED_TOOLS:
+            return True
+        args = calls[0].get("args") or {}
+        try:
+            if name == "create_asset":
+                # required: name, asset_type_code
+                CreateAssetArgs(**args)  # type: ignore[arg-type]
+            elif name == "set_asset_meta":
+                # required: asset_id and at least one field to update (checked later)
+                SetAssetMetaArgs(**args)  # type: ignore[arg-type]
+        except Exception:
+            return True
+        return False
+
+    # No tool calls: check control tag
+    content = (getattr(ai_msg, "content", None) or "").strip()
+    if not content:
+        return True
+    control_text, _ = _extract_control_tag_and_human_text(content)
+    if control_text is None:
+        # Accept pure human text (OK) — but prefer explicit control → do not enforce repair here.
+        return False
+    # Validate control grammar
+    return _interpret_ai_read_control(control_text) is None
+
 
 # --------------------------------------------------------------------------------------
 # Extract hidden control tag
@@ -293,17 +466,24 @@ def _extract_control_tag_and_human_text(content: str) -> tuple[str | None, str]:
 
 
 # --------------------------------------------------------------------------------------
-# WS events + immediate single-action ChangeSet submit; returns submitted_count
+# WS events + immediate single-action ChangeSet submit; returns (submitted_count, events)
 # --------------------------------------------------------------------------------------
 
-async def _handle_tool_calls(req: UIRequest, tool_calls: Sequence[dict[str, Any]]) -> int:
+async def _handle_tool_calls(req: UIRequest, tool_calls: Sequence[dict[str, Any]]) -> tuple[int, list[AgentEvent]]:
     submitted = 0
+    events: list[AgentEvent] = []
 
     for tc in tool_calls:
         name = tc.get("name")
         args = tc.get("args") or {}
 
         if name == "create_asset":
+            # Validate args (schema-level guard)
+            try:
+                CreateAssetArgs(**args)  # raises if invalid
+            except Exception:
+                continue
+
             if "name" not in args or "asset_type_code" not in args:
                 continue
             client_token = f"tmp-{_slug(args.get('name', 'item'))}"
@@ -319,7 +499,7 @@ async def _handle_tool_calls(req: UIRequest, tool_calls: Sequence[dict[str, Any]
                 fields=fields,
             ).model_dump()
 
-            # 1) WS change event (user sees the change immediately)
+            # WS change event (user sees the change immediately)
             await aemit_change_event(
                 "asset.create",
                 org_id=req.org_id,
@@ -328,12 +508,31 @@ async def _handle_tool_calls(req: UIRequest, tool_calls: Sequence[dict[str, Any]
                 asset_id=None,
             )
 
-            # 2) Single-action ChangeSet → immediate async submit (non-blocking)
+            # HTTP echo
+            events.append(
+                AgentEvent(
+                    event="asset.create",
+                    org_id=req.org_id,
+                    user_id=req.user_id,
+                    asset_id=None,
+                    data=action,
+                    source="AssetAgent",
+                    version="v1",
+                )
+            )
+
+            # Single-action ChangeSet → immediate async submit (non-blocking)
             cs = _make_changeset_one(req, action)
             asyncio.create_task(_submit_now(cs))
             submitted += 1
 
         elif name == "set_asset_meta":
+            # Validate args (schema-level guard)
+            try:
+                SetAssetMetaArgs(**args)  # raises if invalid
+            except Exception:
+                continue
+
             asset_id = args.get("asset_id")
             if not asset_id:
                 continue
@@ -351,7 +550,7 @@ async def _handle_tool_calls(req: UIRequest, tool_calls: Sequence[dict[str, Any]
                 fields=fields,
             ).model_dump()
 
-            # 1) WS change event
+            # WS change event
             await aemit_change_event(
                 "asset.set_meta",
                 org_id=req.org_id,
@@ -360,13 +559,26 @@ async def _handle_tool_calls(req: UIRequest, tool_calls: Sequence[dict[str, Any]
                 asset_id=asset_id,
             )
 
-            # 2) Single-action ChangeSet → immediate async submit
+            # HTTP echo
+            events.append(
+                AgentEvent(
+                    event="asset.set_meta",
+                    org_id=req.org_id,
+                    user_id=req.user_id,
+                    asset_id=asset_id,
+                    data=action,
+                    source="AssetAgent",
+                    version="v1",
+                )
+            )
+
+            # Single-action ChangeSet → immediate async submit
             cs = _make_changeset_one(req, action)
             asyncio.create_task(_submit_now(cs))
             submitted += 1
 
         # ignore any other tool (tool-gated)
-    return submitted
+    return submitted, events
 
 
 # --------------------------------------------------------------------------------------
@@ -409,10 +621,11 @@ async def _handle_read_controls(
     ai_fallback_text: str | None = None,
 ) -> UIResponse:
     backend = _get_backend()
+    lang = _pref_lang(req)
 
     if parsed is None:
         # No recognizable control line; return short hint or LLM text.
-        text = ai_fallback_text or "Tell me what you’d like to do with assets (create, update, list, detail)."
+        text = ai_fallback_text or _t(lang, "hint_generic")
         return UIResponse(messages=[text], proposals=None, staging={"needs_commit": False})
 
     kind, payload = parsed
@@ -420,17 +633,17 @@ async def _handle_read_controls(
     if kind == "READ_DETAIL":
         asset_id = payload.get("id") or ""
         if not asset_id:
-            return UIResponse(messages=["Please provide an asset ID to show its detail."], proposals=None, staging={"needs_commit": False})
+            return UIResponse(messages=[_t(lang, "need_id")], proposals=None, staging={"needs_commit": False})
         asset = await _call_async(backend.asset_get, asset_id)
         if asset is None:
             return UIResponse(
-                messages=[f"I couldn't find an asset with ID “{asset_id}”."],
+                messages=[_t(lang, "not_found", id=asset_id)],
                 proposals=None,
                 staging={"needs_commit": False},
             )
         detail = _to_asset_detail(asset)
         return UIResponse(
-            messages=[f"Here’s the asset detail for “{detail.name}”."] ,
+            messages=[_t(lang, "detail_intro", name=detail.name)],
             proposals={"asset": detail.model_dump()},
             staging={"needs_commit": False},
         )
@@ -448,7 +661,9 @@ async def _handle_read_controls(
             filters.type,
             filters.is_primary,
         )
-        items = _sort_assets(items)[:READ_PAGE_LIMIT]
+        # Respect 'number_of_assets' hint (safe cap)
+        limit = min(READ_PAGE_LIMIT, int(getattr(req, "number_of_assets", READ_PAGE_LIMIT) or READ_PAGE_LIMIT))
+        items = _sort_assets(items)[:limit]
         previews = [_to_asset_preview(a).model_dump() for a in items]
 
         parts: list[str] = []
@@ -458,16 +673,21 @@ async def _handle_read_controls(
             parts.append(f'type="{filters.type}"')
         if filters.is_primary is not None:
             parts.append("primary=true" if filters.is_primary else "primary=false")
-        suffix = f" (filters: {', '.join(parts)})" if parts else ""
+        suffix = ""
+        if parts:
+            if lang == "sk":
+                suffix = f' (filtre: {", ".join(parts)})'
+            else:
+                suffix = f' (filters: {", ".join(parts)})'
 
         return UIResponse(
-            messages=[f"I found {len(previews)} item(s){suffix}."],
+            messages=[_t(lang, "list_found", n=len(previews), suffix=suffix)],
             proposals={"assets": previews},
             staging={"needs_commit": False},
         )
 
     # Unknown kind (shouldn't happen)
-    return UIResponse(messages=["Nothing to process."], proposals=None, staging={"needs_commit": False})
+    return UIResponse(messages=[_t(_pref_lang(req), "ok")], proposals=None, staging={"needs_commit": False})
 
 
 def _fallback_read_control(message: str) -> str:
@@ -589,10 +809,12 @@ def _audit_in(req: UIRequest, intent: Intent) -> None:
                 "org_id": req.org_id,
                 "user_id": req.user_id,
                 "intent": intent,
-                "has_selection": bool(req.selection),
+                "has_selection": bool(getattr(req, "selection", None)),
                 "message_preview": (req.message[:256] + "…") if req.message and len(req.message) > 256 else req.message,
                 "ai_enabled": True,      # always-on if available
                 "send_now": True,        # no buffer, immediate submit
+                "language": _pref_lang(req),
+                "number_of_assets": getattr(req, "number_of_assets", None),
             },
         )
     except Exception:
@@ -603,14 +825,14 @@ def _slug(s: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", s)
     return s.strip("-") or "item"
 
-def _explain_response() -> UIResponse:
+def _explain_response(lang: str) -> UIResponse:
     return UIResponse(
         messages=[
-            "I’m your AssetAgent. Tell me in plain language what you want to do with assets.",
-            "• “Create a CRM asset as primary, type Information system …”",
-            "• “Update asset asset-db-001: rename to Customer DB and set primary=false.”",
-            "• “List primary Application software containing ‘crm’.”",
-            "Every change is broadcast via WS and submitted to the backend outbox as a single-action ChangeSet.",
+            _t(lang, "explain_1"),
+            _t(lang, "explain_2"),
+            _t(lang, "explain_3"),
+            _t(lang, "explain_4"),
+            _t(lang, "explain_5"),
         ],
         proposals=None,
         staging={"needs_commit": False},

@@ -22,11 +22,12 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Any, Dict, Iterable, Iterator, Mapping, MutableMapping, Optional, Tuple
+
+from workshops_ai.settings import get_settings
 
 # Optional, best-effort telemetry
 try:  # pragma: no cover
@@ -36,18 +37,15 @@ except Exception:  # pragma: no cover
         return None
 
 # ------------------------------------------------------------------------------
-# Config (env)
+# Config (centralized via settings)
 # ------------------------------------------------------------------------------
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
-
-MAX_ORG_KEYS = _env_int("WORKSHOPS_AI_MEMORY_MAX_ORG_KEYS", 1000)
-MAX_VALUE_BYTES = _env_int("WORKSHOPS_AI_MEMORY_MAX_VALUE_BYTES", 262_144)  # ~256 KiB
-SOFT_TOTAL_BYTES_PER_ORG = _env_int("WORKSHOPS_AI_MEMORY_TOTAL_MAX_BYTES", 8_388_608)  # ~8 MiB
+_SETTINGS = get_settings()
+MAX_ORG_KEYS: int = int(getattr(_SETTINGS.memory, "max_org_keys", 1000))
+MAX_VALUE_BYTES: int = int(getattr(_SETTINGS.memory, "max_value_bytes", 262_144))  # ~256 KiB
+SOFT_TOTAL_BYTES_PER_ORG: int = int(
+    getattr(_SETTINGS.memory, "soft_total_bytes_per_org", 8_388_608)
+)  # ~8 MiB
 
 # ------------------------------------------------------------------------------
 # Data model
@@ -118,7 +116,14 @@ def memory_set(
             store.total_bytes -= max(prev.size_bytes, 0)
 
         expires_at = (now + float(ttl_sec)) if ttl_sec and ttl_sec > 0 else None
-        entry = _Entry(key=key, value=value, size_bytes=size, created_at=prev.created_at if prev else now, updated_at=now, expires_at=expires_at)
+        entry = _Entry(
+            key=key,
+            value=value,
+            size_bytes=size,
+            created_at=prev.created_at if prev else now,
+            updated_at=now,
+            expires_at=expires_at,
+        )
         bucket[key] = entry
         store.total_bytes += size
 

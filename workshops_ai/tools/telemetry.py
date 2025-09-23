@@ -10,16 +10,6 @@
 #   from workshops_ai.tools.telemetry import telemetry_log
 #   telemetry_log("chat.request", {"message_preview": "list assets"}, user_id="u-1", org_id="acme")
 #
-# Environment:
-#   WORKSHOPS_AI_TELEMETRY_ENABLED   (default: "true")
-#   WORKSHOPS_AI_SERVICE_NAME        (default: "workshops_ai")
-#   WORKSHOPS_AI_SERVICE_VERSION     (default: "0.1.0")
-#   WORKSHOPS_AI_ENVIRONMENT         (default: "dev")
-#   WORKSHOPS_AI_LOG_LEVEL           (default: "INFO")  # DEBUG|INFO|WARN|ERROR
-#   WORKSHOPS_AI_LOG_TO_FILE         (default: "false")
-#   WORKSHOPS_AI_LOG_FILE_PATH       (default: "./telemetry.log")
-#   WORKSHOPS_AI_MAX_PAYLOAD_LEN     (default: "4096")  # characters for payload snapshot
-#
 # Notes:
 #   - Never raise exceptions; failures are swallowed (best-effort telemetry).
 #   - request_id is auto-fetched if available via main app; can also be passed in payload.
@@ -33,11 +23,17 @@ import os
 import queue
 import socket
 import sys
-import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
-from typing import Any, Iterable, Mapping, MutableMapping, Optional
+from typing import Any, Iterable, Mapping, Optional
+
+try:
+    # Centralized settings (preferred source of truth)
+    from workshops_ai.settings import get_settings  # type: ignore
+    _SETTINGS = get_settings()
+except Exception:  # pragma: no cover
+    _SETTINGS = None  # graceful fallback below
 
 try:
     # Optional helpers for safe dumps/redaction
@@ -55,7 +51,7 @@ except Exception:  # pragma: no cover
 
 
 # --------------------------------------------------------------------------------------
-# Config
+# Config (from settings; small env-free fallback for import-time safety)
 # --------------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -69,38 +65,46 @@ class _Config:
     log_file_path: str
     max_payload_len: int
 
-def _env_bool(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return val.strip().lower() in ("1", "true", "yes", "y", "on")
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except Exception:
-        return default
-
-def _level_from_env(val: str | None) -> int:
+def _level_from_str(val: str | None) -> int:
     mapping = {
         "DEBUG": logging.DEBUG,
         "INFO": logging.INFO,
         "WARN": logging.WARN,
         "WARNING": logging.WARN,
         "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL,
     }
     return mapping.get((val or "").strip().upper(), logging.INFO)
 
-_CFG = _Config(
-    enabled=_env_bool("WORKSHOPS_AI_TELEMETRY_ENABLED", True),
-    service=os.getenv("WORKSHOPS_AI_SERVICE_NAME", "workshops_ai"),
-    version=os.getenv("WORKSHOPS_AI_SERVICE_VERSION", "0.1.0"),
-    environment=os.getenv("WORKSHOPS_AI_ENVIRONMENT", "dev"),
-    level=_level_from_env(os.getenv("WORKSHOPS_AI_LOG_LEVEL")),
-    log_to_file=_env_bool("WORKSHOPS_AI_LOG_TO_FILE", False),
-    log_file_path=os.getenv("WORKSHOPS_AI_LOG_FILE_PATH", "./telemetry.log"),
-    max_payload_len=_env_int("WORKSHOPS_AI_MAX_PAYLOAD_LEN", 4096),
-)
+
+def _build_cfg_from_settings() -> _Config:
+    if _SETTINGS is None:
+        # Minimal sane fallback if settings import failed early
+        return _Config(
+            enabled=True,
+            service="workshops_ai",
+            version="0.1.0",
+            environment="dev",
+            level=logging.INFO,
+            log_to_file=False,
+            log_file_path="./telemetry.log",
+            max_payload_len=4096,
+        )
+    tel = getattr(_SETTINGS, "telemetry", None)
+    return _Config(
+        enabled=bool(getattr(tel, "enabled", True)),
+        service=str(getattr(_SETTINGS, "service_name", "workshops_ai")),
+        version=str(getattr(_SETTINGS, "version", "0.1.0")),
+        environment=str(getattr(_SETTINGS, "env", "dev")),
+        level=_level_from_str(getattr(tel, "level", "INFO")),
+        log_to_file=bool(getattr(tel, "log_to_file", False)),
+        log_file_path=str(getattr(tel, "log_file_path", "./telemetry.log")),
+        max_payload_len=int(getattr(tel, "max_payload_len", 16_000)),
+    )
+
+
+_CFG = _build_cfg_from_settings()
 
 
 # --------------------------------------------------------------------------------------
@@ -151,8 +155,10 @@ if not _logger.handlers:
 _hostname = socket.gethostname()
 _pid = os.getpid()
 
+
 def _iso_utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
 
 def _try_get_request_id() -> Optional[str]:
     """
@@ -165,10 +171,12 @@ def _try_get_request_id() -> Optional[str]:
     except Exception:
         return None
 
+
 def _level_to_int(level: str | int | None) -> int:
     if isinstance(level, int):
         return level
-    return _level_from_env(str(level or "INFO"))
+    return _level_from_str(str(level or "INFO"))
+
 
 def _coerce_mapping(obj: Any) -> Mapping[str, Any] | None:
     if obj is None:

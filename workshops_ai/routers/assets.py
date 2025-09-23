@@ -9,6 +9,7 @@
 # - Non-blocking: sync CSV backend wrapped via asyncio.to_thread.
 # - Stable keys (EN codes) – do not localize catalog codes in responses.
 # - Consistent error model (delegated to global handlers in main app).
+# - Auth: API-key/JWT via centralized settings (same behavior as /chat).
 
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
+from workshops_ai.app.security import require_auth  # ← unified auth (API-key/JWT)
 from workshops_ai.backend.port import BackendPort
 from workshops_ai.backend.csv_backend import CsvBackend  # MVP backend
 from workshops_ai.tools.telemetry import telemetry_log
@@ -234,13 +236,14 @@ async def list_assets(
     type: str | None = Query(None, alias="type", description="Asset type (EN code from catalog)"),
     is_primary: bool | None = Query(None, description="Filter primary assets"),
     backend: BackendPort = Depends(get_backend),
+    _auth=Depends(require_auth),  # ← enforce unified auth (same as /chat)
 ) -> ListAssetsResponse:
     """
     Returns a filtered list of assets for the given organization.
     - Filtering by `search`, `type`, `is_primary` is optional.
     - Response is capped by backend (or the caller can paginate later via API evolution).
     """
-    # Telemetry (non-blocking)
+    # Telemetry (best-effort, non-blocking)
     try:
         telemetry_log(
             "rest.assets.list",
@@ -285,13 +288,14 @@ async def get_asset(
     asset_id: str,
     org_id: str = Query(..., description="Organization identifier"),
     backend: BackendPort = Depends(get_backend),
+    _auth=Depends(require_auth),  # ← enforce unified auth (same as /chat)
 ) -> AssetOut:
     """
     Returns a single asset by its ID.
     - org_id is currently unused by CSV backend for direct get, but kept for compatibility
       with prospective API backends (multi-tenant).
     """
-    # Telemetry (non-blocking)
+    # Telemetry (best-effort, non-blocking)
     try:
         telemetry_log(
             "rest.assets.get",
