@@ -3,25 +3,39 @@
 #   Read-only helpers to query CSV catalogs for “explain/help” use-cases.
 #   - Zero writes. Dependency-light (stdlib csv).
 #   - Hot-reload via mtime cache.
-#   - Heuristic column detection (tolerant to header variants).
+#   - Heuristic column + delimiter/encoding detection.
 #   - Safe: never raises for missing catalogs; returns empty results instead.
 #
 # Catalogs (expected locations; resilient if absent):
 #   <settings.paths.catalogs_dir>/Asset type.csv
 #   <settings.paths.catalogs_dir>/Asset type x Threat.csv
-#   (Placeholders for future: Impacts.csv, Threats.csv, Controls.csv)
+#   <settings.paths.catalogs_dir>/Threat.csv
+#   <settings.paths.catalogs_dir>/Threat category.csv
+#   <settings.paths.catalogs_dir>/Threat x Threat category.csv
 #
-# API (stable, small):
+# API:
 #   list_asset_types() -> list[str]
 #   search_asset_types(q: str|None, *, limit=50) -> list[str]
 #   explain_asset_type(code: str) -> dict|None
 #   mapped_threats_for_asset_type(asset_type_code: str) -> list[str]
+#
+#   list_threat_categories() -> list[str]
+#   normalize_threat_category(code_or_alias: str) -> str|None
+#   explain_threat_category(category_code: str) -> dict|None
+#
+#   normalize_threat_code(code_or_alias: str) -> str|None
+#   search_threats(q: str|None, *, category: str|None = None,
+#                  apply_asset_type: str|None = None, limit=200) -> list[dict]
+#   list_threats(...)  -> alias of search_threats (same params)
+#   explain_threat(code: str) -> dict|None
+#
 #   generic_search(file_name: str, q: str|None, *, fields: list[str]|None = None, limit=50) -> list[dict]
-
+#
 
 from __future__ import annotations
 
 import csv
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -45,11 +59,10 @@ _CAT_DIR = Path(_SETTINGS.paths.catalogs_dir).resolve()
 _CAT_ASSET_TYPE_FILE = _CAT_DIR / "Asset type.csv"
 _CAT_AT_X_THREAT_FILE = _CAT_DIR / "Asset type x Threat.csv"
 
-# Future reserved (may not exist yet)
-_CAT_IMPACTS_FILE = _CAT_DIR / "Impacts.csv"
-_CAT_THREATS_FILE = _CAT_DIR / "Threats.csv"
-_CAT_CONTROLS_FILE = _CAT_DIR / "Controls.csv"
-
+# Threat catalogs
+_CAT_THREAT_FILE = _CAT_DIR / "Threat.csv"
+_CAT_THREAT_CATEGORY_FILE = _CAT_DIR / "Threat category.csv"
+_CAT_THREAT_X_CATEGORY_FILE = _CAT_DIR / "Threat x Threat category.csv"
 
 # --------------------------------------------------------------------------------------
 # CSV cache (mtime-aware)
@@ -78,30 +91,53 @@ class _CsvCache:
             self.mtime, self.rows = 0.0, []
             return self.rows or []
 
+# ---- file reading (encoding + delimiter detection) -----------------------------------
 
-def _read_csv(path: Path) -> list[dict[str, str]]:
-    # Try utf-8-sig first (handles BOM); fall back to utf-8 then cp1250 for EU exports
+def _detect_encoding_and_delimiter(path: Path) -> tuple[str, str]:
+    """
+    Detect encoding among utf-8-sig → utf-8 → cp1250 and delimiter via csv.Sniffer.
+    Falls back to ('utf-8-sig', ',') if unsure. Semicolon is common in EU CSVs.
+    """
+    sample_bytes = b""
+    try:
+        with path.open("rb") as fb:
+            sample_bytes = fb.read(4096)
+    except FileNotFoundError:
+        return "utf-8-sig", ","
+
     for enc in ("utf-8-sig", "utf-8", "cp1250"):
         try:
-            with path.open("r", encoding=enc, newline="") as f:
-                reader = csv.DictReader(f)
-                # Normalize headers (strip whitespace/BOM remnants)
-                if reader.fieldnames:
-                    reader.fieldnames = [h.strip() for h in reader.fieldnames]
-                out: list[dict[str, str]] = []
-                for row in reader:
-                    # Trim values; keep strings only (csv gives str or None)
-                    clean = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
-                    out.append(clean)
-                return out
+            sample_text = sample_bytes.decode(enc, errors="strict")
         except UnicodeDecodeError:
             continue
-    # Last resort: try reading raw and let csv handle whatever it can
-    with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
-        reader = csv.DictReader(f)
+        delim = ","
+        try:
+            sniffer = csv.Sniffer()
+            dialect = sniffer.sniff(sample_text, delimiters=",;\t|")
+            delim = dialect.delimiter or delim
+        except Exception:
+            if ";" in sample_text and sample_text.count(";") > sample_text.count(","):
+                delim = ";"
+        return enc, delim
+
+    return "utf-8-sig", ","
+
+
+def _read_csv(path: Path) -> list[dict[str, str]]:
+    """Read CSV into list[dict]. Robust to BOM, semicolons, CP1250; trims headers/values."""
+    enc, delim = _detect_encoding_and_delimiter(path)
+    with path.open("r", encoding=enc, newline="") as f:
+        reader = csv.DictReader(f, delimiter=delim)
         if reader.fieldnames:
             reader.fieldnames = [h.strip() for h in reader.fieldnames]
-        return [{k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()} for row in reader]
+        out: list[dict[str, str]] = []
+        for row in reader:
+            clean = {
+                (k.strip() if isinstance(k, str) else k): (v.strip() if isinstance(v, str) else v)
+                for k, v in row.items()
+            }
+            out.append(clean)
+        return out
 
 
 def _first_present_column(rows: list[dict[str, str]], candidates: Iterable[str]) -> Optional[str]:
@@ -115,15 +151,43 @@ def _first_present_column(rows: list[dict[str, str]], candidates: Iterable[str])
 
 
 # --------------------------------------------------------------------------------------
+# Text normalization (diacritics, case, separators)
+# --------------------------------------------------------------------------------------
+
+def _slug(s: str | None) -> str:
+    """
+    Lowercased, ASCII-only slug for tolerant matching:
+      - removes diacritics (č->c, ě->e, ľ->l, etc.)
+      - strips non-alnum to single spaces
+      - trims spaces
+    """
+    if not s:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", s)
+    base = "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+    out = []
+    prev_space = False
+    for ch in base.lower():
+        if ch.isalnum():
+            out.append(ch)
+            prev_space = False
+        else:
+            if not prev_space:
+                out.append(" ")
+                prev_space = True
+    return " ".join("".join(out).split())
+
+
+# --------------------------------------------------------------------------------------
 # Catalog indices
 # --------------------------------------------------------------------------------------
 
 _asset_types = _CsvCache(_CAT_ASSET_TYPE_FILE)
 _at_x_threat = _CsvCache(_CAT_AT_X_THREAT_FILE)
 
-_impacts = _CsvCache(_CAT_IMPACTS_FILE)
-_threats = _CsvCache(_CAT_THREATS_FILE)
-_controls = _CsvCache(_CAT_CONTROLS_FILE)
+_threats = _CsvCache(_CAT_THREAT_FILE)
+_threat_categories = _CsvCache(_CAT_THREAT_CATEGORY_FILE)
+_threat_x_category = _CsvCache(_CAT_THREAT_X_CATEGORY_FILE)
 
 
 # --------------------------------------------------------------------------------------
@@ -135,8 +199,9 @@ def list_asset_types() -> list[str]:
     rows = _asset_types.load()
     if not rows:
         return []
-    # Header heuristics (prefer code-like names)
-    col = _first_present_column(rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name")) or next(iter(rows[0].keys()))
+    col = _first_present_column(
+        rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name")
+    ) or next(iter(rows[0].keys()))
     seen: set[str] = set()
     out: list[str] = []
     for r in rows:
@@ -153,8 +218,9 @@ def search_asset_types(q: str | None, *, limit: int = 50) -> list[str]:
     if not rows:
         return []
     qn = (q or "").casefold()
-    code_col = _first_present_column(rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name")) or next(iter(rows[0].keys()))
-    # If there is a separate 'name' column, include it in matching
+    code_col = _first_present_column(
+        rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name")
+    ) or next(iter(rows[0].keys()))
     name_col = _first_present_column(rows, ("name", "Name", "label", "Label"))
 
     seen: set[str] = set()
@@ -182,12 +248,280 @@ def explain_asset_type(code: str) -> dict[str, str] | None:
     rows = _asset_types.load()
     if not rows:
         return None
-    col = _first_present_column(rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name")) or next(iter(rows[0].keys()))
+    col = _first_present_column(
+        rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name")
+    ) or next(iter(rows[0].keys()))
     needle = code.strip()
     for r in rows:
         if (r.get(col) or "").strip() == needle:
-            return dict(r)  # return a copy
+            return dict(r)
     return None
+
+
+# --------------------------------------------------------------------------------------
+# Public API – Threat categories
+# --------------------------------------------------------------------------------------
+
+def list_threat_categories() -> list[str]:
+    """Return canonical threat category codes (best-effort header detection)."""
+    rows = _threat_categories.load()
+    if not rows:
+        return []
+    col = _first_present_column(
+        rows,
+        ("category_code", "code", "Category", "Threat category", "threat_category", "EN Name", "Name"),
+    ) or next(iter(rows[0].keys()))
+    seen: set[str] = set()
+    out: list[str] = []
+    for r in rows:
+        v = (r.get(col) or "").strip()
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _category_row_by_any(value: str) -> dict[str, str] | None:
+    """Best-effort match of a category by code or human label (CZ/SK/EN tolerant)."""
+    if not value:
+        return None
+    rows = _threat_categories.load()
+    if not rows:
+        return None
+    code_cols = ("category_code", "code")
+    name_cols = ("name", "Name", "EN Name", "CZ Name", "SK Name", "Threat category", "Category")
+    code_col = _first_present_column(rows, code_cols)
+    sl_value = _slug(value)
+    if code_col:
+        for r in rows:
+            if (r.get(code_col) or "").strip() == value.strip():
+                return r
+    cols = [c for c in (code_cols + name_cols) if _first_present_column(rows, (c,))]
+    for r in rows:
+        for c in cols:
+            v = r.get(c)
+            if v and _slug(v) == sl_value:
+                return r
+    return None
+
+
+def normalize_threat_category(code_or_alias: str) -> Optional[str]:
+    """
+    Normalize a user-provided category (EN code or CZ/SK/EN alias) to the canonical EN code.
+    Returns None if no match.
+    """
+    row = _category_row_by_any(code_or_alias)
+    if not row:
+        return None
+    for c in ("category_code", "code"):
+        if c in row and row[c]:
+            return row[c].strip()
+    for c in ("name", "Name", "EN Name", "Threat category", "Category"):
+        if c in row and row[c]:
+            return row[c].strip()
+    return None
+
+
+def explain_threat_category(category_code: str) -> Optional[dict[str, str]]:
+    """Return the full row for a canonical category code (or None)."""
+    if not category_code:
+        return None
+    rows = _threat_categories.load()
+    if not rows:
+        return None
+    col = _first_present_column(rows, ("category_code", "code"))
+    needle = category_code.strip()
+    if not col:
+        return None
+    for r in rows:
+        if (r.get(col) or "").strip() == needle:
+            return dict(r)
+    return None
+
+
+# --------------------------------------------------------------------------------------
+# Public API – Threats
+# --------------------------------------------------------------------------------------
+
+def _build_threat_index() -> dict[str, dict[str, Any]]:
+    """
+    Build a minimal, search-friendly index:
+      code, name, description?, flags{intentional,unintentional,environmental},
+      categories: [code], category: first or None, asset_types: [code]
+    """
+    t_rows = _threats.load()
+    if not t_rows:
+        return {}
+
+    code_col = _first_present_column(t_rows, ("code", "threat_code", "Code", "Threat", "ID", "EN Name"))
+    name_col = _first_present_column(t_rows, ("name", "Name", "EN Name", "Threat name", "Threat"))
+    desc_col = _first_present_column(t_rows, ("description", "Description", "EN Description", "Notes", "EN Notes", "Note"))
+    intentional_col = _first_present_column(t_rows, ("intentional", "Intentional"))
+    unintentional_col = _first_present_column(t_rows, ("unintentional", "Unintentional", "accidental"))
+    environmental_col = _first_present_column(t_rows, ("environmental", "Environmental", "env"))
+
+    # Threat ↔ category mapping
+    txc = _threat_x_category.load()
+    txc_threat_col = _first_present_column(txc, ("threat_code", "Threat", "Threat code", "code", "EN Name"))
+    txc_cat_col = _first_present_column(
+        txc, ("category_code", "Category", "Threat category", "threat_category", "code", "EN Name")
+    )
+    threat_to_categories: dict[str, list[str]] = {}
+    if txc and txc_threat_col and txc_cat_col:
+        for r in txc:
+            th = (r.get(txc_threat_col) or "").strip()
+            cat = (r.get(txc_cat_col) or "").strip()
+            if th and cat:
+                threat_to_categories.setdefault(th, [])
+                if cat not in threat_to_categories[th]:
+                    threat_to_categories[th].append(cat)
+
+    # Asset type ↔ threat mapping (respect "Value" truthiness when present)
+    att = _at_x_threat.load()
+    att_asset_col = _first_present_column(att, ("asset_type", "Asset type"))
+    att_threat_col = _first_present_column(att, ("threat_code", "Threat", "threat", "EN Name"))
+    att_value_col = _first_present_column(att, ("Value", "Include", "Included", "Enabled"))
+    threat_to_asset_types: dict[str, list[str]] = {}
+    if att and att_threat_col:
+        for r in att:
+            if att_value_col:
+                val = (r.get(att_value_col) or "").strip().lower()
+                if val and val not in {"1", "true", "t", "yes", "y", "ano"}:
+                    continue  # only include truthy mappings
+            at = (r.get(att_asset_col) or "").strip() if att_asset_col else None
+            th = (r.get(att_threat_col) or "").strip()
+            if th:
+                threat_to_asset_types.setdefault(th, [])
+                if at and at not in threat_to_asset_types[th]:
+                    threat_to_asset_types[th].append(at)
+
+    # Build index
+    idx: dict[str, dict[str, Any]] = {}
+    for r in t_rows:
+        code = ((r.get(code_col) or "") if code_col else "").strip()
+        if not code:
+            continue
+        name = ((r.get(name_col) or "") if name_col else "").strip()
+        desc = ((r.get(desc_col) or "") if desc_col else "").strip() or None
+        flags = {
+            "intentional": _truthy(r.get(intentional_col)) if intentional_col else False,
+            "unintentional": _truthy(r.get(unintentional_col)) if unintentional_col else False,
+            "environmental": _truthy(r.get(environmental_col)) if environmental_col else False,
+        }
+        cats = list(threat_to_categories.get(code, []))
+        cat_primary = cats[0] if cats else None
+        ats = list(threat_to_asset_types.get(code, []))
+        idx[code] = {
+            "code": code,
+            "name": name or code,
+            "description": desc,
+            "flags": flags,
+            "categories": cats,
+            "category": cat_primary,
+            "asset_types": ats,
+        }
+    return idx
+
+
+def _truthy(v: Any) -> bool:
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "ano"}
+
+
+def normalize_threat_code(code_or_alias: str) -> Optional[str]:
+    """
+    Normalize a user-provided threat handle (code or human name) to the canonical code.
+    - Exact code match first (case-sensitive then case-insensitive).
+    - Then slug-match against the 'name' field.
+    """
+    if not code_or_alias:
+        return None
+    idx = _build_threat_index()
+    if not idx:
+        return None
+    raw = code_or_alias.strip()
+    if raw in idx:
+        return raw
+    lower_map = {k.lower(): k for k in idx.keys()}
+    if raw.lower() in lower_map:
+        return lower_map[raw.lower()]
+    sl = _slug(raw)
+    for th in idx.values():
+        if _slug(th.get("name")) == sl:
+            return th["code"]
+    return None
+
+
+def search_threats(
+    q: str | None,
+    *,
+    category: str | None = None,
+    apply_asset_type: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """
+    Search threats with tolerant filters:
+      - q: substring (code/name/description/categories/asset_types), diacritics-insensitive
+      - category: accepts EN code or CZ/SK/EN alias; normalized to canonical code
+      - apply_asset_type: filter threats mapped to given asset-type code (respects Value=TRUE)
+    Returns detailed dicts: {code, name, description?, flags, categories, category, asset_types}
+    """
+    idx = _build_threat_index()
+    if not idx:
+        return []
+    items = list(idx.values())
+
+    if category:
+        norm_cat = normalize_threat_category(category)
+        if norm_cat:
+            items = [t for t in items if norm_cat in (t.get("categories") or [])]
+        else:
+            items = []  # unknown category → empty
+
+    if apply_asset_type:
+        at = apply_asset_type.strip()
+        items = [t for t in items if at in (t.get("asset_types") or [])]
+
+    if q:
+        qn = _slug(q)
+
+        def _hay(t: dict[str, Any]) -> str:
+            return _slug(
+                " ".join(
+                    [
+                        t.get("code") or "",
+                        t.get("name") or "",
+                        t.get("description") or "",
+                        " ".join(t.get("categories") or []),
+                        " ".join(t.get("asset_types") or []),
+                    ]
+                )
+            )
+
+        items = [t for t in items if qn in _hay(t)]
+
+    items.sort(key=lambda t: (t.get("code") or "").casefold())
+    return items[: max(0, limit)]
+
+
+def list_threats(
+    q: str | None = None,
+    *,
+    category: str | None = None,
+    apply_asset_type: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Alias to search_threats (same parameters)."""
+    return search_threats(q, category=category, apply_asset_type=apply_asset_type, limit=limit)
+
+
+def explain_threat(code: str) -> Optional[dict[str, Any]]:
+    """Return the indexed detail dict for a threat code (or None)."""
+    if not code:
+        return None
+    idx = _build_threat_index()
+    return dict(idx.get(code)) if (idx and code in idx) else None
 
 
 # --------------------------------------------------------------------------------------
@@ -198,6 +532,7 @@ def mapped_threats_for_asset_type(asset_type_code: str) -> list[str]:
     """
     Return unique threat codes mapped to the given asset type using the
     "Asset type x Threat.csv" mapping catalog. Empty if catalog missing.
+    Respects 'Value' (or Include/Included/Enabled) column when present.
     """
     if not asset_type_code:
         return []
@@ -206,7 +541,9 @@ def mapped_threats_for_asset_type(asset_type_code: str) -> list[str]:
         return []
 
     asset_col = _first_present_column(rows, ("asset_type", "Asset type"))
-    threat_col = _first_present_column(rows, ("threat_code", "Threat", "threat"))
+    threat_col = _first_present_column(rows, ("threat_code", "Threat", "threat", "EN Name"))
+    value_col = _first_present_column(rows, ("Value", "Include", "Included", "Enabled"))
+
     if not threat_col:
         return []
 
@@ -217,6 +554,10 @@ def mapped_threats_for_asset_type(asset_type_code: str) -> list[str]:
             a = (r.get(asset_col) or "").strip()
             if a != needle:
                 continue
+        if value_col:
+            val = (r.get(value_col) or "").strip().lower()
+            if val and val not in {"1", "true", "t", "yes", "y", "ano"}:
+                continue
         t = (r.get(threat_col) or "").strip()
         if t:
             out.add(t)
@@ -224,7 +565,7 @@ def mapped_threats_for_asset_type(asset_type_code: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------------------
-# Generic search (for future catalogs; safe & reusable)
+# Generic search (for arbitrary catalogs; safe & reusable)
 # --------------------------------------------------------------------------------------
 
 def generic_search(file_name: str, q: str | None, *, fields: list[str] | None = None, limit: int = 50) -> list[dict[str, str]]:
@@ -259,7 +600,6 @@ def generic_search(file_name: str, q: str | None, *, fields: list[str] | None = 
         if len(res) >= limit:
             break
 
-    # Telemetry (best-effort)
     try:
         telemetry_log(
             "catalog.search",
@@ -273,9 +613,21 @@ def generic_search(file_name: str, q: str | None, *, fields: list[str] | None = 
 
 
 __all__ = [
+    # Asset types
     "list_asset_types",
     "search_asset_types",
     "explain_asset_type",
+    # Threat categories
+    "list_threat_categories",
+    "normalize_threat_category",
+    "explain_threat_category",
+    # Threats
+    "normalize_threat_code",
+    "search_threats",
+    "list_threats",
+    "explain_threat",
+    # Mappings
     "mapped_threats_for_asset_type",
+    # Generic
     "generic_search",
 ]

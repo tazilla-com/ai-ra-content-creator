@@ -4,6 +4,7 @@
 # - Minimal, FastAPI-friendly broadcast hub with async registration.
 # - Used by agents/services to push UI events (optimistic updates).
 # - Provides a dedicated emitter for ImpactAgent: aemit_impact_set_level(payload).
+# - Also provides a risk emitter: aemit_risk_set_probability(payload).
 #
 # Design goals
 # - Thread-safe via a single asyncio.Lock for the clients set.
@@ -13,9 +14,11 @@
 # Public API
 # - register(ws: WebSocket) / unregister(ws: WebSocket)
 # - connected_count() -> int
-# - broadcast(event: str, payload: dict)  # adds {"event": event, **payload}
-# - broadcast_json(payload: dict)         # expects "event" already present
-# - aemit_impact_set_level(payload: dict) # validates WSImpactSetEvent, then broadcast_json
+# - broadcast(event: str, payload: dict)   # adds {"event": event, **payload}
+# - emit(event: str, payload: dict)        # alias to broadcast(...)
+# - broadcast_json(payload: dict)          # expects "event" already present
+# - aemit_impact_set_level(payload: dict)  # validates WSImpactSetEvent, then broadcast_json
+# - aemit_risk_set_probability(payload: dict) # validates WSRiskSetEvent (or wraps plain item)
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from typing import Any, Set
 from fastapi import WebSocket
 
 from workshops_ai.schemas.impact_models import WSImpactSetEvent
+from workshops_ai.schemas.risk_models import WSRiskSetEvent, RiskChangeItem
 
 
 class WsHub:
@@ -67,6 +71,13 @@ class WsHub:
         await cls.broadcast_json(message)
 
     @classmethod
+    async def emit(cls, event: str, payload: dict[str, Any]) -> None:
+        """
+        Alias for broadcast(...). Provided for convenience.
+        """
+        await cls.broadcast(event, payload)
+
+    @classmethod
     async def broadcast_json(cls, payload: dict[str, Any]) -> None:
         """
         Broadcast a JSON payload to all connected clients.
@@ -102,4 +113,29 @@ class WsHub:
           - note?, actor, ts (ISO8601)
         """
         evt = WSImpactSetEvent.model_validate(payload)
+        await cls.broadcast_json(evt.model_dump())
+
+    @classmethod
+    async def aemit_risk_set_probability(cls, payload: dict[str, Any]) -> None:
+        """
+        Validate and emit a 'risk.set_probability' event to all clients.
+
+        Accepts either:
+          1) A full envelope:
+             {"event": "risk.set_probability", "payload": {...RiskChangeItem...}}
+          2) A plain item (will be wrapped):
+             {"asset_id": "...", "threat_code": "...", "probability": 3, "note": "...?"}
+
+        When a plain item is provided, it is normalized into a RiskChangeItem,
+        which adds an ISO8601 timestamp (`ts`) and a stable UUIDv5 `idempotency_key`.
+        """
+        # If already a full event envelope, validate & forward
+        if "event" in payload and "payload" in payload:
+            evt = WSRiskSetEvent.model_validate(payload)
+            await cls.broadcast_json(evt.model_dump())
+            return
+
+        # Otherwise, normalize plain item → envelope
+        item = RiskChangeItem.model_validate(payload)
+        evt = WSRiskSetEvent(event="risk.set_probability", payload=item)
         await cls.broadcast_json(evt.model_dump())

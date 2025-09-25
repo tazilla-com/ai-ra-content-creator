@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import queue
+import re
 import socket
 import sys
 from dataclasses import dataclass
@@ -35,20 +36,118 @@ try:
 except Exception:  # pragma: no cover
     _SETTINGS = None  # graceful fallback below
 
-try:
-    # Optional helpers for safe dumps/redaction
-    from workshops_ai.tools.guard_validate_payload import safe_model_dump, redact_for_log  # type: ignore
-except Exception:  # pragma: no cover
-    def safe_model_dump(obj: Any, *, max_len: int = 2048) -> Any:  # type: ignore
+# --------------------------------------------------------------------------------------
+# Redaction utilities (dependency-free)
+# --------------------------------------------------------------------------------------
+
+# Common sensitive key names to redact (case-insensitive exact field name match)
+_SENSITIVE_KEYS = {
+    "password", "pass", "pwd",
+    "token", "access_token", "refresh_token",
+    "secret", "client_secret", "secret_key",
+    "authorization", "authorization_header", "auth",
+    "api_key", "apikey", "x-api-key",
+    "bearer", "session", "cookie",
+}
+
+# PII patterns (emails, phone numbers, credit card-like, UUIDs if considered sensitive)
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_PHONE_RE = re.compile(r"\+?[0-9][0-9\s\-()]{6,}")
+_CC_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")  # very loose, just to avoid logging numbers
+# Keep UUIDs visible by default (often harmless in logs), set to True to mask them:
+_MASK_UUIDS = False
+_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", re.I)
+
+def redact_pii(s: str | None) -> str | None:
+    """Redact common PII patterns in arbitrary strings (best-effort)."""
+    try:
+        if not s:
+            return s
+        out = s
+        out = _EMAIL_RE.sub("[redacted-email]", out)
+        out = _PHONE_RE.sub("[redacted-phone]", out)
+        out = _CC_RE.sub("[redacted-cc]", out)
+        if _MASK_UUIDS:
+            out = _UUID_RE.sub("[redacted-uuid]", out)
+        return out
+    except Exception:  # pragma: no cover
+        return s
+
+def _redact_value(val: Any) -> Any:
+    """Apply PII redaction to leaf values while preserving types."""
+    try:
+        if isinstance(val, str):
+            return redact_pii(val)
+        # numbers/bools/None unchanged
+        if isinstance(val, (int, float, bool)) or val is None:
+            return val
+        # For other simple leafs, attempt string redaction but keep original if conversion fails
+        if isinstance(val, (bytes, bytearray)):
+            try:
+                return redact_pii(val.decode("utf-8", errors="ignore"))
+            except Exception:
+                return "[redacted-bytes]"
+        return val
+    except Exception:  # pragma: no cover
+        return val
+
+def redact_for_log(obj: Any, *, sensitive_keys: Iterable[str] = _SENSITIVE_KEYS) -> Any:
+    """
+    Recursively redact values for keys considered sensitive (case-insensitive),
+    and scrub PII patterns from strings. Keeps structure (dict/list/tuple).
+    """
+    try:
+        sens = {str(k).lower() for k in sensitive_keys}
+
+        def _walk(x: Any) -> Any:
+            if isinstance(x, Mapping):
+                red: dict[str, Any] = {}
+                for k, v in x.items():
+                    k_str = str(k)
+                    if k_str.lower() in sens:
+                        red[k_str] = "[redacted]"
+                    else:
+                        red[k_str] = _walk(v)
+                return red
+            if isinstance(x, list):
+                return [_walk(v) for v in x]
+            if isinstance(x, tuple):
+                return tuple(_walk(v) for v in x)
+            # leaf
+            return _redact_value(x)
+
+        return _walk(obj)
+    except Exception:  # pragma: no cover
+        return obj
+
+def safe_model_dump(obj: Any, *, max_len: int = 2048) -> Any:
+    """
+    Best-effort serialization guard: returns JSON-serializable shape or
+    a pruned textual repr not exceeding max_len.
+    """
+    try:
+        # If already JSON-ish (dict/list/tuple/scalar), return as-is
+        if isinstance(obj, (Mapping, list, tuple, str, int, float, bool)) or obj is None:
+            # If it's a huge string, trim it
+            if isinstance(obj, str) and len(obj) > max_len:
+                return obj[:max_len] + "…"
+            return obj
+        # pydantic v2 model?
+        if hasattr(obj, "model_dump"):
+            try:
+                return obj.model_dump(mode="json")
+            except Exception:
+                pass
+        # Try generic 'dict()'
         try:
-            s = repr(obj)
-            return (s[:max_len] + "…") if len(s) > max_len else obj
+            return dict(obj)  # type: ignore[arg-type]
         except Exception:
-            return "<unserializable>"
-
-    def redact_for_log(obj: Any, *, sensitive_keys: Iterable[str] = ("password", "token", "secret", "authorization", "api_key", "apikey", "bearer")) -> Any:  # type: ignore
-        return obj  # minimal fallback
-
+            pass
+        # Fallback to repr (trimmed)
+        s = repr(obj)
+        return (s[:max_len] + "…") if len(s) > max_len else s
+    except Exception:  # pragma: no cover
+        return "<unserializable>"
 
 # --------------------------------------------------------------------------------------
 # Config (from settings; small env-free fallback for import-time safety)
@@ -65,7 +164,6 @@ class _Config:
     log_file_path: str
     max_payload_len: int
 
-
 def _level_from_str(val: str | None) -> int:
     mapping = {
         "DEBUG": logging.DEBUG,
@@ -76,7 +174,6 @@ def _level_from_str(val: str | None) -> int:
         "CRITICAL": logging.CRITICAL,
     }
     return mapping.get((val or "").strip().upper(), logging.INFO)
-
 
 def _build_cfg_from_settings() -> _Config:
     if _SETTINGS is None:
@@ -89,7 +186,7 @@ def _build_cfg_from_settings() -> _Config:
             level=logging.INFO,
             log_to_file=False,
             log_file_path="./telemetry.log",
-            max_payload_len=4096,
+            max_payload_len=16_000,
         )
     tel = getattr(_SETTINGS, "telemetry", None)
     return _Config(
@@ -103,9 +200,7 @@ def _build_cfg_from_settings() -> _Config:
         max_payload_len=int(getattr(tel, "max_payload_len", 16_000)),
     )
 
-
 _CFG = _build_cfg_from_settings()
-
 
 # --------------------------------------------------------------------------------------
 # Logger (non-blocking)
@@ -147,7 +242,6 @@ if not _logger.handlers:
             _logger.removeHandler(h)
         _logger.addHandler(stdout_handler)
 
-
 # --------------------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------------------
@@ -155,10 +249,8 @@ if not _logger.handlers:
 _hostname = socket.gethostname()
 _pid = os.getpid()
 
-
 def _iso_utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
 
 def _try_get_request_id() -> Optional[str]:
     """
@@ -171,12 +263,10 @@ def _try_get_request_id() -> Optional[str]:
     except Exception:
         return None
 
-
 def _level_to_int(level: str | int | None) -> int:
     if isinstance(level, int):
         return level
     return _level_from_str(str(level or "INFO"))
-
 
 def _coerce_mapping(obj: Any) -> Mapping[str, Any] | None:
     if obj is None:
@@ -188,7 +278,6 @@ def _coerce_mapping(obj: Any) -> Mapping[str, Any] | None:
         return dict(obj)  # type: ignore[arg-type]
     except Exception:
         return {"value": safe_model_dump(obj, max_len=_CFG.max_payload_len)}
-
 
 # --------------------------------------------------------------------------------------
 # Public API
@@ -271,5 +360,4 @@ def telemetry_log(
         # Best-effort: never raise from telemetry
         pass
 
-
-__all__ = ["telemetry_log"]
+__all__ = ["telemetry_log", "redact_pii", "redact_for_log", "safe_model_dump"]

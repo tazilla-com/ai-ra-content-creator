@@ -2,22 +2,25 @@
 # -----------------------------------------------------------------------------
 # Purpose
 # Minimal-yet-enterprise router for Workshop Agents.
-# For now it supports two tabs and dispatches accordingly:
-#   - active_tab == "assets"  → AssetAgent (emit-only)
-#   - active_tab == "impacts" → ImpactAgent (LangChain tools, send-now)
+# Now supports three tabs and dispatches accordingly:
+#   - active_tab == "assets"   → AssetAgent (emit-only)
+#   - active_tab == "impacts"  → ImpactAgent (LangChain tools, send-now)
+#   - active_tab == "threats"  → ThreatAgent (LangChain tools, send-now)
 #
 # Design notes
 # - Contract-first: route_chat(UIRequest) -> UIResponse (strict Pydantic types).
 # - Tool-gating by active_tab (security-by-design; no cross-tab calls).
 # - Lightweight intent detector (read | propose | change | explain) for assets path
-#   to keep backward compatibility with your AssetAgent signature.
+#   to keep backward compatibility with AssetAgent signature.
 # - Per-request telemetry (best-effort), structured messages in the agent.
 # - Defensive imports (avoid cycles). If an agent isn’t wired yet, return a graceful UIResponse.
-# - Both tabs operate in EMIT-ONLY / SEND-NOW semantics (WS optimistic + submit ChangeSet).
+# - All tabs operate in EMIT-ONLY / SEND-NOW semantics (WS optimistic + submit ChangeSet).
+# - Agent execution timeout (fail-fast; configurable via settings.agent_timeout_sec*).
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Final, Literal, TypedDict, cast
 
 from pydantic import ValidationError
@@ -25,6 +28,7 @@ from pydantic import ValidationError
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 from workshops_ai.tools.telemetry import telemetry_log
 from workshops_ai.tools.memory import memory_get, memory_set
+from workshops_ai.settings import get_settings
 
 # -----------------------------------------------------------------------------
 # Types & constants
@@ -39,10 +43,32 @@ class ToolGate(TypedDict):
 
 
 TOOL_GATES: Final[dict[str, ToolGate]] = {
-    "assets":   {"tools": ["assets_list", "asset_get", "create_asset", "set_asset_meta"], "writes_allowed": True},
+    "assets":   {
+        "tools": ["assets_list", "asset_get", "create_asset", "set_asset_meta"],
+        "writes_allowed": True,
+    },
     # Impacts = send-now tools; no staging/commit in UI
-    "impacts":  {"tools": ["list_impacts", "asset_get_impacts", "set_impact_level", "bulk_set_impact_levels", "explain_impacts"], "writes_allowed": True},
-    "threats":  {"tools": ["list_threats", "asset_get_risks"], "writes_allowed": False},
+    "impacts":  {
+        "tools": [
+            "list_impacts",
+            "asset_get_impacts",
+            "set_impact_level",
+            "bulk_set_impact_levels",
+            "explain_impacts",
+        ],
+        "writes_allowed": True,
+    },
+    # Threats enabled with writes (send-now semantics)
+    "threats":  {
+        "tools": [
+            "list_threats",
+            "explain_threats",
+            "set_risk_probability",
+            "bulk_set_risk_probability",
+            "upsert_threat",
+        ],
+        "writes_allowed": True,
+    },
     "controls": {"tools": ["list_controls", "get_control_coverage"], "writes_allowed": False},
 }
 
@@ -51,6 +77,13 @@ DEFAULT_RESPONSE: Final[UIResponse] = UIResponse(
     proposals=None,
     staging={"needs_commit": False},
 )
+
+_SETTINGS = get_settings()
+# Global default timeout for agents
+_AGENT_TIMEOUT_SEC: Final[int] = int(getattr(_SETTINGS, "agent_timeout_sec", 45))
+# Per-tab overrides (fallback to global)
+_IMPACTS_TIMEOUT_SEC: Final[int] = int(getattr(_SETTINGS, "agent_timeout_sec_impacts", _AGENT_TIMEOUT_SEC))
+_THREATS_TIMEOUT_SEC: Final[int] = int(getattr(_SETTINGS, "agent_timeout_sec_threats", _AGENT_TIMEOUT_SEC))
 
 # -----------------------------------------------------------------------------
 # Public entrypoint
@@ -76,7 +109,7 @@ async def route_chat(req: UIRequest) -> UIResponse:
     if gate is None:
         # Unknown tab – reply explicitly and do not attempt any tools.
         return UIResponse(
-            messages=[f"Tab “{req.active_tab}” is not supported yet. Use Assets or Impacts."],
+            messages=[f"Tab “{req.active_tab}” is not supported yet. Use Assets, Impacts or Threats."],
             proposals=None,
             staging={"needs_commit": False},
         )
@@ -90,6 +123,9 @@ async def route_chat(req: UIRequest) -> UIResponse:
 
     if active_tab == "impacts":
         return await _dispatch_impacts(req)
+
+    if active_tab == "threats":
+        return await _dispatch_threats(req)
 
     # Known but not implemented tabs – reply clearly, no silent fallthrough.
     return UIResponse(
@@ -129,7 +165,11 @@ async def _dispatch_assets(req: UIRequest, intent: Intent) -> UIResponse:
         )
 
     try:
-        result = await asset_run(req, intent)  # pass the original req object unchanged
+        # Fail-fast guard: timeout agent execution
+        result = await asyncio.wait_for(asset_run(req, intent), timeout=_AGENT_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        telemetry_log("manager.asset_agent_timeout", {"timeout_sec": _AGENT_TIMEOUT_SEC})
+        return _fail("AssetAgent execution timed out.", req, details={"timeout_sec": _AGENT_TIMEOUT_SEC})
     except Exception as e:
         telemetry_log("manager.asset_agent_runtime_error", {"error": str(e)})
         return _fail("AssetAgent execution failed. Please check agent logs.", req, details=str(e))
@@ -157,6 +197,9 @@ async def _dispatch_impacts(req: UIRequest) -> UIResponse:
         memory_set(req.org_id, "impacts.last_message", (req.message or "")[:200])
         if (aid := _selection_asset_id(req)) is not None:
             memory_set(req.org_id, "impacts.last_selected_asset_id", aid)
+        # Optional locale shadow for observability
+        if getattr(req, "locale", None):
+            memory_set(req.org_id, "impacts.locale", str(req.locale))
     except Exception:
         pass
 
@@ -201,10 +244,65 @@ async def _dispatch_impacts(req: UIRequest) -> UIResponse:
     # Construct agent and run
     try:
         agent = ImpactAgent(backend_port=backend, ws_hub=WsHub)
-        result = await agent.run(req)  # agent handles LangChain + tools routing
+        result = await asyncio.wait_for(agent.run(req), timeout=_IMPACTS_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        telemetry_log("manager.impact_agent_timeout", {"timeout_sec": _IMPACTS_TIMEOUT_SEC})
+        return _fail("ImpactAgent execution timed out.", req, details={"timeout_sec": _IMPACTS_TIMEOUT_SEC})
     except Exception as e:
         telemetry_log("manager.impact_agent_runtime_error", {"error": str(e)})
         return _fail("ImpactAgent execution failed. Please check agent logs.", req, details=str(e))
+
+    # Validate outgoing payload & ensure optimistic policy
+    try:
+        resp = UIResponse.model_validate(result)
+        policy = dict(getattr(resp, "policy", {}) or {})
+        policy["emit_changes_enabled"] = True
+        resp.policy = policy  # type: ignore[attr-defined]
+        return resp
+    except ValidationError as ve:
+        telemetry_log("manager.response_validation_error", {"errors": ve.errors()})
+        return _fail("Agent response failed UIResponse validation.", req, details=ve.errors())
+
+
+async def _dispatch_threats(req: UIRequest) -> UIResponse:
+    """
+    Call ThreatAgent (LangChain tools, SEND-NOW).
+    ThreatAgent sets policy.emit_changes_enabled=True in its own response as well.
+    """
+    # Persist lightweight per-tab memory (best-effort)
+    try:
+        memory_set(req.org_id, "threats.last_message", (req.message or "")[:200])
+        if (aid := _selection_asset_id(req)) is not None:
+            memory_set(req.org_id, "threats.last_selected_asset_id", aid)
+        if getattr(req, "locale", None):
+            memory_set(req.org_id, "threats.locale", str(req.locale))
+    except Exception:
+        pass
+
+    # Lazy import to avoid import cycles; ThreatAgent entrypoint is module-level run(req)
+    try:
+        from workshops_ai.agents.threat_agent import run as threat_run  # type: ignore
+    except Exception as e:
+        telemetry_log("manager.threat_agent_not_available", {"error": str(e)})
+        return UIResponse(
+            messages=[
+                "ThreatAgent is not available (module not loaded). "
+                "Check `workshops_ai/agents/threat_agent.py` (function `run`)."
+            ],
+            proposals=None,
+            staging={"needs_commit": False},
+            policy={"emit_changes_enabled": True},
+        )
+
+    # Run with fail-fast timeout
+    try:
+        result = await asyncio.wait_for(threat_run(req), timeout=_THREATS_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        telemetry_log("manager.threat_agent_timeout", {"timeout_sec": _THREATS_TIMEOUT_SEC})
+        return _fail("ThreatAgent execution timed out.", req, details={"timeout_sec": _THREATS_TIMEOUT_SEC})
+    except Exception as e:
+        telemetry_log("manager.threat_agent_runtime_error", {"error": str(e)})
+        return _fail("ThreatAgent execution failed. Please check agent logs.", req, details=str(e))
 
     # Validate outgoing payload & ensure optimistic policy
     try:

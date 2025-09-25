@@ -4,10 +4,10 @@
 #   - Strict Pydantic v2 validation (fail-closed at edges)
 #   - Request ID + timing middleware
 #   - Sessions (Redis) + simple rate-limit middleware
-#   - CORS (configurable via settings.cors_origins)
+#   - CORS (configurable via settings.cors_origins) with prod hardening
 #   - Consistent JSON error model (prefers orjson if available)
 #   - LangChain/LangSmith tracing env export via centralized settings (no getenv reads)
-#   - Safe fallbacks if /chat, /ws, or /assets router are not implemented
+#   - Canonical router imports (fail-fast in prod; no legacy fallbacks)
 #   - Chat UI is provided by workshops_ai/chatui/router.py
 
 from __future__ import annotations
@@ -149,6 +149,33 @@ class TimingMiddleware:
         await self.app(scope, receive, send_wrapper)
 
 
+class SecurityHeadersMiddleware:
+    """
+    Add a few basic security headers. Keep CSP minimal to avoid breaking the demo UI.
+    For production, consider serving UI with a stricter CSP policy.
+    """
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = dict(message.get("headers", []))
+                def _set(name: bytes, val: str):
+                    headers[name.lower()] = val.encode()
+
+                _set(b"x-content-type-options", "nosniff")
+                _set(b"x-frame-options", "DENY")
+                _set(b"referrer-policy", "no-referrer")
+                # Only set HSTS outside dev; assumes HTTPS termination upstream
+                if settings.env != "dev":
+                    _set(b"strict-transport-security", "max-age=63072000; includeSubDomains; preload")
+
+                message["headers"] = list(headers.items())
+            await send(message)
+        await self.app(scope, receive, send_wrapper)
+
+
 # ------------------------------------------------------------------------------
 # Error model & handlers (unified envelope)
 # ------------------------------------------------------------------------------
@@ -234,6 +261,10 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
 # App factory
 # ------------------------------------------------------------------------------
 def create_app() -> FastAPI:
+    # CORS hardening: if "*" in prod, fail fast to avoid accidental wide-open CORS
+    if settings.env != "dev" and settings.cors_origins == ["*"]:
+        raise RuntimeError("CORS '*' is not allowed outside dev. Configure settings.cors_origins with explicit domains.")
+
     app = FastAPI(
         title=settings.service_name,
         version=settings.version,
@@ -247,6 +278,7 @@ def create_app() -> FastAPI:
     # Core middleware (order matters)
     app.add_middleware(RequestIDMiddleware)  # adds headers on the way out
     app.add_middleware(TimingMiddleware)
+    app.add_middleware(SecurityHeadersMiddleware)
     # Sessions (cookie + Redis). Secure cookie if env != "dev".
     app.add_middleware(SessionMiddleware, secure_cookie=(settings.env != "dev"))
     # HTTP rate-limit (per session/IP per route, fixed 1-minute window)
@@ -294,87 +326,74 @@ def create_app() -> FastAPI:
     app.include_router(chatui_router, tags=["_demo"])
 
     # --------------------------------------------------------------------------
-    # Mount /chat (HTTP router) + safe fallback
-    # Prefer the API router we implemented: workshops_ai.api.app.router
-    # Protect with auth dependency if available.
+    # Canonical routers (fail-fast if missing in prod; dev has explicit fallbacks)
     # --------------------------------------------------------------------------
-    try:
-        from workshops_ai.api.app import router as chat_router  # PREFERRED (our new /chat)
+    def _mount_or_fallback(name: str, mount: Callable[[], None], fallback: Callable[[], None]) -> None:
+        try:
+            mount()
+            logger.info("%s mounted", name)
+        except Exception as e:
+            if settings.env != "dev":
+                # In prod we fail hard to surface misconfiguration early
+                raise
+            logger.warning("%s not mounted, using dev fallback: %s", name, e)
+            fallback()
+
+    # /chat
+    def _mount_chat():
+        from workshops_ai.api.app import router as chat_router  # canonical
         app.include_router(chat_router, tags=["chat"], dependencies=_AUTH_DEP)
-        logger.info("chat_router mounted (api.app)")
-    except Exception:
-        try:
-            from workshops_ai.routers.chat_router import router as chat_router  # NEW canonical (if exists)
-            app.include_router(chat_router, tags=["chat"], dependencies=_AUTH_DEP)
-            logger.info("chat_router mounted (routers.chat_router)")
-        except Exception:
-            try:
-                from workshops_ai.app.routers.chat_router import router as chat_router  # LEGACY path
-                app.include_router(chat_router, tags=["chat"], dependencies=_AUTH_DEP)
-                logger.info("chat_router mounted (app.routers.chat_router)")
-            except Exception as e:  # pragma: no cover
-                logger.warning('chat_router not mounted: %s', e)
-                fallback = APIRouter()
 
-                @fallback.post(
-                    "/chat",
-                    tags=["chat"],
-                    response_class=_DEFAULT_RESPONSE_CLASS,
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                )
-                async def chat_not_ready(_: Request) -> dict[str, Any]:
-                    return {
-                        "error": {
-                            "type": "not_ready",
-                            "message": "Chat router not mounted yet. Implement workshops_ai.api.app.router",
-                        },
-                        "request_id": get_request_id(),
-                    }
+    def _fallback_chat():
+        router = APIRouter()
+        @router.post(
+            "/chat",
+            tags=["chat"],
+            response_class=_DEFAULT_RESPONSE_CLASS,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        async def chat_not_ready(_: Request) -> dict[str, Any]:
+            return {
+                "error": {
+                    "type": "not_ready",
+                    "message": "Chat router not mounted. Implement workshops_ai.api.app.router",
+                },
+                "request_id": get_request_id(),
+            }
+        app.include_router(router)
 
-                app.include_router(fallback)
+    _mount_or_fallback("chat_router", _mount_chat, _fallback_chat)
 
-    # --------------------------------------------------------------------------
-    # Mount /ws (WebSocket router) + safe fallback (prefer new path, then legacy)
-    # --------------------------------------------------------------------------
-    try:
-        from workshops_ai.routers.ws_router import router as ws_router  # NEW canonical
+    # /ws
+    def _mount_ws():
+        from workshops_ai.routers.ws_router import router as ws_router  # canonical
         app.include_router(ws_router, tags=["ws"], dependencies=_AUTH_DEP)
-        logger.info("ws_router mounted")
-    except Exception:
-        try:
-            from workshops_ai.app.routers.ws_router import router as ws_router  # LEGACY path
-            app.include_router(ws_router, tags=["ws"], dependencies=_AUTH_DEP)
-            logger.info("ws_router mounted (legacy path)")
-        except Exception as e:  # pragma: no cover
-            logger.warning("ws_router not mounted: %s", e)
-            ws_fallback = APIRouter()
 
-            @ws_fallback.websocket("/ws")
-            async def ws_not_ready(websocket: WebSocket) -> None:
-                await websocket.accept()
-                await websocket.send_json({
-                    "error": {
-                        "type": "not_ready",
-                        "message": "WS router not mounted yet. Implement workshops_ai.app.routers.ws_router.router"
-                    },
-                    "request_id": get_request_id(),
-                })
-                await websocket.close()
+    def _fallback_ws():
+        router = APIRouter()
+        @router.websocket("/ws")
+        async def ws_not_ready(websocket: WebSocket) -> None:
+            await websocket.accept()
+            await websocket.send_json({
+                "error": {
+                    "type": "not_ready",
+                    "message": "WS router not mounted. Implement workshops_ai.routers.ws_router.router"
+                },
+                "request_id": get_request_id(),
+            })
+            await websocket.close()
+        app.include_router(router)
 
-            app.include_router(ws_fallback)
+    _mount_or_fallback("ws_router", _mount_ws, _fallback_ws)
 
-    # --------------------------------------------------------------------------
-    # Mount /assets (HTTP router) + safe fallback (preferred path only; MVP exists)
-    # --------------------------------------------------------------------------
-    try:
-        from workshops_ai.routers.assets import router as assets_router  # NEW canonical
+    # /assets
+    def _mount_assets():
+        from workshops_ai.routers.assets import router as assets_router  # canonical
         app.include_router(assets_router, tags=["assets"], dependencies=_AUTH_DEP)
-        logger.info("assets_router mounted")
-    except Exception as e:  # pragma: no cover
-        logger.warning("assets_router not mounted: %s", e)
-        assets_fallback = APIRouter()
 
-        @assets_fallback.get(
+    def _fallback_assets():
+        router = APIRouter()
+        @router.get(
             "/api/assets",
             tags=["assets"],
             response_class=_DEFAULT_RESPONSE_CLASS,
@@ -384,12 +403,13 @@ def create_app() -> FastAPI:
             return {
                 "error": {
                     "type": "not_ready",
-                    "message": "Assets router not mounted yet. Implement workshops_ai.routers.assets.router",
+                    "message": "Assets router not mounted. Implement workshops_ai.routers.assets.router",
                 },
                 "request_id": get_request_id(),
             }
+        app.include_router(router)
 
-        app.include_router(assets_fallback)
+    _mount_or_fallback("assets_router", _mount_assets, _fallback_assets)
 
     return app
 

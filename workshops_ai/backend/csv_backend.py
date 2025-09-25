@@ -7,7 +7,10 @@
 #
 # Files (relative to configured paths):
 #   catalogs/Asset type.csv
-#   catalogs/Asset type x Threat.csv  (not used by AssetAgent MVP; prewired for later)
+#   catalogs/Threat.csv
+#   catalogs/Threat category.csv
+#   catalogs/Threat x Threat category.csv
+#   catalogs/Asset type x Threat.csv
 #   state/assets.csv
 #
 # Notes:
@@ -75,7 +78,12 @@ _CAT_DIR = Path(_s.paths.catalogs_dir).resolve()
 
 _ASSETS_STATE_FILE = _STATE_DIR / "assets.csv"
 _CAT_ASSET_TYPE_FILE = _CAT_DIR / "Asset type.csv"
-_CAT_AT_X_THREAT_FILE = _CAT_DIR / "Asset type x Threat.csv"  # reserved for future
+_CAT_AT_X_THREAT_FILE = _CAT_DIR / "Asset type x Threat.csv"  # asset-type ↔ threat mapping
+
+# New threat catalogs
+_CAT_THREAT_FILE = _CAT_DIR / "Threat.csv"
+_CAT_THREAT_CATEGORY_FILE = _CAT_DIR / "Threat category.csv"
+_CAT_THREAT_X_CATEGORY_FILE = _CAT_DIR / "Threat x Threat category.csv"
 
 
 # --------------------------------------------------------------------------------------
@@ -174,8 +182,15 @@ class _Catalogs:
     """Lazy, cached access to catalog CSVs with resilient column heuristics."""
 
     def __init__(self) -> None:
+        # Asset types + mappings
         self.asset_types = _CsvCache(_CAT_ASSET_TYPE_FILE)
         self.asset_type_x_threat = _CsvCache(_CAT_AT_X_THREAT_FILE)
+        # Threats + categories
+        self.threats = _CsvCache(_CAT_THREAT_FILE)
+        self.threat_categories = _CsvCache(_CAT_THREAT_CATEGORY_FILE)
+        self.threat_x_category = _CsvCache(_CAT_THREAT_X_CATEGORY_FILE)
+
+    # ------------------------ Asset type catalog ------------------------
 
     def list_asset_types(self) -> list[str]:
         rows = self.asset_types.load()
@@ -206,29 +221,155 @@ class _Catalogs:
                 res.append(code)
         return res
 
-    # Reserved for later agents; keep stubs resilient to missing files
-    def list_threats(self, apply_asset_type: str | None = None) -> list[str]:
-        rows = self.asset_type_x_threat.load()
+    # ------------------------ Threat categories ------------------------
+
+    def list_threat_categories(self) -> list[str]:
+        """Return canonical category codes found in Threat category.csv."""
+        rows = self.threat_categories.load()
         if not rows:
             return []
-        # Heuristics: expect columns like ["Asset type","Threat"] or ["asset_type","threat_code"]
-        asset_col = _first_present_column(rows, ("asset_type", "Asset type"))
-        threat_col = _first_present_column(rows, ("threat_code", "Threat", "threat"))
-        if threat_col is None:
-            return []
-        threats: list[str] = []
-        if apply_asset_type and asset_col:
-            for r in rows:
-                if (r.get(asset_col) or "").strip() == apply_asset_type:
-                    t = (r.get(threat_col) or "").strip()
-                    if t:
-                        threats.append(t)
-            return sorted(set(threats))
+        col = _first_present_column(
+            rows,
+            ("category_code", "code", "Category", "Threat category", "threat_category", "Name", "EN Name"),
+        )
+        if col is None:
+            col = next(iter(rows[0].keys()))
+        seen: set[str] = set()
+        out: list[str] = []
         for r in rows:
-            t = (r.get(threat_col) or "").strip()
-            if t:
-                threats.append(t)
-        return sorted(set(threats))
+            v = (r.get(col) or "").strip()
+            if v and v not in seen:
+                seen.add(v)
+                out.append(v)
+        return out
+
+    # ------------------------ Threats (detail + list) -------------------
+
+    def _build_threat_index(self) -> dict[str, dict[str, Any]]:
+        """
+        Build a dict: code -> threat dict with fields:
+          code, name, description?, flags{intentional,unintentional,environmental},
+          categories: [category_code...], category: first or None,
+          asset_types: [asset_type_code...]
+        """
+        t_rows = self.threats.load()
+        if not t_rows:
+            return {}
+
+        # Column heuristics
+        code_col = _first_present_column(t_rows, ("code", "threat_code", "Code", "Threat", "ID"))
+        name_col = _first_present_column(t_rows, ("name", "Name", "EN Name", "Threat name"))
+        desc_col = _first_present_column(t_rows, ("description", "Description", "EN Description", "Note"))
+        intentional_col = _first_present_column(t_rows, ("intentional", "Intentional"))
+        unintentional_col = _first_present_column(t_rows, ("unintentional", "Unintentional", "accidental"))
+        environmental_col = _first_present_column(t_rows, ("environmental", "Environmental", "env"))
+
+        # Threat ↔ category mapping
+        txc = self.threat_x_category.load()
+        txc_threat_col = _first_present_column(txc, ("threat_code", "Threat", "Threat code", "code"))
+        txc_cat_col = _first_present_column(
+            txc, ("category_code", "Category", "Threat category", "threat_category", "code")
+        )
+        threat_to_categories: dict[str, list[str]] = {}
+        if txc and txc_threat_col and txc_cat_col:
+            for r in txc:
+                th = (r.get(txc_threat_col) or "").strip()
+                cat = (r.get(txc_cat_col) or "").strip()
+                if th and cat:
+                    threat_to_categories.setdefault(th, [])
+                    if cat not in threat_to_categories[th]:
+                        threat_to_categories[th].append(cat)
+
+        # Asset type ↔ threat mapping
+        att = self.asset_type_x_threat.load()
+        att_asset_col = _first_present_column(att, ("asset_type", "Asset type"))
+        att_threat_col = _first_present_column(att, ("threat_code", "Threat", "threat"))
+        threat_to_asset_types: dict[str, list[str]] = {}
+        if att and att_asset_col and att_threat_col:
+            for r in att:
+                at = (r.get(att_asset_col) or "").strip()
+                th = (r.get(att_threat_col) or "").strip()
+                if at and th:
+                    threat_to_asset_types.setdefault(th, [])
+                    if at not in threat_to_asset_types[th]:
+                        threat_to_asset_types[th].append(at)
+
+        # Build index
+        index: dict[str, dict[str, Any]] = {}
+        for r in t_rows:
+            code = ((r.get(code_col) or "") if code_col else "").strip()
+            if not code:
+                continue
+            name = ((r.get(name_col) or "") if name_col else "").strip()
+            desc = ((r.get(desc_col) or "") if desc_col else "").strip() or None
+            flags = {
+                "intentional": _parse_bool((r.get(intentional_col) or "") if intentional_col else None) or False,
+                "unintentional": _parse_bool((r.get(unintentional_col) or "") if unintentional_col else None) or False,
+                "environmental": _parse_bool((r.get(environmental_col) or "") if environmental_col else None) or False,
+            }
+            cats = list(threat_to_categories.get(code, []))
+            cat_primary = cats[0] if cats else None
+            ats = list(threat_to_asset_types.get(code, []))
+            index[code] = {
+                "code": code,
+                "name": name or code,
+                "description": desc,
+                "flags": flags,
+                "categories": cats,
+                "category": cat_primary,
+                "asset_types": ats,
+            }
+        return index
+
+    def threat_detail(self, code: str) -> dict[str, Any] | None:
+        """Return a single threat detail dict or None if not found."""
+        idx = self._build_threat_index()
+        return idx.get((code or "").strip()) if idx else None
+
+    def list_threats(
+        self,
+        *,
+        q: str | None = None,
+        category: str | None = None,
+        apply_asset_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Return detailed threats with optional filters:
+          - q: case-insensitive substring match over code/name/description
+          - category: filter by category code (from Threat x Threat category.csv)
+          - apply_asset_type: filter by mapped asset type (from Asset type x Threat.csv)
+        """
+        idx = self._build_threat_index()
+        if not idx:
+            return []
+
+        items = list(idx.values())
+
+        if category:
+            cat_norm = category.strip().casefold()
+            items = [t for t in items if any(c.casefold() == cat_norm for c in t.get("categories", []))]
+
+        if apply_asset_type:
+            at_norm = apply_asset_type.strip()
+            items = [t for t in items if at_norm in (t.get("asset_types") or [])]
+
+        if q:
+            qn = q.casefold()
+            def _hay(t: dict[str, Any]) -> str:
+                return " ".join(
+                    [
+                        t.get("code") or "",
+                        t.get("name") or "",
+                        t.get("description") or "",
+                        " ".join(t.get("categories") or []),
+                        " ".join(t.get("asset_types") or []),
+                    ]
+                ).casefold()
+            items = [t for t in items if qn in _hay(t)]
+
+        # Stable order: by code
+        items.sort(key=lambda t: (t.get("code") or "").casefold())
+        return items
 
 
 # --------------------------------------------------------------------------------------
@@ -509,8 +650,24 @@ class CsvBackend(BackendPort):
         # Placeholder – wire to catalogs when available
         return []
 
-    def list_threats(self, apply_asset_type: str | None = None) -> list[str]:
-        return self._catalogs.list_threats(apply_asset_type)
+    def list_threat_categories(self) -> list[str]:
+        """Expose threat categories to callers (codes only)."""
+        return self._catalogs.list_threat_categories()
+
+    def list_threats(self, apply_asset_type: str | None = None, **kwargs) -> list[dict[str, Any]]:
+        """
+        Return detailed threats with optional filters.
+        Accepts extra kwargs:
+          - q: substring filter (code/name/description)
+          - category: category code filter
+        """
+        q = kwargs.get("q")
+        category = kwargs.get("category")
+        return self._catalogs.list_threats(q=q, category=category, apply_asset_type=apply_asset_type)
+
+    def threat_detail(self, code: str) -> dict[str, Any] | None:
+        """Expose single-threat detail (dict) to callers."""
+        return self._catalogs.threat_detail(code)
 
     def list_controls(self, category: str | None = None, include_coverage: bool = True) -> list[str]:
         # Placeholder – wire to catalogs when available

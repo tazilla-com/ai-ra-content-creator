@@ -12,7 +12,7 @@
 # - HTTP auth token supports both raw token and already-prefixed "Bearer ...".
 # - File names are defensive and cross-platform friendly.
 # - Asynchronous variant is recommended from WS/agent code paths.
-# - Designed for send-now ImpactAgent (e.g., kind="impact.set_level"), but generic.
+# - Designed for send-now Impact/Asset agents; supports idempotency keys end-to-end.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import random
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional
 
 import httpx
 from pydantic import BaseModel
@@ -58,14 +58,16 @@ def _safe_component(s: str | None) -> str:
     return s[:64] or "x"
 
 
-def _headers() -> Dict[str, str]:
+def _headers(idempotency_key: Optional[str] = None) -> Dict[str, str]:
     cfg = get_settings().tazila
-    headers = {"Content-Type": "application/json"}
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
     tok = (getattr(cfg, "auth_token", None) or "").strip()
     if tok:
         if not tok.lower().startswith("bearer "):
             tok = f"Bearer {tok}"
         headers["Authorization"] = tok
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
     return headers
 
 
@@ -76,7 +78,7 @@ def _file_name(payload: Dict[str, Any]) -> str:
     """
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     kind = _safe_component(str(payload.get("kind") or "changeset"))
-    ikey = _safe_component(str(payload.get("idempotency_key") or "nokey")[:12])
+    ikey = _safe_component(str(payload.get("idempotency_key") or "nokey")[:24])
     org = _safe_component(str(payload.get("org_id") or "noorg"))
     return f"{ts}_{kind}_{org}_{ikey}.json"
 
@@ -98,27 +100,36 @@ async def _write_file_async(payload: Dict[str, Any]) -> str:
 
 def _should_retry(exc_or_status: Any) -> bool:
     """
-    Decide if the request should be retried:
-      - network errors / timeouts
-      - HTTP 5xx
-      - 429 (Too Many Requests)
+    Retry pouze pro:
+      - síťové chyby/timeouty,
+      - HTTP 5xx,
+      - HTTP 429.
+    Na 4xx (krom 429) NERETRYUJEME.
     """
-    if isinstance(exc_or_status, Exception):
+    # přímo status kód (int)
+    if isinstance(exc_or_status, int):
+        return exc_or_status >= 500 or exc_or_status == 429
+
+    # httpx HTTPStatusError (má response se status kódem)
+    if isinstance(exc_or_status, httpx.HTTPStatusError):
+        sc = getattr(exc_or_status, "response", None)
+        sc = getattr(sc, "status_code", None)
+        return (sc is not None) and (sc >= 500 or sc == 429)
+
+    # ostatní request/network chyby (timeout, connect, atd.) → retry
+    if isinstance(exc_or_status, (httpx.TimeoutException, httpx.RequestError)):
         return True
-    try:
-        status = int(exc_or_status)
-    except Exception:
-        return False
-    return status >= 500 or status == 429
+
+    return False
 
 
-async def _http_post_async(payload: Dict[str, Any]) -> Dict[str, Any]:
+async def _http_post_async(payload: Dict[str, Any], *, idempotency_key: Optional[str]) -> Dict[str, Any]:
     cfg = get_settings().tazila
     endpoint = getattr(cfg, "endpoint", None)
     timeout = getattr(cfg, "timeout_sec", 30)
     max_retries = int(getattr(cfg, "max_retries", 3))
     if not endpoint:
-        return {"mode": "http", "status": None, "response": "No endpoint configured"}
+        return {"mode": "http", "status": None, "response": "No endpoint configured", "idempotency_key": idempotency_key}
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         attempt = 0
@@ -126,22 +137,22 @@ async def _http_post_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         while True:
             attempt += 1
             try:
-                r = await client.post(endpoint, json=payload, headers=_headers())
+                r = await client.post(endpoint, json=payload, headers=_headers(idempotency_key))
                 if _should_retry(r.status_code) and attempt <= max_retries:
                     # Exponential backoff with jitter
                     await asyncio.sleep((2 ** (attempt - 1)) + random.random())
-                else:
-                    r.raise_for_status()
-                    try:
-                        body = r.json()
-                    except Exception:
-                        body = r.text
-                    return {
-                        "mode": "http",
-                        "status": r.status_code,
-                        "response": body,
-                        "idempotency_key": payload.get("idempotency_key"),
-                    }
+                    continue
+                r.raise_for_status()
+                try:
+                    body = r.json()
+                except Exception:
+                    body = r.text
+                return {
+                    "mode": "http",
+                    "status": r.status_code,
+                    "response": body,
+                    "idempotency_key": idempotency_key,
+                }
             except (httpx.HTTPError, httpx.TimeoutException) as e:
                 last_error = str(e)
                 if attempt <= max_retries and _should_retry(e):
@@ -151,17 +162,17 @@ async def _http_post_async(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "mode": "http",
                     "status": None,
                     "error": last_error,
-                    "idempotency_key": payload.get("idempotency_key"),
+                    "idempotency_key": idempotency_key,
                 }
 
 
-def _http_post_sync(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _http_post_sync(payload: Dict[str, Any], *, idempotency_key: Optional[str]) -> Dict[str, Any]:
     cfg = get_settings().tazila
     endpoint = getattr(cfg, "endpoint", None)
     timeout = getattr(cfg, "timeout_sec", 30)
     max_retries = int(getattr(cfg, "max_retries", 3))
     if not endpoint:
-        return {"mode": "http", "status": None, "response": "No endpoint configured"}
+        return {"mode": "http", "status": None, "response": "No endpoint configured", "idempotency_key": idempotency_key}
 
     with httpx.Client(timeout=timeout) as client:
         attempt = 0
@@ -169,23 +180,23 @@ def _http_post_sync(payload: Dict[str, Any]) -> Dict[str, Any]:
         while True:
             attempt += 1
             try:
-                r = client.post(endpoint, json=payload, headers=_headers())
+                r = client.post(endpoint, json=payload, headers=_headers(idempotency_key))
                 if _should_retry(r.status_code) and attempt <= max_retries:
                     # Simple sync backoff
                     import time
                     time.sleep((2 ** (attempt - 1)) + random.random())
-                else:
-                    r.raise_for_status()
-                    try:
-                        body = r.json()
-                    except Exception:
-                        body = r.text
-                    return {
-                        "mode": "http",
-                        "status": r.status_code,
-                        "response": body,
-                        "idempotency_key": payload.get("idempotency_key"),
-                    }
+                    continue
+                r.raise_for_status()
+                try:
+                    body = r.json()
+                except Exception:
+                    body = r.text
+                return {
+                    "mode": "http",
+                    "status": r.status_code,
+                    "response": body,
+                    "idempotency_key": idempotency_key,
+                }
             except (httpx.HTTPError, httpx.TimeoutException) as e:
                 last_error = str(e)
                 if attempt <= max_retries and _should_retry(e):
@@ -196,7 +207,7 @@ def _http_post_sync(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "mode": "http",
                     "status": None,
                     "error": last_error,
-                    "idempotency_key": payload.get("idempotency_key"),
+                    "idempotency_key": idempotency_key,
                 }
 
 
@@ -204,13 +215,20 @@ def _http_post_sync(payload: Dict[str, Any]) -> Dict[str, Any]:
 # Synchronous API (backward compatible)
 # -----------------------------------------------------------------------------
 
-def submit_changeset(cs: BaseModel | Mapping[str, Any]) -> Dict[str, Any]:
+def submit_changeset(
+    cs: BaseModel | Mapping[str, Any],
+    *,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Synchronous submit suitable for CLI/scripts.
     NOTE: In async code paths (e.g., WS/agents), prefer `asubmit_changeset` to avoid blocking.
     """
     cfg = get_settings().tazila
     payload = _payload(cs)
+    # propagate idempotency (header + body + filename)
+    if idempotency_key and "idempotency_key" not in payload:
+        payload["idempotency_key"] = idempotency_key
 
     mode = str(getattr(cfg, "mode", "file")).lower()
     if mode == "file":
@@ -218,13 +236,13 @@ def submit_changeset(cs: BaseModel | Mapping[str, Any]) -> Dict[str, Any]:
         return {"mode": "file", "path": fpath, "idempotency_key": payload.get("idempotency_key")}
 
     if mode == "http":
-        result = _http_post_sync(payload)
+        result = _http_post_sync(payload, idempotency_key=idempotency_key or payload.get("idempotency_key"))
         return result
 
     return {
         "mode": "disabled",
         "reason": "TAZILA mode is disabled or misconfigured",
-        "idempotency_key": payload.get("idempotency_key"),
+        "idempotency_key": payload.get("idempotency_key") or idempotency_key,
     }
 
 
@@ -232,7 +250,11 @@ def submit_changeset(cs: BaseModel | Mapping[str, Any]) -> Dict[str, Any]:
 # Asynchronous API (non-blocking; recommended for WS / async handlers)
 # -----------------------------------------------------------------------------
 
-async def asubmit_changeset(cs: BaseModel | Mapping[str, Any]) -> Dict[str, Any]:
+async def asubmit_changeset(
+    cs: BaseModel | Mapping[str, Any],
+    *,
+    idempotency_key: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Asynchronous submit:
       - file mode: writes JSON via asyncio.to_thread (non-blocking)
@@ -241,6 +263,9 @@ async def asubmit_changeset(cs: BaseModel | Mapping[str, Any]) -> Dict[str, Any]
     """
     cfg = get_settings().tazila
     payload = _payload(cs)
+    # propagate idempotency (header + body + filename)
+    if idempotency_key and "idempotency_key" not in payload:
+        payload["idempotency_key"] = idempotency_key
 
     mode = str(getattr(cfg, "mode", "file")).lower()
     if mode == "file":
@@ -248,11 +273,11 @@ async def asubmit_changeset(cs: BaseModel | Mapping[str, Any]) -> Dict[str, Any]
         return {"mode": "file", "path": fpath, "idempotency_key": payload.get("idempotency_key")}
 
     if mode == "http":
-        result = await _http_post_async(payload)
+        result = await _http_post_async(payload, idempotency_key=idempotency_key or payload.get("idempotency_key"))
         return result
 
     return {
         "mode": "disabled",
         "reason": "TAZILA mode is disabled or misconfigured",
-        "idempotency_key": payload.get("idempotency_key"),
+        "idempotency_key": payload.get("idempotency_key") or idempotency_key,
     }

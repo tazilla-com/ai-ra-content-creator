@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pytest_cache
+.pytype
+.mypy_cache
+.coverage
+htmlcov/
+
+# Venvs / tooling
+.venv
+.envrc
+*.egg-info/
+dist/
+build/
+
+# Git / IDE
+.git
+.gitignore
+.gitattributes
+.vscode
+.idea
+.DS_Store
+
+# App runtime
+logs/
+data/
+outbox/
+node_modules/
+.env

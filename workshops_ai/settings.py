@@ -152,7 +152,7 @@ class AppSettings(BaseSettings):
       WORKSHOPS_AI_SECURITY__API_KEYS=["dev-key"]
       WORKSHOPS_AI_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
       WORKSHOPS_AI_PATHS__DATA_DIR=/mnt/data
-      WORKSHOPS_AI_LLM__MODEL=gpt-4o-mini
+      WORKSHOPS_AI_LLM__MODEL=gpt-4o-mini 
     """
     model_config = SettingsConfigDict(
         env_prefix="WORKSHOPS_AI_",
@@ -167,7 +167,7 @@ class AppSettings(BaseSettings):
     version: str = "0.1.0"
     log_level: str = "INFO"
     app_host: str = "0.0.0.0"
-    app_port: int = 8080
+    app_port: int = 8000
     enable_docs: bool = True
     reload: bool = True
 

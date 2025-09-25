@@ -72,7 +72,7 @@ WORKSHOPS_AI_RATELIMIT__PER_MINUTE=120
 # ===================== FastAPI server ======================
 APP_HOST=0.0.0.0
 APP_PORT=8000
-ENABLE_DOCS=false
+ENABLE_DOCS=true # prod false
 
 # ==================== LLM / OpenAI =========================
 OPENAI_API_KEY=

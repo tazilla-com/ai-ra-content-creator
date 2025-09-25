@@ -1,10 +1,12 @@
 # File: workshops_ai/agents/asset_agent.py
+# -----------------------------------------------------------------------------
 # Role: AssetAgent (tab: "assets") — LangChain-based AI agent (NO BUFFER, send-now semantics)
 # Mode: EMIT-ONLY WRITES (always enabled)
 # - Capabilities: list/detail (read-only) + NL → (create_asset | set_asset_meta)
 # - On every change the agent:
 #     1) emits a WS JSON event via WsHub (aemit_change_event)
 #     2) builds a single-action ChangeSet and IMMEDIATELY submits it to BE outbox (asubmit_changeset) asynchronously
+# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import asyncio
 import inspect
 import re
 import logging
+from uuid import uuid4
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Sequence
 
@@ -31,7 +34,7 @@ from workshops_ai.models.changeset import (
 )
 from workshops_ai.agents.utils.changeset_builder import build_changeset
 
-# New: context utilities (seed heuristics / summaries)
+# Context utilities (seed heuristics / summaries)
 from workshops_ai.agents.utils.context_enricher import (
     summarize_org_profile,
     extract_seed_candidates,
@@ -45,11 +48,14 @@ from workshops_ai.app.services.tazila_client import asubmit_changeset  # type: i
 # WS change events (raw JSON broadcast via WsHub → /ws)
 from workshops_ai.app.services.change_events import aemit_change_event
 
-# New: HTTP echo of events (AgentEvent schema)
+# HTTP echo of events (AgentEvent schema)
 from workshops_ai.models.agent_event import AgentEvent
 
-# Centralized settings 
+# Centralized settings
 from workshops_ai.settings import get_settings
+
+# i18n (centralized; supports "en", "sk", "cs" without mapping CS→SK)
+from workshops_ai.i18n import t as i18n_t, lang_from as i18n_lang_from
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +70,13 @@ except Exception:  # pragma: no cover
     # Minimal shims so the file imports cleanly even without LangChain installed.
     class LCBaseModel(BaseModel):  # type: ignore
         pass
+
     def LCField(*args, **kwargs):  # type: ignore
         return None
+
     ChatOpenAI = object  # type: ignore
     HumanMessage = SystemMessage = object  # type: ignore
+
 
 Intent = Literal["read", "explain"]
 READ_PAGE_LIMIT = 100
@@ -79,68 +88,9 @@ _REPAIR_HINT = (
     "Do not include any extra text besides the one short human sentence and optional <control> tag."
 )
 
-
-# --------------------------------------------------------------------------------------
-# Language helpers (base = 'sk' or 'en')
-# --------------------------------------------------------------------------------------
-
-def _pref_lang(req: UIRequest) -> str:
-    """
-    Choose response language: 'sk' or 'en'.
-    - 'sk' if req.language startswith 'sk' OR 'cs' (map Czech → Slovak base as requested).
-    - 'en' if req.language startswith 'en'.
-    - default 'en' if not provided/unknown.
-    """
-    lang = (getattr(req, "language", None) or "").strip().lower()
-    if lang.startswith("sk") or lang.startswith("cs"):
-        return "sk"
-    if lang.startswith("en"):
-        return "en"
-    return "en"
-
-_T = {
-    "en": {
-        "explain_1": "I’m your AssetAgent. Tell me in plain language what you want to do with assets.",
-        "explain_2": "• “Create a CRM asset as primary, type Information system …”",
-        "explain_3": "• “Update asset asset-db-001: rename to Customer DB and set primary=false.”",
-        "explain_4": "• “List primary Application software containing ‘crm’.”",
-        "explain_5": "Every change is broadcast via WS and submitted to the backend outbox as a single-action ChangeSet.",
-        "hint_generic": "Tell me what you’d like to do with assets (create, update, list, detail).",
-        "need_id": "Please provide an asset ID to show its detail.",
-        "not_found": "I couldn't find an asset with ID “{id}”.",
-        "detail_intro": "Here’s the asset detail for “{name}”.",
-        "list_found": "I found {n} item(s){suffix}.",
-        "ok": "OK.",
-        "done": "Done — {n} change(s) queued to the outbox.",
-        "invalid_change": "I couldn't build a valid change from that request. Try: “Create an asset …” or “Update asset …”.",
-        "seed_intro": "Here are initial asset candidates based on your services/website.",
-    },
-    "sk": {
-        "explain_1": "Som tvoj AssetAgent. Povedz mi jednoducho, čo chceš s aktívami urobiť.",
-        "explain_2": "• „Vytvor CRM ako primárne, typ Information system …“",
-        "explain_3": "• „Aktualizuj asset asset-db-001: premenuj na Customer DB a nastav primary=false.“",
-        "explain_4": "• „Vypíš primárne Application software obsahujúce ‘crm’.“",
-        "explain_5": "Každá zmena sa posiela cez WS a ukladá do outboxu backendu ako single-action ChangeSet.",
-        "hint_generic": "Napíš, čo chceš s aktívami spraviť (vytvoriť, upraviť, vypísať, detail).",
-        "need_id": "Uveď prosím ID assetu, aby som zobrazil detail.",
-        "not_found": "Nenašiel som asset s ID „{id}“.",
-        "detail_intro": "Tu je detail assetu „{name}“.",
-        "list_found": "Našiel som {n} položiek{suffix}.",
-        "ok": "OK.",
-        "done": "Hotovo — {n} zmien odoslaných do outboxu.",
-        "invalid_change": "Nepodarilo sa vytvoriť platnú zmenu. Skús: „Vytvor asset …“ alebo „Uprav asset …“.",
-        "seed_intro": "Tu sú počiatoční kandidáti aktív podľa vašich služieb/webu.",
-    },
-}
-
-def _t(lang: str, key: str, **kwargs) -> str:
-    base = _T.get(lang, _T["en"]).get(key, _T["en"].get(key, key))
-    return base.format(**kwargs)
-
-
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # LangChain "structured tools" — the AssetAgent allows exactly two actions
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 class CreateAssetArgs(LCBaseModel):
     """Create a new asset via ChangeSet action."""
@@ -246,10 +196,9 @@ IMPORTANT:
 {repair_clause}
 """
 
-
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Presentation models for proposals (list/detail/seed)
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 class AssetPreview(BaseModel):
     id: str
@@ -260,20 +209,21 @@ class AssetPreview(BaseModel):
     integrity: int | None = None
     availability: int | None = None
 
+
 class AssetDetail(AssetPreview):
     description: str | None = None
     org_id: str | None = None
 
 
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Agent entrypoint
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 async def run(req: UIRequest, intent: Intent) -> UIResponse:
     """AI agent: list/detail + NL→Actions (assets-only) with immediate outbox submit."""
-    _audit_in(req, intent)
+    lang = i18n_lang_from(language=getattr(req, "language", None), locale=getattr(req, "locale", None))
+    _audit_in(req, intent, lang)
 
-    lang = _pref_lang(req)
     msg = (req.message or "").strip()
 
     if intent == "explain":
@@ -300,27 +250,32 @@ async def run(req: UIRequest, intent: Intent) -> UIResponse:
             proposed = limit_results(seeds, limit)
             if proposed:
                 return UIResponse(
-                    messages=[_t(lang, "seed_intro")],
+                    messages=[i18n_t("assets", "seed_intro", lang=lang)],
                     proposals={"seed_assets": proposed},
                     staging={"needs_commit": False},
                 )
-        return await _handle_read_controls(req, parsed, ai_fallback_text=_t(lang, "hint_generic"))
+        return await _handle_read_controls(req, parsed, ai_fallback_text=i18n_t("assets", "hint_generic", lang=lang))
 
     # 1a) If tools were called, emit WS events and immediately submit a single-action ChangeSet
     tool_calls = _normalize_tool_calls(ai_msg)
     if tool_calls:
+        if len(tool_calls) > 1:
+            telemetry_log(
+                "asset_agent.tool_truncate",
+                {"count": len(tool_calls), "kept": tool_calls[0].get("name"), "dropped": [c.get("name") for c in tool_calls[1:]]},
+            )
         # enforce exactly ONE tool call
         tool_calls = tool_calls[:1]
-        submitted, events = await _handle_tool_calls(req, tool_calls)
+        submitted, events = await _handle_tool_calls(req, tool_calls, lang=lang)
         if submitted > 0:
             return UIResponse(
-                messages=[_t(lang, "done", n=submitted)],
+                messages=[i18n_t("assets", "done", lang=lang, n=submitted)],
                 proposals=None,
                 staging={"needs_commit": False},
                 agent_events=events,  # HTTP echo
             )
         return UIResponse(
-            messages=[_t(lang, "invalid_change")],
+            messages=[i18n_t("assets", "invalid_change", lang=lang)],
             proposals=None,
             staging={"needs_commit": False},
         )
@@ -335,20 +290,19 @@ async def run(req: UIRequest, intent: Intent) -> UIResponse:
         proposed = limit_results(seeds, limit)
         if proposed:
             return UIResponse(
-                messages=[human_text or _t(lang, "seed_intro")],
+                messages=[human_text or i18n_t("assets", "seed_intro", lang=lang)],
                 proposals={"seed_assets": proposed},
                 staging={"needs_commit": False},
             )
-        return UIResponse(messages=[human_text or _t(lang, "ok")], proposals=None, staging={"needs_commit": False})
+        return UIResponse(messages=[human_text or i18n_t("assets", "ok", lang=lang)], proposals=None, staging={"needs_commit": False})
 
     # Interpret hidden READ_* control and return human sentence + proposals
     parsed = _interpret_ai_read_control(control_text)
     return await _handle_read_controls(req, parsed, ai_fallback_text=(human_text or None))
 
-
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # AI helpers
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 async def _ai_invoke(
     req: UIRequest,
@@ -425,10 +379,8 @@ def _needs_repair(ai_msg: Any) -> bool:
         args = calls[0].get("args") or {}
         try:
             if name == "create_asset":
-                # required: name, asset_type_code
                 CreateAssetArgs(**args)  # type: ignore[arg-type]
             elif name == "set_asset_meta":
-                # required: asset_id and at least one field to update (checked later)
                 SetAssetMetaArgs(**args)  # type: ignore[arg-type]
         except Exception:
             return True
@@ -445,31 +397,44 @@ def _needs_repair(ai_msg: Any) -> bool:
     # Validate control grammar
     return _interpret_ai_read_control(control_text) is None
 
-
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Extract hidden control tag
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 _CONTROL_TAG = re.compile(r"<control>\s*(?P<ctl>.*?)\s*</control>", re.IGNORECASE | re.DOTALL)
+_CONTROL_TAG_ALL = re.compile(r"<control>.*?</control>", re.IGNORECASE | re.DOTALL)
+_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", re.I)
+
+def _strip_html(s: str) -> str:
+    # very small sanitizer to avoid accidental HTML rendering; UI should also escape.
+    return re.sub(r"<[^>]+>", "", s or "")
 
 def _extract_control_tag_and_human_text(content: str) -> tuple[str | None, str]:
     """
     Returns (control_text_or_none, human_text_without_tag).
-    The human text is the content with the <control>...</control> removed and stripped.
+    Enforces at most one <control> tag; if multiple, fall back to seeds/hint by returning None.
+    Also strips any residual HTML tags from human text (defense-in-depth).
     """
     if not content:
         return None, ""
+    # more than one control tag → reject to avoid ambiguity
+    if len(_CONTROL_TAG_ALL.findall(content)) > 1:
+        return None, _strip_html(_CONTROL_TAG_ALL.sub("", content)).strip()
     m = _CONTROL_TAG.search(content)
     control = m.group("ctl").strip() if m else None
-    human = (_CONTROL_TAG.sub("", content)).strip()
+    human = _strip_html(_CONTROL_TAG.sub("", content)).strip()
     return (control if control else None, human)
 
-
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # WS events + immediate single-action ChangeSet submit; returns (submitted_count, events)
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
-async def _handle_tool_calls(req: UIRequest, tool_calls: Sequence[dict[str, Any]]) -> tuple[int, list[AgentEvent]]:
+async def _handle_tool_calls(
+    req: UIRequest,
+    tool_calls: Sequence[dict[str, Any]],
+    *,
+    lang: str,
+) -> tuple[int, list[AgentEvent]]:
     submitted = 0
     events: list[AgentEvent] = []
 
@@ -486,7 +451,8 @@ async def _handle_tool_calls(req: UIRequest, tool_calls: Sequence[dict[str, Any]
 
             if "name" not in args or "asset_type_code" not in args:
                 continue
-            client_token = f"tmp-{_slug(args.get('name', 'item'))}"
+            client_token = f"tmp-{_slug(args.get('name', 'item'))}-{uuid4().hex[:8]}"
+            idempotency_key = f"asset.create:{req.org_id}:{client_token}"
 
             # map 'primary' -> 'isPrimary' to match downstream schema
             fields = {k: v for k, v in args.items()}
@@ -523,7 +489,7 @@ async def _handle_tool_calls(req: UIRequest, tool_calls: Sequence[dict[str, Any]
 
             # Single-action ChangeSet → immediate async submit (non-blocking)
             cs = _make_changeset_one(req, action)
-            asyncio.create_task(_submit_now(cs))
+            asyncio.create_task(_submit_now(cs, idempotency_key=idempotency_key))
             submitted += 1
 
         elif name == "set_asset_meta":
@@ -573,17 +539,17 @@ async def _handle_tool_calls(req: UIRequest, tool_calls: Sequence[dict[str, Any]
             )
 
             # Single-action ChangeSet → immediate async submit
+            idempotency_key = f"asset.set_meta:{req.org_id}:{asset_id}:{uuid4().hex[:8]}"
             cs = _make_changeset_one(req, action)
-            asyncio.create_task(_submit_now(cs))
+            asyncio.create_task(_submit_now(cs, idempotency_key=idempotency_key))
             submitted += 1
 
         # ignore any other tool (tool-gated)
     return submitted, events
 
-
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # READ control handling
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 _CONTROL_READ_LIST = re.compile(
     r"""^READ_LIST(?:\s+search="(?P<search>[^"]*)")?(?:\s+type="(?P<type>[^"]*)")?(?:\s+is_primary=(?P<primary>true|false))?\s*$""",
@@ -621,11 +587,11 @@ async def _handle_read_controls(
     ai_fallback_text: str | None = None,
 ) -> UIResponse:
     backend = _get_backend()
-    lang = _pref_lang(req)
+    lang = i18n_lang_from(language=getattr(req, "language", None), locale=getattr(req, "locale", None))
 
     if parsed is None:
         # No recognizable control line; return short hint or LLM text.
-        text = ai_fallback_text or _t(lang, "hint_generic")
+        text = ai_fallback_text or i18n_t("assets", "hint_generic", lang=lang)
         return UIResponse(messages=[text], proposals=None, staging={"needs_commit": False})
 
     kind, payload = parsed
@@ -633,17 +599,17 @@ async def _handle_read_controls(
     if kind == "READ_DETAIL":
         asset_id = payload.get("id") or ""
         if not asset_id:
-            return UIResponse(messages=[_t(lang, "need_id")], proposals=None, staging={"needs_commit": False})
+            return UIResponse(messages=[i18n_t("assets", "need_id", lang=lang)], proposals=None, staging={"needs_commit": False})
         asset = await _call_async(backend.asset_get, asset_id)
         if asset is None:
             return UIResponse(
-                messages=[_t(lang, "not_found", id=asset_id)],
+                messages=[i18n_t("assets", "not_found", lang=lang, id=asset_id)],
                 proposals=None,
                 staging={"needs_commit": False},
             )
         detail = _to_asset_detail(asset)
         return UIResponse(
-            messages=[_t(lang, "detail_intro", name=detail.name)],
+            messages=[i18n_t("assets", "detail_intro", lang=lang, name=detail.name)],
             proposals={"asset": detail.model_dump()},
             staging={"needs_commit": False},
         )
@@ -673,48 +639,45 @@ async def _handle_read_controls(
             parts.append(f'type="{filters.type}"')
         if filters.is_primary is not None:
             parts.append("primary=true" if filters.is_primary else "primary=false")
-        suffix = ""
         if parts:
-            if lang == "sk":
-                suffix = f' (filtre: {", ".join(parts)})'
-            else:
-                suffix = f' (filters: {", ".join(parts)})'
+            suffix = f' (filters: {", ".join(parts)})' if lang == "en" else \
+                     f' (filtre: {", ".join(parts)})' if lang == "sk" else \
+                     f' (filtry: {", ".join(parts)})'
+        else:
+            suffix = ""
 
         return UIResponse(
-            messages=[_t(lang, "list_found", n=len(previews), suffix=suffix)],
+            messages=[i18n_t("assets", "list_found", lang=lang, n=len(previews), suffix=suffix)],
             proposals={"assets": previews},
             staging={"needs_commit": False},
         )
 
     # Unknown kind (shouldn't happen)
-    return UIResponse(messages=[_t(_pref_lang(req), "ok")], proposals=None, staging={"needs_commit": False})
-
+    return UIResponse(messages=[i18n_t("assets", "ok", lang=lang)], proposals=None, staging={"needs_commit": False})
 
 def _fallback_read_control(message: str) -> str:
     """
-    Very small heuristic used only when LLM is unavailable:
-    - If message contains an id-like token, prefer READ_DETAIL.
+    Heuristic used only when LLM is unavailable:
+    - Prefer UUID-like token for READ_DETAIL.
     - Otherwise default to READ_LIST with optional search="...".
     """
-    m = message.strip()
-    # naive id detection (token with dash or long alnum)
-    tokens = re.findall(r"[A-Za-z0-9_-]{6,}", m)
-    if tokens:
-        return f'READ_DETAIL id="{tokens[0]}"'
-    # search:"..." or last word
-    search = None
+    m = (message or "").strip()
+    uuid_m = _UUID_RE.search(m)
+    if uuid_m:
+        return f'READ_DETAIL id="{uuid_m.group(0)}"'
+    # search:"..." or quoted pattern
     if "search:" in m.lower():
-        search = m.split("search:", 1)[-1].strip()
-    elif m and m.lower() not in {"list", "show", "detail"}:
-        search = m
-    if search:
-        return f'READ_LIST search="{search}"'
+        search = m.split("search:", 1)[-1].strip().strip('"')
+        if search:
+            return f'READ_LIST search="{search}"'
+    # fall back to listing with a search term if message looks like a query
+    if m and m.lower() not in {"list", "show", "detail"}:
+        return f'READ_LIST search="{m}"'
     return "READ_LIST"
 
-
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # ChangeSet helpers (single-action, send-now)
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 def _make_changeset_one(req: UIRequest, action: dict[str, Any]) -> ChangeSet:
     """Build a ChangeSet with exactly one action using the shared builder to keep schema stable."""
@@ -725,28 +688,34 @@ def _make_changeset_one(req: UIRequest, action: dict[str, Any]) -> ChangeSet:
         intent="apply",
     )
 
-async def _submit_now(cs: ChangeSet) -> None:
+async def _submit_now(cs: ChangeSet, *, idempotency_key: str | None = None) -> None:
     """
     Fire-and-forget submit; logs telemetry. Exceptions are caught and logged.
+    Tries to pass idempotency_key when supported; falls back for backward compatibility.
     """
     try:
-        resp = await asubmit_changeset(cs)
+        try:
+            # Preferred (new) signature with idempotency
+            resp = await asubmit_changeset(cs, idempotency_key=idempotency_key)  # type: ignore[call-arg]
+        except TypeError:
+            # Backward-compat: older tazila_client without idempotency support
+            resp = await asubmit_changeset(cs)  # type: ignore[misc]
         telemetry_log(
             "changeset.submitted",
             {
                 "status": resp.get("status"),
                 "mode": resp.get("mode"),
                 "path": resp.get("path") or resp.get("id"),
+                "idempotency_key": idempotency_key,
             },
         )
     except Exception as e:
         logger.exception("ChangeSet submit failed")
-        telemetry_log("changeset.submit.error", {"error": str(e)})
+        telemetry_log("changeset.submit.error", {"error": str(e), "idempotency_key": idempotency_key})
 
-
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Non-AI listing/detail helpers (used by READ_* control)
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 @dataclass
 class Filters:
@@ -791,8 +760,14 @@ def _sort_assets(items: Sequence[Any]) -> list[Any]:
         return (primary, name)
     return sorted(items, key=_key)
 
+# Singleton backend to avoid repeated instantiation/IO
+_BACKEND_SINGLETON: BackendPort | None = None
+
 def _get_backend() -> BackendPort:
-    return CsvBackend()  # sync → wrap with _call_async
+    global _BACKEND_SINGLETON
+    if _BACKEND_SINGLETON is None:
+        _BACKEND_SINGLETON = CsvBackend()
+    return _BACKEND_SINGLETON
 
 async def _call_async(func, *args, **kwargs):
     # If the target is a coroutine function, await it directly.
@@ -801,8 +776,19 @@ async def _call_async(func, *args, **kwargs):
     # Otherwise offload the sync call to a thread to avoid blocking the loop.
     return await asyncio.to_thread(func, *args, **kwargs)
 
-def _audit_in(req: UIRequest, intent: Intent) -> None:
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_PHONE_RE = re.compile(r"\+?[0-9][0-9\s\-()]{6,}")
+
+def _mask_pii(s: str | None) -> str | None:
+    if not s:
+        return s
+    s = _EMAIL_RE.sub("[redacted-email]", s)
+    s = _PHONE_RE.sub("[redacted-phone]", s)
+    return s
+
+def _audit_in(req: UIRequest, intent: Intent, lang: str) -> None:
     try:
+        mp = (req.message[:256] + "…") if req.message and len(req.message) > 256 else req.message
         telemetry_log(
             "asset_agent_ai.in",
             {
@@ -810,10 +796,10 @@ def _audit_in(req: UIRequest, intent: Intent) -> None:
                 "user_id": req.user_id,
                 "intent": intent,
                 "has_selection": bool(getattr(req, "selection", None)),
-                "message_preview": (req.message[:256] + "…") if req.message and len(req.message) > 256 else req.message,
+                "message_preview": _mask_pii(mp),
                 "ai_enabled": True,      # always-on if available
                 "send_now": True,        # no buffer, immediate submit
-                "language": _pref_lang(req),
+                "language": lang,
                 "number_of_assets": getattr(req, "number_of_assets", None),
             },
         )
@@ -828,11 +814,11 @@ def _slug(s: str) -> str:
 def _explain_response(lang: str) -> UIResponse:
     return UIResponse(
         messages=[
-            _t(lang, "explain_1"),
-            _t(lang, "explain_2"),
-            _t(lang, "explain_3"),
-            _t(lang, "explain_4"),
-            _t(lang, "explain_5"),
+            i18n_t("assets", "explain_1", lang=lang),
+            i18n_t("assets", "explain_2", lang=lang),
+            i18n_t("assets", "explain_3", lang=lang),
+            i18n_t("assets", "explain_4", lang=lang),
+            i18n_t("assets", "explain_5", lang=lang),
         ],
         proposals=None,
         staging={"needs_commit": False},
