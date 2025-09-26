@@ -1,6 +1,20 @@
 # File: workshops_ai/routers/chat_router.py
 from __future__ import annotations
 
+"""
+Chat Router
+-----------
+- Auth-protected POST /chat endpoint used by the UI.
+- Resolves a configurable "AI manager/router" callable and invokes it.
+- Normalizes heterogeneous manager outputs into a stable ChatResponse.
+
+Key features:
+- Optional authentication dependency (API key / JWT); aligns with main app.
+- Telemetry hook (best-effort, no-op if module missing).
+- Timeout guard and friendly error mapping.
+- Passthrough `policy` field for UI features (e.g., emit_changes_enabled).
+"""
+
 import asyncio
 import importlib
 import inspect
@@ -11,10 +25,19 @@ from pydantic import BaseModel, Field, ConfigDict
 
 from workshops_ai.settings import get_settings
 
-# --- Security dependency (API key / JWT via central security) ---
-from workshops_ai.app.security import require_auth  # HTTP dependency; WS uses verify_ws_auth
+# --- Security dependency (API key / JWT) --------------------------------------
+# Prefer central path; fall back to legacy path; dev runs without auth.
+try:
+    from workshops_ai.app.security import require_auth  # type: ignore[reportMissingImports]
+    _AUTH_DEPS = [Depends(require_auth)]
+except Exception:  # pragma: no cover
+    try:
+        from workshops_ai.app.deps.auth import require_auth  # type: ignore[reportMissingImports]
+        _AUTH_DEPS = [Depends(require_auth)]
+    except Exception:  # pragma: no cover
+        _AUTH_DEPS = []
 
-# Telemetry (best-effort, no-op if missing)
+# --- Telemetry (best-effort, optional) ----------------------------------------
 try:
     from workshops_ai.tools.telemetry import telemetry_log  # type: ignore
 except Exception:  # pragma: no cover
@@ -22,11 +45,11 @@ except Exception:  # pragma: no cover
         return
 
 settings = get_settings()
-router = APIRouter(dependencies=[Depends(require_auth)])
+router = APIRouter(dependencies=_AUTH_DEPS)
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # UI contract models
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 ActiveTab = Literal["assets", "impacts", "threats", "controls"]
 
@@ -49,13 +72,17 @@ class ChatResponse(BaseModel):
     messages: List[str]
     proposals: Optional[Dict[str, Any]] = None
     staging: Dict[str, Any] = Field(default_factory=lambda: {"needs_commit": False})
+    # UI expects policy passthrough (e.g. {"emit_changes_enabled": true})
+    policy: Optional[Dict[str, Any]] = Field(
+        default_factory=lambda: {"emit_changes_enabled": True}
+    )
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Manager/Router resolver
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
-# Default to your manager:
+# Default spec:
 #   workshops_ai/graph/manager.py -> async def route_chat(UIRequest) -> UIResponse
 _DEFAULT_SPEC = "workshops_ai.graph.manager:route_chat"
 
@@ -91,7 +118,7 @@ def _load_from_spec(spec: str) -> Any:
         except Exception as e:
             last_err = e
             continue
-        # get_manager() factory
+        # Factory pattern: get_manager() -> instance
         if name == "get_manager" and callable(obj):
             return obj()
         return obj
@@ -101,6 +128,10 @@ def _load_from_spec(spec: str) -> Any:
 
 
 def _resolve_manager() -> Any:
+    """
+    Resolve and memoize the manager/router object or callable according to
+    settings.ai_manager_spec, with compatibility fallbacks.
+    """
     global _manager_singleton
     if _manager_singleton is not None:
         return _manager_singleton
@@ -126,9 +157,9 @@ def _resolve_manager() -> Any:
     raise RuntimeError(f"Manager/Router not found (spec='{_SPEC}'). Last error: {last_err}")
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Invocation helpers
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 async def _invoke_manager(manager: Any, payload: dict) -> Any:
     """
@@ -174,26 +205,35 @@ def _as_list_messages(val: Any) -> List[str]:
 def _normalize_to_chat_response(res: Any) -> ChatResponse:
     """
     Accept Pydantic UIResponse / dict / string, return ChatResponse.
+    Preserves `policy` if present; otherwise sets a safe default.
     """
     # Pydantic model (e.g., UIResponse) – prefer model_dump
     if hasattr(res, "model_dump"):
         res = res.model_dump()
 
     if isinstance(res, dict):
+        policy = res.get("policy")
+        if not isinstance(policy, dict):
+            policy = {"emit_changes_enabled": True}
         return ChatResponse(
             messages=_as_list_messages(
                 res.get("messages") or res.get("message") or res.get("text")
             ),
             proposals=res.get("proposals"),
             staging=res.get("staging") or {"needs_commit": False},
+            policy=policy,
         )
 
-    return ChatResponse(messages=_as_list_messages(res), staging={"needs_commit": False})
+    return ChatResponse(
+        messages=_as_list_messages(res),
+        staging={"needs_commit": False},
+        policy={"emit_changes_enabled": True},
+    )
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Route
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
@@ -219,13 +259,14 @@ async def chat(req: ChatRequest) -> ChatResponse:
     except Exception:
         pass
 
-    # 3) Resolve & invoke your manager/router with timeout
+    # 3) Resolve & invoke manager/router with timeout
     try:
         manager = _resolve_manager()
     except Exception as e:
         return ChatResponse(
             messages=[f"Agent not available: {e}"],
             staging={"needs_commit": False},
+            policy={"emit_changes_enabled": True},
         )
 
     try:
@@ -238,11 +279,13 @@ async def chat(req: ChatRequest) -> ChatResponse:
         return ChatResponse(
             messages=[f"Timed out after {getattr(settings.chat, 'timeout_sec', 0)}s"],
             staging={"needs_commit": False},
+            policy={"emit_changes_enabled": True},
         )
     except Exception as e:
         return ChatResponse(
             messages=[f"Agent failed: {type(e).__name__}: {e}"],
             staging={"needs_commit": False},
+            policy={"emit_changes_enabled": True},
         )
 
     return _normalize_to_chat_response(raw)

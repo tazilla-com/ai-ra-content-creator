@@ -194,6 +194,17 @@ class StagingState(BaseModel):
     diff: Optional[JSONDict] = Field(default=None, description="Staged diff preview.")
 
 
+class UIResponsePolicy(BaseModel):
+    """Policy hints for UI rendering/behavior on the response channel."""
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    emit_changes_enabled: StrictBool = Field(
+        default=True,
+        description="If true, UI may assume the agent emits WS events / submits changesets.",
+    )
+
+
+# NEW: UIResponse with optional 'policy'
 class UIResponse(BaseModel):
     """
     Chat output contract to UI.
@@ -217,6 +228,12 @@ class UIResponse(BaseModel):
         default=None,
         description="Optional synchronous echo of agent events returned with the response.",
     )
+    # +++ newly allowed +++
+    policy: Optional[UIResponsePolicy] = Field(
+        default=None,
+        description="Response-side policy switches and hints for the UI.",
+    )
+    # +++++++++++++++++++++
 
     @field_validator("messages")
     @classmethod
@@ -238,5 +255,6 @@ __all__ = [
     "WebsiteContent",
     "UIRequest",
     "StagingState",
+    "UIResponsePolicy",
     "UIResponse",
 ]

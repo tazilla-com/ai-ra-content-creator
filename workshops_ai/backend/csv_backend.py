@@ -355,6 +355,7 @@ class _Catalogs:
 
         if q:
             qn = q.casefold()
+
             def _hay(t: dict[str, Any]) -> str:
                 return " ".join(
                     [
@@ -365,6 +366,7 @@ class _Catalogs:
                         " ".join(t.get("asset_types") or []),
                     ]
                 ).casefold()
+
             items = [t for t in items if qn in _hay(t)]
 
         # Stable order: by code

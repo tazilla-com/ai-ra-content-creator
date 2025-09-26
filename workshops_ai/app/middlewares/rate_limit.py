@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi import Request, status, HTTPException
 
 from workshops_ai.settings import get_settings
 from workshops_ai.app.services.redis_pool import get_redis
+
+HEALTH_PATHS = {"/livez", "/readyz"}  # never rate-limit health probes
 
 
 def _get_request_id(request: Request) -> str:
@@ -20,28 +22,36 @@ def _get_request_id(request: Request) -> str:
     return rid or "n/a"
 
 
-async def _allow(key: str, per_minute: int) -> tuple[bool, int]:
+async def _allow(key: str, per_minute: int) -> Tuple[bool, int]:
     """
     Fixed 60s window counter using Redis INCR + EXPIRE.
     Returns (allowed, seconds_until_reset).
-    - If Redis is unavailable, allow the request (fail-open).
+    - If Redis is unavailable or errors, allow the request (fail-open).
     """
-    r = await get_redis()
+    try:
+        r = await get_redis()
+    except Exception:
+        return True, 60
+
     if not r:
-        return True, 60  # fail-open, behave generously
+        return True, 60  # fail-open (no Redis configured)
 
-    now = int(time.time())
-    window = now // 60
-    rk = f"rl:{key}:{window}"
+    try:
+        now = int(time.time())
+        window = now // 60
+        rk = f"rl:{key}:{window}"
 
-    n = await r.incr(rk)
-    if n == 1:
-        # keep key a bit longer than a minute to be safe
-        await r.expire(rk, 120)
+        n = await r.incr(rk)
+        if n == 1:
+            # keep key a bit longer than a minute to be safe
+            await r.expire(rk, 120)
 
-    # seconds left until the current minute window resets
-    reset_in = 60 - (now % 60)
-    return n <= per_minute, reset_in
+        # seconds left until the current minute window resets
+        reset_in = 60 - (now % 60)
+        return n <= per_minute, reset_in
+    except Exception:
+        # Any Redis error → fail-open
+        return True, 60
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -49,7 +59,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     HTTP rate limiting middleware.
     - Reads config from settings().ratelimit (enabled, per_minute).
     - Keys by path + session_id (if present) else client IP.
-    - On limit → raises HTTPException(429, ...) so global error handler
+    - On limit → raises HTTPException(429, ...) so the global handler
       builds the unified error envelope and attaches the request_id.
     - Adds Retry-After header with seconds until reset.
     """
@@ -61,6 +71,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.per_min = int(getattr(s, "per_minute", 60)) if s is not None else 60
 
     async def dispatch(self, request: Request, call_next):
+        # Bypass health endpoints completely
+        if request.url.path in HEALTH_PATHS:
+            return await call_next(request)
+
         if not self.enabled:
             return await call_next(request)
 
@@ -72,8 +86,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         allowed, retry_after = await _allow(key, self.per_min)
         if not allowed:
             rid = _get_request_id(request)
-            # Raise HTTPException → picked by global handler for a unified JSON envelope.
-            # Attach Retry-After header for good API hygiene.
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail={
@@ -91,11 +103,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-# Helper pro WebSocket
+# Helper for WebSocket gating (mirrors HTTP keying)
 async def allow_ws(event: str, sid: str | None, per_minute: int) -> bool:
-    """
-    WS guard used v routeru; sjednoceno s HTTP klíčováním.
-    """
     key = f"ws:{event}:{sid or 'anon'}"
     allowed, _ = await _allow(key, per_minute)
     return allowed

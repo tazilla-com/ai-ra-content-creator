@@ -1,0 +1,42 @@
+# File: docker-compose.yaml
+services:
+  api:
+    build: .
+    image: workshops-ai:local
+    container_name: workshops-ai-api
+    ports:
+      - "8000:8000"
+
+    # Load your .env exactly as-is (ENABLE_DOCS=false, CORS, API keys, JWT, Tazila, etc.)
+    env_file:
+      - .env
+
+    # Only safe fallbacks here; .env remains the source of truth
+    environment:
+      # healthcheck.py reads PORT (fallback to APP_PORT if provided, else 8000)
+      PORT: ${APP_PORT:-8000}
+      # Ensure in-container Redis URL if not set in .env
+      WORKSHOPS_AI_REDIS__URL: ${WORKSHOPS_AI_REDIS__URL:-redis://redis:6379/0}
+
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./workshops_ai/data/catalogs:/app/data/catalogs 
+
+    depends_on:
+      - redis
+    restart: unless-stopped
+    # Healthcheck is defined in the Dockerfile image; no duplication here.
+
+  redis:
+    image: redis:7-alpine
+    container_name: workshops-ai-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:

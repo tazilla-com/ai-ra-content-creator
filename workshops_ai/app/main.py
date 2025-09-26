@@ -292,7 +292,7 @@ def create_app() -> FastAPI:
         allow_origins=allow_origins,
         allow_credentials=allow_credentials,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Request-Id", "X-Correlation-Id", "X-API-Key"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-Id", "X-Correlation-Id", "X-API-Key", "Origin"],
         expose_headers=["X-Request-Id", "X-Correlation-Id", "X-Process-Time"],
     )
 
@@ -384,7 +384,7 @@ def create_app() -> FastAPI:
             await websocket.close()
         app.include_router(router)
 
-    _mount_or_fallback("ws_router", _mount_ws, _fallback_ws)
+    _mount_or_fallback("ws_router (auth=%s)" % bool(_AUTH_DEP), _mount_ws, _fallback_ws)
 
     # /assets
     def _mount_assets():

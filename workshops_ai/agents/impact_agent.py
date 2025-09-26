@@ -37,13 +37,18 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
+# Outbox overlay (to reflect pending ChangeSets in reads)
+import json
+import os
+import glob
+
 # LangChain
 from langchain_openai import ChatOpenAI
 from langchain.agents import AgentExecutor, create_openai_tools_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.tools import StructuredTool
 
-from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
+from workshops_ai.schemas.ui_contract import UIRequest, UIResponse, StagingState
 from workshops_ai.app.services.ws_hub import WsHub
 from workshops_ai.app.services.tazila_client import asubmit_changeset
 from workshops_ai.schemas.impact_models import (
@@ -59,7 +64,7 @@ from workshops_ai.settings import get_settings
 # Read-only catalogs (robust CSV readers; zero writes)
 from workshops_ai.tools import search_catalogs as cat
 
-# Centralized i18n (supports "en", "sk", "cs" — no CS→SK mapping)
+# Centralized i18n (supports "en", "sk", "cs"; we answer in the user's language)
 from workshops_ai.i18n import t as i18n_t, lang_from as i18n_lang_from
 
 
@@ -121,15 +126,14 @@ class ImpactAgent:
             self.llm = llm
         else:
             s = self._settings
-            # Prefer nested `llm.*` if available, otherwise fall back to flat fields.
             try:
-                model = getattr(s.llm, "model")              # type: ignore[attr-defined]
-                temperature = float(getattr(s.llm, "temperature"))  # type: ignore[attr-defined]
-                timeout = int(getattr(s.llm, "http_timeout_sec"))   # type: ignore[attr-defined]
+                model = getattr(s.llm, "model")                       # type: ignore[attr-defined]
+                temperature = float(getattr(s.llm, "temperature"))    # type: ignore[attr-defined]
+                timeout = int(getattr(s.llm, "http_timeout_sec"))     # type: ignore[attr-defined]
                 max_retries = int(getattr(s.llm, "openai_max_retries"))  # type: ignore[attr-defined]
             except Exception:
                 model = getattr(s, "llm_model", "gpt-4o-mini")
-                temperature = float(getattr(s, "llm_temperature", 0.1))
+                temperature = float(getattr(s, "llm_temperature", 0.0))
                 timeout = int(getattr(s, "openai_timeout_sec", 60))
                 max_retries = int(getattr(s, "openai_max_retries", 3))
 
@@ -148,39 +152,91 @@ class ImpactAgent:
 
     async def run(self, req: UIRequest, hint: IntentHint | None = None) -> UIResponse:
         """
-        Invoke the LangChain tools agent. Returns UIResponse with policy.emit_changes_enabled=True.
+        Invoke the LangChain tools agent. Returns UIResponse.
+
+        Guard behavior:
+        - Single-asset writes still require an asset_id (either in selection or inferred).
+        - Bulk writes DO NOT require selection.asset_id (asset IDs are taken from the message).
         """
         self._assert_tab(req)
-        lang = i18n_lang_from(language=getattr(req, "language", None), locale=getattr(req, "locale", None))
+        lang = i18n_lang_from(language=getattr(req, "language", None), locale=None)
         self._last_lang = lang
+
+        asset_id = self._asset_id_from_req(req)
 
         telemetry_log("impact_agent.in", {
             "org_id": req.org_id,
             "user_id": req.user_id,
-            "asset_id": (getattr(req, "selection", None) or {}).get("asset_id"),
+            "asset_id": asset_id,
             "message": (req.message or "")[:512],
             "language": lang,
         })
 
         agent_input = {
-            "input": req.message or "",
+            "input": req.message or "help",
             "org_id": req.org_id,
-            "user_id": req.user_id,
-            "asset_id": (getattr(req, "selection", None) or {}).get("asset_id"),
+            "user_id": req.user_id or "anon",
+            "asset_id": asset_id,
             "language": lang,
         }
 
+        # Intent classifiers -------------------------------------------------
+        def _is_change_intent(msg: str) -> bool:
+            m = (msg or "").strip().lower()
+
+            # Explicit explanations are not changes
+            if re.search(r"^\s*(explain|why)\b", m):
+                return False
+
+            # Real change keywords
+            if re.search(r"\b(set|update|change|bulk)\b", m):
+                return True
+
+            # Patterns like “to <0-4>” or “level <0-4>”
+            if re.search(r"\b(to\s*[0-4]\b|\blevel\s*[0-4]\b)", m):
+                return True
+
+            return False
+
+        def _is_bulk_intent(msg: str) -> bool:
+            m = (msg or "").strip().lower()
+            # Heuristics: presence of 'bulk' OR "for asset(s) X,Y,..." list
+            if re.search(r"\bbulk\b", m):
+                return True
+            if re.search(r"\bfor\s+assets?\s+[a-z0-9._:-]+(?:\s*,\s*[a-z0-9._:-]+)+", m):
+                return True
+            return False
+
+        # Guard: only block single-asset writes without asset_id; allow bulk without it
+        if _is_change_intent(agent_input["input"]) and not _is_bulk_intent(agent_input["input"]) and not agent_input["asset_id"]:
+            telemetry_log("impact_agent.guard.no_asset", {"intent": "single-change-like", "asset_id": None})
+            return UIResponse(
+                messages=[
+                    i18n_t("impacts", "need_asset", lang=lang)
+                    if i18n_t("impacts", "need_asset", lang=lang) != "impacts.need_asset"
+                    else "Please select an asset (selection.asset_id) before changing impact levels."
+                ],
+                staging=StagingState(needs_commit=False),
+            )
+
         try:
+            # In LC 0.3 the agent executor returns a dict with 'output' (or a raw string)
             result = await self.agent.ainvoke(agent_input)
-            text = result if isinstance(result, str) else str(result)
+            if isinstance(result, dict) and "output" in result:
+                text = str(result["output"] or "")
+            else:
+                text = str(result or "")
             if not text.strip():
                 text = i18n_t("impacts", "fallback", lang=lang)
-            resp = UIResponse(messages=[text], policy={"emit_changes_enabled": True})
+
             telemetry_log("impact_agent.out", {"ok": True})
-            return resp
+            return UIResponse(messages=[text], staging=StagingState(needs_commit=False))
         except Exception as e:
             telemetry_log("impact_agent.error", {"error": str(e)})
-            return UIResponse(messages=[i18n_t("impacts", "error_generic", lang=lang)], policy={"emit_changes_enabled": True})
+            return UIResponse(
+                messages=[i18n_t("impacts", "error_generic", lang=lang), f"(details: {e})".strip()],
+                staging=StagingState(needs_commit=False),
+            )
 
     # -- Tools registry ----------------------------------------------------------
 
@@ -196,10 +252,6 @@ class ImpactAgent:
                 self._impact_codes = set(self._impact_idx.keys())
             return self._impact_idx
 
-        async def _codes() -> set[str]:
-            await _ensure_idx()
-            return self._impact_codes or set()
-
         # list_impacts -----------------------------------------------------------
         async def list_impacts_tool() -> list[dict]:
             """
@@ -207,8 +259,7 @@ class ImpactAgent:
             Uses CSV catalogs via search_catalogs.generic_search(); tolerant headers/encodings.
             """
             idx = await _ensure_idx()
-            # stable order by code
-            items = [idx[c] for c in sorted(idx.keys())]
+            items = [idx[c] for c in sorted(idx.keys())]  # stable order by code
             return [
                 {
                     "code": it["code"],
@@ -226,11 +277,62 @@ class ImpactAgent:
             """
             Return current impacts for the given asset_id.
             Each item: {impact_code, level, note?}
+            - Base is read from backend (CSV).
+            - Overlay any pending ChangeSets in outbox (kind=impact.set_level); last wins.
             """
             if not asset_id:
+                telemetry_log("impact_agent.get_impacts.no_asset", {})
                 return []
-            # Prefer backend for state
-            return await self.backend.asset_get_impacts(asset_id)
+
+            # 1) base from backend (best-effort)
+            try:
+                base = list(self.backend.asset_get_impacts(asset_id) or [])
+            except Exception:
+                base = []
+
+            merged: dict[str, dict] = {}
+            for it in base:
+                code_key = ((it.get("impact_code") or "")).strip().lower()
+                if not code_key:
+                    continue
+                lvl = it.get("level")
+                if lvl is None:
+                    lvl = it.get("level_index")
+                merged[code_key] = {
+                    "impact_code": it.get("impact_code"),
+                    "level": lvl,
+                    "note": it.get("note"),
+                }
+
+            # 2) overlay from outbox (SEND-NOW)
+            try:
+                outdir = getattr(self._settings.tazila, "outbox_path", "./data/outbox")
+                files = sorted(glob.glob(os.path.join(outdir, "*.json")))
+                for p in files:
+                    try:
+                        with open(p, "r", encoding="utf-8") as fh:
+                            data = json.load(fh)
+                        if data.get("kind") != "impact.set_level":
+                            continue
+                        for it in data.get("items", []):
+                            if (it.get("asset_id") or "") != asset_id:
+                                continue
+                            code_key = ((it.get("impact_code") or "")).strip().lower()
+                            if not code_key:
+                                continue
+                            merged[code_key] = {
+                                "impact_code": it.get("impact_code"),
+                                "level": it.get("level_index"),
+                                "note": it.get("note"),
+                            }
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            out = list(merged.values())
+            out.sort(key=lambda x: (x.get("impact_code") or "").casefold())
+            return out
 
         # set_impact_level (SEND-NOW) -------------------------------------------
         async def set_impact_level_tool(
@@ -244,15 +346,22 @@ class ImpactAgent:
             """Validate → WS optimistic → async submit to BE (send-now)."""
             lang = self._last_lang
             try:
+                if not asset_id:
+                    return (
+                        i18n_t("impacts", "need_asset", lang=lang)
+                        if i18n_t("impacts", "need_asset", lang=lang) != "impacts.need_asset"
+                        else "Missing asset_id."
+                    )
                 if level not in ALLOWED_LEVELS:
                     return i18n_t("impacts", "invalid_level", lang=lang, level=level)
 
-                code = self._resolve_impact_code(impact_code, await _ensure_idx())
+                idx = await _ensure_idx()
+                code = self._resolve_impact_code(impact_code, idx)
                 if not code:
                     return i18n_t("impacts", "unknown_code", lang=lang, impact_code=impact_code)
 
                 upd = ImpactUpdate(
-                    org_id=org_id, user_id=user_id,
+                    org_id=org_id, user_id=user_id or "anon",
                     asset_id=asset_id, impact_code=code, level=level, note=note
                 )
                 await self._emit_and_submit(upd)
@@ -277,7 +386,8 @@ class ImpactAgent:
                 if level not in ALLOWED_LEVELS:
                     return i18n_t("impacts", "invalid_level", lang=lang, level=level)
 
-                code = self._resolve_impact_code(impact_code, await _ensure_idx())
+                idx = await _ensure_idx()
+                code = self._resolve_impact_code(impact_code, idx)
                 if not code:
                     return i18n_t("impacts", "unknown_code", lang=lang, impact_code=impact_code)
 
@@ -292,7 +402,7 @@ class ImpactAgent:
                 async def _one(aid: str) -> None:
                     async with sem:
                         upd = ImpactUpdate(
-                            org_id=org_id, user_id=user_id,
+                            org_id=org_id, user_id=user_id or "anon",
                             asset_id=aid, impact_code=code, level=level, note=note
                         )
                         await self._emit_and_submit(upd)
@@ -327,7 +437,7 @@ class ImpactAgent:
                 # Build a small context window from the CSV catalogs
                 idx = await _ensure_idx()
                 ctx_lines: list[str] = []
-                for c, it in list(idx.items())[:20]:  # limit context size
+                for c, it in list(idx.items())[:20]:  # keep context bounded
                     cat_label = it.get("category") or "Uncategorized"
                     levels = it.get("levels") or {}
                     lv = ", ".join(f"{k}:{v}" for k, v in levels.items()) if isinstance(levels, dict) else ""
@@ -340,14 +450,16 @@ class ImpactAgent:
                 else:
                     rag = ""
 
-                content = f"{sys}\n\nCatalog:\n{catalog_context}\n\n{('Context:\n' + rag + '\n\n') if rag else ''}User:\n{prompt}"
+                content = f"{sys}\n\nCatalog:\n{catalog_context}\n\n"
+                if rag:
+                    content += f"Context:\n{rag}\n\n"
+                content += f"User:\n{prompt}"
                 llm_resp = await self.llm.ainvoke(content)
                 out = str(getattr(llm_resp, "content", llm_resp))
                 telemetry_log("impact_agent.explain.ok", {"len": len(out or "")})
                 return out
             except Exception as e:
                 telemetry_log("impact_agent.explain.error", {"error": str(e)})
-                # Use last known language for error
                 return i18n_t("impacts", "error_generic", lang=self._last_lang)
 
         # Wrap as StructuredTool (async)
@@ -384,6 +496,7 @@ class ImpactAgent:
         Build an OpenAI Tools agent with a guardrail prompt.
         - The agent MUST use only provided tools to read/change impacts.
         - No staging; changes must be applied immediately using set_impact_level / bulk_set_impact_levels.
+        - IMPORTANT: include MessagesPlaceholder('agent_scratchpad') to avoid LC template errors.
         """
         system = (
             "You are ImpactAgent, operating on the 'impacts' tab.\n"
@@ -399,9 +512,12 @@ class ImpactAgent:
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", system),
+                # (Optional) future chat history hook
                 MessagesPlaceholder("chat_history", optional=True),
                 ("human", "{input}"),
                 ("system", "org_id={org_id} user_id={user_id} asset_id={asset_id} language={language}"),
+                # Required so LC can inject tool traces
+                MessagesPlaceholder("agent_scratchpad"),
             ]
         )
 
@@ -449,7 +565,6 @@ class ImpactAgent:
             audit={"source": "AI", "user_id": upd.user_id, "ts": ws_payload["ts"]},
         )
         try:
-            # Submit now (async)
             asyncio.create_task(asubmit_changeset(cs))
         except Exception as e:
             telemetry_log("impact_agent.submit.schedule_error", {"error": str(e)})
@@ -484,10 +599,10 @@ class ImpactAgent:
         rows = cat.generic_search(IMPACT_FILE, q=None, limit=10_000)
         # Load category mapping
         map_rows = cat.generic_search(IMPACT_X_CAT_FILE, q=None, limit=10_000)
-        # (Categories themselves are not strictly needed beyond labels, but we load for completeness)
+        # (Categories are optional for labels; still load for completeness)
         _ = cat.generic_search(IMPACT_CAT_FILE, q=None, limit=10_000)
 
-        # Helper: find category label for given EN impact name (best-effort)
+        # Helper: find category label for a given EN impact name (best-effort)
         def _cat_of(impact_en_name: str) -> Optional[str]:
             if not map_rows:
                 return None
@@ -546,7 +661,7 @@ class ImpactAgent:
 
     @staticmethod
     def _canon_code(text: str) -> str:
-        # normalize to a stable, code-ish key (lower + single spaces)
+        # Normalize to a stable, code-ish key (lower + single spaces)
         return re.sub(r"\s+", " ", (text or "").strip().lower())
 
     @staticmethod
@@ -559,6 +674,13 @@ class ImpactAgent:
     def _now_iso() -> str:
         from datetime import datetime, timezone
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _asset_id_from_req(req: UIRequest) -> Optional[str]:
+        sel = getattr(req, "selection", None)
+        if isinstance(sel, dict):
+            return sel.get("asset_id")
+        return getattr(sel, "asset_id", None)
 
     @staticmethod
     def _assert_tab(req: UIRequest) -> None:

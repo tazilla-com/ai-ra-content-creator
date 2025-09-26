@@ -87,7 +87,7 @@ async def demo_page() -> str:
     <section class="chat">
       <div id="chat" class="chat-log"></div>
       <div class="input-row">
-        <textarea id="msg" placeholder="Type to talk to the AI (e.g., 'List primary Application software', or 'Create asset CRM as primary type Application software')"></textarea>
+        <textarea id="msg" placeholder="Type and press Enter to send. Shift+Enter for newline. E.g., 'List primary Application software', or 'Create asset CRM as primary type Application software'"></textarea>
         <button id="send">Send</button>
       </div>
     </section>
@@ -126,11 +126,13 @@ async def demo_page() -> str:
     }
 
     async function sendMessage() {
+      const text = msg.value;
+      if (!text.trim()) return;
       const payload = {
         org_id: org.value.trim(),
         active_tab: tab.value,
         selection: {},   // pass asset_id, etc. if needed
-        message: msg.value,
+        message: text,
         staging: false,
         user_id: user.value.trim(),
       };
@@ -138,15 +140,28 @@ async def demo_page() -> str:
       msg.value = '';
 
       const headers = { 'Content-Type': 'application/json' };
-      if (apiKey.value.trim()) headers['X-API-Key'] = apiKey.value.trim();
+      const key = apiKey.value.trim();
+      if (key) headers['X-API-Key'] = key;
 
       try {
-        const res = await fetch('/chat', {
+        // Add api_key as query param as well (proxies/CORS tolerant)
+        const chatUrl = new URL('/chat', window.location.origin);
+        if (key) chatUrl.searchParams.set('api_key', key);
+
+        const res = await fetch(chatUrl.toString(), {
           method: 'POST',
           headers,
           body: JSON.stringify(payload),
         });
-        const data = await res.json();
+
+        let data = null;
+        const ct = res.headers.get('content-type') || '';
+        if (ct.includes('application/json')) {
+          data = await res.json();
+        } else {
+          data = { message: await res.text() };
+        }
+
         if (res.ok) {
           (data.messages || []).forEach(t => line('ai', t));
           if (data.proposals) {
@@ -175,12 +190,13 @@ async def demo_page() -> str:
       const url = new URL(window.location.href);
       url.protocol = url.protocol.replace('http', 'ws');
       url.pathname = '/ws';
+      // Send both for compatibility (server commonly expects `tab`)
+      url.searchParams.set('tab', tab.value);
+      url.searchParams.set('active_tab', tab.value);
       url.searchParams.set('org_id', org.value.trim());
       url.searchParams.set('user_id', user.value.trim());
-      url.searchParams.set('active_tab', tab.value);
-      if (apiKey.value.trim()) {
-        url.searchParams.set('api_key', apiKey.value.trim());
-      }
+      const key = apiKey.value.trim();
+      if (key) url.searchParams.set('api_key', key);
 
       ws = new WebSocket(url.toString());
       ws.onopen = () => { line('sys', 'WS connected'); wsBtn.textContent = 'Reconnect WS'; };
@@ -195,7 +211,7 @@ async def demo_page() -> str:
                 line('sys', data.payload.message);
               }
             } else {
-              // AgentEvent (asset.create / asset.set_meta etc.)
+              // AgentEvent (asset.create / impact.set_level / risk.set_probability, etc.)
               ev(data);
               if (data.event) {
                 line('sys', `event: ${data.event}`);
@@ -210,8 +226,17 @@ async def demo_page() -> str:
       ws.onerror = () => { line('sys', 'WS error'); };
     }
 
+    // Click to send
     sendBtn.addEventListener('click', sendMessage);
-    msg.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) sendMessage(); });
+
+    // ENTER to send, SHIFT+ENTER for newline
+    msg.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
     wsBtn.addEventListener('click', connectWs);
     window.addEventListener('load', connectWs);
     window.addEventListener('beforeunload', () => { if (ws) try { ws.close(1000, 'leaving'); } catch {} });

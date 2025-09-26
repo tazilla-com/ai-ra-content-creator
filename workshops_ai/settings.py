@@ -168,7 +168,7 @@ class AppSettings(BaseSettings):
     log_level: str = "INFO"
     app_host: str = "0.0.0.0"
     app_port: int = 8000
-    enable_docs: bool = True
+    enable_docs: bool = False
     reload: bool = True
 
     # CORS

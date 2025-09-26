@@ -381,8 +381,14 @@ def _infer_intent(message: str | None) -> Intent:
 
 def _selection_asset_id(req: UIRequest) -> str | None:
     try:
-        sel = req.selection or {}
-        aid = sel.get("asset_id")  # type: ignore[call-arg]
+        sel = getattr(req, "selection", None)
+        if sel is None:
+            return None
+        # Pydantic model (prefer attribute)
+        aid = getattr(sel, "asset_id", None)
+        # Fallback: kdyby někde výjimečně prošel dict
+        if aid is None and isinstance(sel, dict):
+            aid = sel.get("asset_id")
         return cast(str | None, aid)
     except Exception:
         return None
@@ -402,18 +408,19 @@ def _fail(msg: str, req: UIRequest | None, *, details: Any | None = None) -> UIR
 
 def _audit_in(req: UIRequest) -> None:
     try:
-        telemetry_log(
-            "manager.route_in",
-            {
-                "org_id": req.org_id,
-                "user_id": req.user_id,
-                "active_tab": req.active_tab,
-                "has_selection": bool(req.selection),
-                "staging": req.staging,
-                # extra context (optional) for observability:
-                "locale": getattr(req, "locale", None),
-                "emit_changes_enabled": getattr(getattr(req, "policy", None), "emit_changes_enabled", True),
-            },
-        )
+        pol = getattr(req, "policy", None)
+        if isinstance(pol, dict):
+            emit = bool(pol.get("emit_changes_enabled", True))
+        else:
+            emit = bool(getattr(pol, "emit_changes_enabled", True))
+        telemetry_log("manager.route_in", {
+            "org_id": req.org_id,
+            "user_id": req.user_id,
+            "active_tab": req.active_tab,
+            "has_selection": bool(req.selection),
+            "staging": req.staging,
+            "locale": getattr(req, "locale", None),
+            "emit_changes_enabled": emit,
+        })
     except Exception:
         pass
