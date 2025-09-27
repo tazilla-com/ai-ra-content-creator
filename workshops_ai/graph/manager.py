@@ -10,12 +10,15 @@
 # Design notes
 # - Contract-first: route_chat(UIRequest) -> UIResponse (strict Pydantic types).
 # - Tool-gating by active_tab (security-by-design; no cross-tab calls).
-# - Lightweight intent detector (read | propose | change | explain) for assets path
+# - Lightweight intent detector (read | propose | change | create | explain) for assets path
 #   to keep backward compatibility with AssetAgent signature.
 # - Per-request telemetry (best-effort), structured messages in the agent.
 # - Defensive imports (avoid cycles). If an agent isn’t wired yet, return a graceful UIResponse.
 # - All tabs operate in EMIT-ONLY / SEND-NOW semantics (WS optimistic + submit ChangeSet).
-# - Agent execution timeout (fail-fast; configurable via settings.agent_timeout_sec*).
+# - Agent execution timeout (fail-fast; configurable via settings.manager.* timeouts).
+#   Env mapping (via settings.ManagerSettings):
+#     WORKSHOPS_AI_MANAGER__AGENT_TIMEOUT_SEC=45
+#     WORKSHOPS_AI_MANAGER__THREATS_TIMEOUT_SEC=90
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ from workshops_ai.settings import get_settings
 # Types & constants
 # -----------------------------------------------------------------------------
 
-Intent = Literal["read", "propose", "change", "explain"]
+Intent = Literal["read", "propose", "change", "create", "explain"]
 
 
 class ToolGate(TypedDict):
@@ -78,12 +81,13 @@ DEFAULT_RESPONSE: Final[UIResponse] = UIResponse(
     staging={"needs_commit": False},
 )
 
+# --- Timeouts (read from Settings; production-friendly) -----------------------
 _SETTINGS = get_settings()
-# Global default timeout for agents
-_AGENT_TIMEOUT_SEC: Final[int] = int(getattr(_SETTINGS, "agent_timeout_sec", 45))
-# Per-tab overrides (fallback to global)
-_IMPACTS_TIMEOUT_SEC: Final[int] = int(getattr(_SETTINGS, "agent_timeout_sec_impacts", _AGENT_TIMEOUT_SEC))
-_THREATS_TIMEOUT_SEC: Final[int] = int(getattr(_SETTINGS, "agent_timeout_sec_threats", _AGENT_TIMEOUT_SEC))
+# Global default timeout for all agents (fallback)
+_AGENT_TIMEOUT_SEC: Final[int] = int(_SETTINGS.manager.agent_timeout_sec)
+# Per-tab overrides (use override if provided, otherwise fall back to global)
+_IMPACTS_TIMEOUT_SEC: Final[int] = _AGENT_TIMEOUT_SEC
+_THREATS_TIMEOUT_SEC: Final[int] = int(_SETTINGS.manager.threats_timeout_sec or _AGENT_TIMEOUT_SEC)
 
 # -----------------------------------------------------------------------------
 # Public entrypoint
@@ -353,30 +357,54 @@ def _get_backend_port() -> Any | None:
 
 def _infer_intent(message: str | None) -> Intent:
     """
-    Lightweight intent heuristics (Czech/English keywords).
+    Lightweight intent heuristics (Czech/Slovak/English keywords).
+    Order matters: explain → propose → create → change → read.
     Conservative default is 'read'.
     """
     if not message:
         return "read"
-    m = message.lower()
+    m = message.lower().strip()
 
     # Explain/help
-    if any(k in m for k in ("explain", "help", "nápověda", "vysvětli", "prečo", "preco", "ako funguje", "why")):
+    if any(k in m for k in (
+        "explain", "help", "nápověda", "napoveda", "vysvětli", "vysvetli",
+        "prečo", "preco", "ako funguje", "why"
+    )):
         return "explain"
 
     # Propose (suggestions)
-    if any(k in m for k in ("navrh", "navrhni", "suggest", "proposal", "doporuč", "recommend")):
+    if any(k in m for k in (
+        "navrh", "návrh", "navrhni", "suggest", "proposal",
+        "doporuč", "doporučuj", "recommend"
+    )):
         return "propose"
 
-    # Change/update
-    if any(k in m for k in ("change", "update", "upravit", "zmeni", "změň", "nastav", "set ")):
+    # Create/add/new (new record)
+    if any(k in m for k in (
+        "create", "add ", "add a ", "add an ", "new ", "new:",
+        "vytvoř", "vytvor", "založ", "zalozit", "založiť",
+        "přidej", "pridej", "přidat", "pridat",
+        "nový", "novy", "nové", "nove"
+    )):
+        return "create"
+
+    # Change/update (modify existing)
+    if any(k in m for k in (
+        "change", "update", "edit", "modify", "set ",
+        "upravit", "uprav", "zmeni", "změň", "zmenit", "změnit",
+        "nastav"
+    )):
         return "change"
 
     # Read/list/detail
-    if any(k in m for k in ("list", "seznam", "vyjmenuj", "show", "detail", "zobraz", "najdi", "read", "view")):
+    if any(k in m for k in (
+        "list", "seznam", "vyjmenuj", "show", "detail", "zobraz",
+        "najdi", "read", "view", "display"
+    )):
         return "read"
 
     return "read"
+
 
 
 def _selection_asset_id(req: UIRequest) -> str | None:

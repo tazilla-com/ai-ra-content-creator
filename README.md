@@ -28,14 +28,17 @@ pip install --no-cache-dir -r requirements.txt -c constraints.txt
 Create .env in project root (or export in your shell):
 
 # ====================== Runtime / App ======================
-WORKSHOPS_AI_ENV=dev # prod or dev
+WORKSHOPS_AI_ENV=dev
 WORKSHOPS_AI_VERSION=1.0.0
-WORKSHOPS_AI_LOG_LEVEL=INFO
+WORKSHOPS_AI_LOG_LEVEL=DEBUG
 
 WORKSHOPS_AI_CORS_ORIGINS=["*"]
 
 # Timeouts / limits 
-WORKSHOPS_AI_CHAT_TIMEOUT_SEC=20
+WORKSHOPS_AI_MANAGER__AGENT_TIMEOUT_SEC=75  
+WORKSHOPS_AI_MANAGER__THREATS_TIMEOUT_SEC=120
+WORKSHOPS_AI_CHAT__TIMEOUT_SEC=180
+WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC=30
 WORKSHOPS_AI_MAX_MESSAGE_LEN=4000
 WORKSHOPS_AI_WS_TIMEOUT_SEC=75
 
@@ -52,13 +55,13 @@ WORKSHOPS_AI_SECURITY__JWT_ISSUER=https://auth.example.com
 WORKSHOPS_AI_SECURITY__JWT_AUDIENCE=workshops-ai
 
 # ====================== Data roots (CSV) ===================
-WORKSHOPS_AI_DATA_DIR=./data
-WORKSHOPS_AI_CAT_DIR=./data/catalogs
-WORKSHOPS_AI_STATE_DIR=./data/state
+WORKSHOPS_AI_DATA_DIR=./workshops_ai/data
+WORKSHOPS_AI_CAT_DIR=./workshops_ai/data/catalogs
+WORKSHOPS_AI_STATE_DIR=./workshops_ai/data/state
 
 # ========== Export ChangeSets (Tazila) ==============
 WORKSHOPS_AI_TAZILA__MODE=file   # file or http
-WORKSHOPS_AI_TAZILA__OUTBOX_PATH=./data/outbox
+WORKSHOPS_AI_TAZILA__OUTBOX_PATH=/app/data/outbox
 WORKSHOPS_AI_TAZILA__ENDPOINT=https://backend.example.com/changesets
 WORKSHOPS_AI_TAZILA__AUTH_TOKEN=change-me-bearer-token
 WORKSHOPS_AI_TAZILA__TIMEOUT_SEC=30
@@ -84,6 +87,7 @@ LANGCHAIN_TRACING_V2=false
 # LANGCHAIN_ENDPOINT=   
 LANGCHAIN_API_KEY=
 LANGCHAIN_PROJECT=workshops-ai
+
 
 
 

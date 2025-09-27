@@ -19,9 +19,8 @@ services:
       WORKSHOPS_AI_REDIS__URL: ${WORKSHOPS_AI_REDIS__URL:-redis://redis:6379/0}
 
     volumes:
-      - ./data:/app/data
+      - ./workshops_ai/data:/app/data
       - ./logs:/app/logs
-      - ./workshops_ai/data/catalogs:/app/data/catalogs 
 
     depends_on:
       - redis

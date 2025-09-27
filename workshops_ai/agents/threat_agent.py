@@ -2,25 +2,11 @@
 # -----------------------------------------------------------------------------
 # ThreatAgent — LangChain Tools agent for the "threats" tab (SEND-NOW semantics)
 #
-# Capabilities:
-#  - list_threats(q?, category?, apply_asset_type?)             → read threat catalog
-#  - explain_threats(threat_code, asset_id?)                    → explain threat ↔ asset link
-#  - set_risk_probability(asset_id, threat_code, probability, note?)  → set 0..4
-#  - bulk_set_risk_probability(items=[...])                     → batch set
-#  - upsert_threat(code?, name, category, asset_type_codes[], flags..., description?)
-#
-# READ path (catalog lookups):
-#  - Uses workshops_ai.tools.search_catalogs.* (single source for fuzzy search / explains).
-#  - Keeps EN codes canonical; tolerant to CZ/SK aliases via normalizers in the helper.
-#
-# WRITE path (SEND-NOW):
-#  - Optimistic WS broadcast to update UI quickly (schema-validated emitter if available).
-#  - Asynchronous ChangeSet submission via asubmit_changeset(...) (no commit step).
-#
-# Design:
-#  - Strict Pydantic v2 validation (fail-closed).
-#  - Respect org/user context from UIRequest for audit + idempotency (best-effort).
-#  - Defensive against backend variations (Asset model vs. dict fallback).
+# What's new vs. previous version:
+#  1) FAST READ PATH: list-only requests are answered without LLM (no chance to hang).
+#  2) STEP TIMEOUTS: each external step is wrapped with its own timeout + telemetry.
+#  3) WATCHDOG: prints full thread stack traces ~10s before the manager's timeout.
+#  4) Strict, async-safe writes (WS optimistic emit + async ChangeSet submit).
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -28,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -58,6 +46,7 @@ from workshops_ai.backend import port as backend
 
 # Read-only catalogs (normalize/search/explain)
 from workshops_ai.tools import search_catalogs as cat
+from workshops_ai.tools.telemetry import telemetry_log
 
 log = logging.getLogger("workshops_ai.threat_agent")
 
@@ -65,9 +54,51 @@ log = logging.getLogger("workshops_ai.threat_agent")
 _THREAT_CTX = contextvars.ContextVar("threat_ctx", default={"org_id": "", "user_id": ""})
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Debug helpers: watchdog + per-step timeout wrappers
+# -----------------------------------------------------------------------------
+
+def _now() -> float:
+    return time.time()
+
+
+def _arm_stack_dump(delay_sec: int = 110) -> None:
+    """
+    If the agent gets stuck, dump all thread stacks to stderr before the router's
+    typical 120 s deadline. This is no-op if the process responds earlier.
+    """
+    def _dump():
+        try:
+            import sys, faulthandler
+            time.sleep(delay_sec)
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            telemetry_log("threat_agent.watchdog_dump", {"delay_sec": delay_sec})
+        except Exception:
+            # Never crash the agent because of debugging helpers
+            pass
+
+    threading.Thread(target=_dump, daemon=True).start()
+
+
+async def _with_step_timeout(coro, *, step: str, timeout_sec: int):
+    """
+    Wrap a coroutine with a per-step timeout and structured telemetry.
+    Raises asyncio.TimeoutError on timeout; caller decides the fallback.
+    """
+    t0 = _now()
+    telemetry_log("threat_agent.step.start", {"step": step, "timeout_sec": timeout_sec})
+    try:
+        res = await asyncio.wait_for(coro, timeout=timeout_sec)
+        telemetry_log("threat_agent.step.ok", {"step": step, "dt": _now() - t0})
+        return res
+    except asyncio.TimeoutError:
+        telemetry_log("threat_agent.step_timeout", {"step": step, "timeout_sec": timeout_sec})
+        raise
+
+
+# -----------------------------------------------------------------------------
 # Strict tool-argument schemas
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 class ThreatListArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -120,17 +151,15 @@ class UpsertThreatArgs(BaseModel):
     description: Optional[str] = Field(None, max_length=4000)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Small helpers
+# -----------------------------------------------------------------------------
 
 def _now_iso() -> str:
-    """UTC ISO8601 timestamp for audit records."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def _truthy(val: Any) -> bool:
-    """Coerce common truthy strings to bool (supports 'ano' as yes)."""
     return str(val).strip().lower() in {"1", "true", "t", "yes", "y", "ano"}
 
 
@@ -176,7 +205,6 @@ def _backend_get_asset(asset_id: str) -> Any:
                 return fn(asset_id)
             except Exception:
                 log.exception("backend.%s(%s) failed", name, asset_id)
-                # Try next candidate instead of stopping early
                 continue
     return None
 
@@ -229,9 +257,9 @@ def _to_risk_item(asset_id: str, threat_code: str, probability: int, note: Optio
     return RiskItem(threat_code=threat_code, probability=probability, note=note)
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Tools (read)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 @tool("list_threats", args_schema=ThreatListArgs)
 def tool_list_threats(
@@ -298,9 +326,9 @@ def tool_explain_threats(threat_code: str, asset_id: Optional[str] = None) -> st
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Tools (write — SEND-NOW)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 @tool("set_risk_probability", args_schema=RiskSetArgs)
 async def tool_set_risk_probability(
@@ -404,7 +432,6 @@ async def tool_upsert_threat(
     except Exception:
         log.exception("WS threat.upsert emit failed")
 
-    # Use plural op + array payload; backend validates shape
     cs = ChangeSet(
         idempotency_key=str(uuid.uuid4()),
         org_id=org_id,
@@ -422,63 +449,54 @@ async def tool_upsert_threat(
     return {"status": "ok", "upserted": item.get("code", name)}
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Agent bootstrap
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
-def _resolve_llm_config() -> tuple[str, int, int]:
+def _resolve_llm_config() -> tuple[str, int, int, Optional[str]]:
     """
     Resolve LLM settings with backward/forward compatibility.
-    Prefers nested settings (s.llm.model / s.llm.http_timeout_sec / s.llm.openai_max_retries),
-    but supports legacy flat attributes (s.llm_model / s.openai_timeout_sec / s.openai_max_retries).
-    Provides safe defaults for local/dev runs.
+    Returns (model, timeout_sec, retries, api_key_or_none).
     """
     s = get_settings()
 
     # Model
-    model = getattr(s, "llm_model", None)
-    if not model:
-        llm = getattr(s, "llm", None)
-        model = getattr(llm, "model", None) if llm else None
-    if not model:
-        model = "gpt-4o-mini"  # dev default
+    model = getattr(getattr(s, "llm", None), "model", None) or getattr(s, "llm_model", None) or "gpt-4o-mini"
 
     # Timeout
-    timeout = getattr(s, "openai_timeout_sec", None)
-    if timeout is None:
-        llm = getattr(s, "llm", None)
-        timeout = getattr(llm, "http_timeout_sec", None) if llm else None
-    if timeout is None:
-        timeout = 60
+    timeout = (
+        getattr(getattr(s, "llm", None), "http_timeout_sec", None)
+        or getattr(s, "openai_timeout_sec", None)
+        or 60
+    )
 
     # Retries
-    retries = getattr(s, "openai_max_retries", None)
-    if retries is None:
-        llm = getattr(s, "llm", None)
-        retries = getattr(llm, "openai_max_retries", None) if llm else None
-    if retries is None:
-        retries = 2
+    retries = (
+        getattr(getattr(s, "llm", None), "openai_max_retries", None)
+        or getattr(s, "openai_max_retries", None)
+        or 2
+    )
 
-    return str(model), int(timeout), int(retries)
+    # API key (explicit if present; LangChain will also read env OPENAI_API_KEY)
+    api_key = (
+        getattr(getattr(s, "llm", None), "openai_api_key", None)
+        or getattr(s, "openai_api_key", None)
+        or None
+    )
+
+    return str(model), int(timeout), int(retries), api_key
 
 
 def _build_executor() -> AgentExecutor:
     """Create an OpenAI Tools agent with our tools and a safe system prompt."""
-    model, timeout, retries = _resolve_llm_config()
-
-    s = get_settings()
-    llm_cfg = getattr(s, "llm", None)
-    api_key = (
-        getattr(llm_cfg, "openai_api_key", None)
-        or getattr(s, "openai_api_key", None)
-    )
+    model, timeout, retries, api_key = _resolve_llm_config()
 
     llm = ChatOpenAI(
         model=model,
         temperature=0,
         timeout=timeout,
         max_retries=retries,
-        api_key=api_key,  # pull API key from settings
+        api_key=api_key,  # if None, langchain_openai will fall back to env
     )
 
     tools = [
@@ -489,7 +507,6 @@ def _build_executor() -> AgentExecutor:
         tool_upsert_threat,
     ]
 
-    # No {tools} variable in the template (avoids KeyError in LC 0.2).
     system = (
         "You are ThreatAgent for the 'threats' tab in WorkshopsAI.\n"
         "RULES:\n"
@@ -500,7 +517,6 @@ def _build_executor() -> AgentExecutor:
         "- Do not modify assets/impacts/controls here.\n"
     )
 
-    # Provide explicit context (asset_id/asset_type) so the agent can apply filters.
     prompt = ChatPromptTemplate.from_messages(
         [
             ("system", system),
@@ -520,9 +536,37 @@ def _build_executor() -> AgentExecutor:
     return AgentExecutor(agent=agent, tools=tools, verbose=False)
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Short-circuit (fast read) utilities
+# -----------------------------------------------------------------------------
+
+def _is_list_only(message: str | None) -> bool:
+    """
+    Heuristic for 'list mapped threats' style instructions.
+    We deliberately avoid LLM for this to guarantee snappy, deterministic replies.
+    """
+    if not message:
+        return False
+    m = message.lower()
+    # Conservative: look for "list" (or CZ 'seznam') + explicit 'do not change' / 'read-only'.
+    return (
+        ("list" in m or "seznam" in m or "mapped" in m)
+        and ("do not change" in m or "read-only" in m or "bez změn" in m or "bez zmen" in m)
+    )
+
+
+async def _list_threats_fast(asset_id: Optional[str], asset_type: Optional[str]) -> list[str]:
+    """
+    Pure read path. No LLM. Uses catalogs directly and filters by asset_type when provided.
+    """
+    items = cat.list_threats(q=None, category=None, apply_asset_type=asset_type, limit=200)
+    codes = [t.get("code") for t in items if t.get("code")]
+    return codes[:50]  # keep output compact for UI
+
+
+# -----------------------------------------------------------------------------
 # Public API
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 async def run(req: UIRequest) -> UIResponse:
     """
@@ -538,12 +582,13 @@ async def run(req: UIRequest) -> UIResponse:
             policy={"emit_changes_enabled": True},
         )
 
+    # Arm watchdog ~10s before typical 120 s manager timeout
+    _arm_stack_dump(delay_sec=110)
+
     # Set org/user context for downstream tools & changesets
     _THREAT_CTX.set({"org_id": req.org_id or "", "user_id": req.user_id or ""})
 
-    executor = _build_executor()
-
-    # Try to resolve asset_type from backend so the agent can use it in tool calls
+    # Resolve selection context (asset_id → asset_type)
     selection_asset_id: Optional[str] = None
     selection_asset_type: Optional[str] = None
     if req.selection and getattr(req.selection, "asset_id", None):
@@ -554,18 +599,47 @@ async def run(req: UIRequest) -> UIResponse:
         except Exception:
             log.exception("Failed to resolve asset type for asset_id=%s", selection_asset_id)
 
+    # FAST PATH: list-only requests → bypass LLM completely
+    if _is_list_only(req.message):
+        try:
+            codes = await _with_step_timeout(
+                _list_threats_fast(selection_asset_id, selection_asset_type),
+                step="list_only",
+                timeout_sec=20,
+            )
+            msg = ", ".join(codes) if codes else "No mapped threats found."
+            return UIResponse(
+                messages=[msg],
+                staging={"needs_commit": False},
+                policy={"emit_changes_enabled": True},
+            )
+        except asyncio.TimeoutError:
+            # Fall through to LLM path as a last resort
+            telemetry_log("threat_agent.list_only_timeout_fallback", {})
+
+    # LLM path (tools agent)
+    executor = _build_executor()
+
     try:
-        result = await executor.ainvoke(
-            {
-                "input": req.message or "Help",
-                "chat_history": [],
-                "org_id": req.org_id,
-                "user_id": req.user_id,
-                "selection_asset_id": selection_asset_id or "",
-                "selection_asset_type": selection_asset_type or "",
-            }
+        # Give the agent a reasonable step timeout that's below manager's ceiling
+        result = await _with_step_timeout(
+            executor.ainvoke(
+                {
+                    "input": req.message or "Help",
+                    "chat_history": [],
+                    "org_id": req.org_id,
+                    "user_id": req.user_id,
+                    "selection_asset_id": selection_asset_id or "",
+                    "selection_asset_type": selection_asset_type or "",
+                }
+            ),
+            step="llm.ainvoke",
+            timeout_sec=90,  # independent guard; manager has its own global timeout
         )
         text = (result.get("output") or "").strip() or "Done."
+    except asyncio.TimeoutError:
+        telemetry_log("threat_agent.invoke_timeout", {"timeout_sec": 90})
+        text = "ThreatAgent timed out while processing your request."
     except Exception as e:
         log.exception("ThreatAgent failed")
         text = f"ThreatAgent error: {e!s}"

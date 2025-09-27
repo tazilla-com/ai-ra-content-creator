@@ -78,7 +78,7 @@ except Exception:  # pragma: no cover
     HumanMessage = SystemMessage = object  # type: ignore
 
 
-Intent = Literal["read", "explain"]
+Intent = Literal["read", "explain", "create", "change", "propose"]
 READ_PAGE_LIMIT = 100
 _ALLOWED_TOOLS = {"create_asset", "set_asset_meta"}
 _REPAIR_HINT = (
@@ -154,11 +154,12 @@ def _llm() -> ChatOpenAI:
         raise RuntimeError("LangChain/OpenAI not installed")
 
     s = get_settings()
-    # Using OpenAI client from env configured by Settings; keys are read by the SDK internally.
-    model = getattr(s, "llm_model", None) or "gpt-4o-mini"
-    temperature = float(getattr(s, "llm_temperature", 0.0))
-    timeout = int(getattr(s, "http_timeout_sec", 60))
-    max_retries = int(getattr(s, "openai_max_retries", 3))
+    # Settings jsou v namespacu s.llm.*
+    llm_cfg = getattr(s, "llm", None) or {}
+    model = getattr(llm_cfg, "model", None) or "gpt-4o-mini"
+    temperature = float(getattr(llm_cfg, "temperature", 0.0))
+    timeout = int(getattr(llm_cfg, "http_timeout_sec", 60))
+    max_retries = int(getattr(llm_cfg, "openai_max_retries", 3))
 
     return ChatOpenAI(model=model, temperature=temperature, timeout=timeout, max_retries=max_retries)  # type: ignore[call-arg]
 
@@ -221,22 +222,92 @@ class AssetDetail(AssetPreview):
 
 async def run(req: UIRequest, intent: Intent) -> UIResponse:
     """AI agent: list/detail + NL→Actions (assets-only) with immediate outbox submit."""
+    # ---------------------------------------------------------------------
+    # 1) Locale + audit
+    # ---------------------------------------------------------------------
     lang = i18n_lang_from(language=getattr(req, "language", None), locale=getattr(req, "locale", None))
     _audit_in(req, intent, lang)
 
     msg = (req.message or "").strip()
 
+    # ---------------------------------------------------------------------
+    # 2) Explain path (no LLM/backends)
+    # ---------------------------------------------------------------------
     if intent == "explain":
         return _explain_response(lang)
 
-    # Build context for prompt (summaries + seed terms)
+    # ---------------------------------------------------------------------
+    # 3) Build prompt context (org summary + seed candidates)
+    # ---------------------------------------------------------------------
     org_summary = summarize_org_profile(getattr(req, "organization_profile", None))
     raw_seeds = extract_seed_candidates(getattr(req, "services", None), getattr(req, "website_content", None))
     seeds = dedupe_against_existing(raw_seeds, getattr(req, "existing_assets", None))
     seed_labels = ", ".join([c["name"] for c in seeds]) if seeds else ""
 
-    # 1) Invoke LLM; if unavailable, gracefully fall back to read-only + seed proposals.
+    # ---------------------------------------------------------------------
+    # 3a) Deterministic fast-path for create/update without LLM
+    #     Supported forms:
+    #       - "Create an asset: name=...; type=...; primary=true"
+    #       - "Update asset <id>: name=...; primary=false; type=..."
+    # ---------------------------------------------------------------------
+    def _parse_kv_args_local(s: str) -> dict[str, Any]:
+        parts = re.split(r"\s*[;,]\s*", s.strip())
+        out: dict[str, Any] = {}
+        for p in parts:
+            if not p:
+                continue
+            m = re.match(r"^\s*([a-zA-Z_][a-zA-Z0-9_\- ]*)\s*=\s*(.+?)\s*$", p)
+            if not m:
+                continue
+            k = m.group(1).strip().lower()
+            v = m.group(2).strip().strip('"').strip("'")
+            if v.lower() in ("true", "false"):
+                v = (v.lower() == "true")
+            if k == "type":
+                k = "asset_type_code"
+            out[k.replace(" ", "_")] = v
+        return out
+
+    fast_tool: dict[str, Any] | None = None
+    if msg:
+        # CREATE
+        m_create = re.match(r"^\s*create\s+an?\s+asset\s*:\s*(.+)$", msg, flags=re.I)
+        if m_create:
+            args = _parse_kv_args_local(m_create.group(1))
+            if args.get("name") and (args.get("asset_type_code") or args.get("asset_type_uuid")):
+                fast_tool = {"name": "create_asset", "args": args}
+
+        # UPDATE
+        if fast_tool is None:
+            m_update = re.match(r"^\s*update\s+asset\s+([^\s:]+)\s*:\s*(.+)$", msg, flags=re.I)
+            if m_update:
+                asset_id = m_update.group(1).strip()
+                args = _parse_kv_args_local(m_update.group(2))
+                if asset_id:
+                    args["asset_id"] = asset_id
+                    fast_tool = {"name": "set_asset_meta", "args": args}
+
+    if fast_tool:
+        submitted, events = await _handle_tool_calls(req, [fast_tool], lang=lang)
+        if submitted > 0:
+            return UIResponse(
+                messages=[i18n_t("assets", "done", lang=lang, n=submitted)],
+                proposals=None,
+                staging={"needs_commit": False},
+                agent_events=events,
+            )
+        return UIResponse(
+            messages=[i18n_t("assets", "invalid_change", lang=lang)],
+            proposals=None,
+            staging={"needs_commit": False},
+        )
+
+    # ---------------------------------------------------------------------
+    # 4) LLM invocation (+ one self-repair attempt); fallback on failure
+    # ---------------------------------------------------------------------
     try:
+        # (Optional) expose intent to the prompt builder if it uses req.intent
+        setattr(req, "intent", intent)
         ai_msg = await _ai_invoke(req, msg, lang, org_summary, seed_labels, repair=False)
         if _needs_repair(ai_msg):
             telemetry_log("asset_agent.repair_retry", {"reason": "schema/rules mismatch"})
@@ -256,7 +327,9 @@ async def run(req: UIRequest, intent: Intent) -> UIResponse:
                 )
         return await _handle_read_controls(req, parsed, ai_fallback_text=i18n_t("assets", "hint_generic", lang=lang))
 
-    # 1a) If tools were called, emit WS events and immediately submit a single-action ChangeSet
+    # ---------------------------------------------------------------------
+    # 5) If tools were called by the LLM → emit WS + submit one ChangeSet
+    # ---------------------------------------------------------------------
     tool_calls = _normalize_tool_calls(ai_msg)
     if tool_calls:
         if len(tool_calls) > 1:
@@ -264,7 +337,6 @@ async def run(req: UIRequest, intent: Intent) -> UIResponse:
                 "asset_agent.tool_truncate",
                 {"count": len(tool_calls), "kept": tool_calls[0].get("name"), "dropped": [c.get("name") for c in tool_calls[1:]]},
             )
-        # enforce exactly ONE tool call
         tool_calls = tool_calls[:1]
         submitted, events = await _handle_tool_calls(req, tool_calls, lang=lang)
         if submitted > 0:
@@ -280,7 +352,9 @@ async def run(req: UIRequest, intent: Intent) -> UIResponse:
             staging={"needs_commit": False},
         )
 
-    # 1b) No tools: parse hidden control tag and show only the human sentence (+ optional seeds)
+    # ---------------------------------------------------------------------
+    # 6) No tools: parse hidden <control> and produce read responses/seeds
+    # ---------------------------------------------------------------------
     raw_content = (getattr(ai_msg, "content", None) or "").strip()
     control_text, human_text = _extract_control_tag_and_human_text(raw_content)
 
@@ -296,9 +370,12 @@ async def run(req: UIRequest, intent: Intent) -> UIResponse:
             )
         return UIResponse(messages=[human_text or i18n_t("assets", "ok", lang=lang)], proposals=None, staging={"needs_commit": False})
 
-    # Interpret hidden READ_* control and return human sentence + proposals
+    # ---------------------------------------------------------------------
+    # 7) Interpret hidden READ_* control and return human sentence + proposals
+    # ---------------------------------------------------------------------
     parsed = _interpret_ai_read_control(control_text)
     return await _handle_read_controls(req, parsed, ai_fallback_text=(human_text or None))
+
 
 # -----------------------------------------------------------------------------
 # AI helpers

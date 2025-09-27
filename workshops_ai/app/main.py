@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 try:
     from fastapi.responses import ORJSONResponse  # uses orjson if installed
     _DEFAULT_RESPONSE_CLASS = ORJSONResponse
-except Exception:  # pragma: no cover
+except Exception: 
     _DEFAULT_RESPONSE_CLASS = JSONResponse
 
 from pydantic import BaseModel, Field, ConfigDict
@@ -47,9 +47,11 @@ settings = get_settings()
 
 # Optional auth dependency (API-key/JWT); if module not present we no-op auth.
 try:
-    from workshops_ai.app.deps.auth import require_auth as _require_auth  # noqa: F401
+    from workshops_ai.app.security import require_auth as _require_auth  # ✅ jednotná logika z app/security.py
     _AUTH_DEP = [Depends(_require_auth)]
-except Exception:  # pragma: no cover
+except Exception as e:  # pragma: no cover
+    import logging
+    logging.getLogger("workshops_ai").warning("auth.disabled: %s", e)
     _AUTH_DEP = []
 
 # Chat UI (demo)
@@ -341,7 +343,7 @@ def create_app() -> FastAPI:
 
     # /chat
     def _mount_chat():
-        from workshops_ai.api.app import router as chat_router  # canonical
+        from workshops_ai.routers.chat_router import router as chat_router
         app.include_router(chat_router, tags=["chat"], dependencies=_AUTH_DEP)
 
     def _fallback_chat():
