@@ -19,10 +19,6 @@
 #   "policy": {"emit_changes_enabled": true}
 # }
 #
-# Notes
-# - Compiled with an injected checkpointer → per-org/tab history.
-# - Write paths are "emit-only": WS broadcast first, then async submit (or outbox fallback).
-# - Optional NLU node: parses simple free-text updates into structured payloads.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -46,12 +42,6 @@ except Exception as e:  # pragma: no cover
     raise RuntimeError("langgraph must be installed to use threat_graph") from e
 
 logger = logging.getLogger(__name__)
-
-# Optional LLM (LangChain OpenAI); runtime-safe fallback
-try:
-    from langchain_openai import ChatOpenAI  # type: ignore
-except Exception:  # pragma: no cover
-    ChatOpenAI = None  # type: ignore
 
 
 # -----------------------------------------------------------------------------
@@ -92,7 +82,7 @@ class ThreatState(BaseModel):
     user_id: Optional[str] = None
     locale: Optional[str] = None
 
-    # Wizard context (optional, used in ChangeSet context)
+    # Wizard context (consumed in write paths)
     organization_profile: Optional[dict] = None
     services: Optional[list[dict]] = None
     existing_assets: Optional[list[dict]] = None
@@ -111,11 +101,11 @@ class ThreatState(BaseModel):
     intent: Optional[Intent] = None
     change: Optional[dict] = None
     result: Optional[dict] = None
-    touched_asset_ids: Optional[List[str]] = None  # for post-submit hint
+    touched_asset_ids: Optional[List[str]] = None  # pro bulk hint po submitu
 
 
 # -----------------------------------------------------------------------------
-# Small helpers
+# Helpers
 # -----------------------------------------------------------------------------
 
 def _now_iso() -> str:
@@ -132,27 +122,6 @@ def _ui_response(text: str, *, extra: Optional[dict] = None) -> dict:
     if extra:
         base.update(extra)
     return base
-
-
-def _context_from_wizard(state: ThreatState) -> dict:
-    """
-    Assemble a compact context object from optional wizard-like fields.
-    Only includes non-empty items to keep payloads small.
-    """
-    ctx = {}
-    if state.organization_profile:
-        ctx["organization_profile"] = state.organization_profile
-    if state.services:
-        ctx["services"] = state.services[:20]
-    if state.existing_assets:
-        ctx["existing_assets_count"] = len(state.existing_assets)
-    if state.website_content:
-        ctx["website_content_present"] = True
-    if state.number_of_assets is not None:
-        ctx["number_of_assets"] = state.number_of_assets
-    if state.language:
-        ctx["language"] = state.language
-    return ctx
 
 
 def _build_changeset(*, kind: str, org_id: str, user_id: Optional[str], data: dict) -> dict:
@@ -175,7 +144,7 @@ def _build_changeset(*, kind: str, org_id: str, user_id: Optional[str], data: di
 
 async def _asubmit_changeset_or_outbox(payload: dict, deps: GraphDeps) -> None:
     """
-    Try the Tazila client (async/sync). If missing or it fails, dump JSON into outbox.
+    Zkusí Tazila klienta (async/sync). Když není / selže → outbox JSON.
     Outbox path priority:
       settings.tazila.outbox_path → env WORKSHOPS_AI_TAZILA__OUTBOX_PATH → /app/workshops_ai/data/outbox
     """
@@ -222,13 +191,11 @@ async def _asubmit_changeset_or_outbox(payload: dict, deps: GraphDeps) -> None:
         logger.warning("Outbox write failed: %s", e)
 
 
-async def _maybe_mem_set(deps: GraphDeps, key: str, value: Any, *, ttl_sec: Optional[int] = None) -> None:
+async def _maybe_mem_set(deps: GraphDeps, key: string, value: Any, *, ttl_sec: Optional[int] = None) -> None:
     """
-    Best-effort memory write compatible with sync/async implementations and optional TTL.
-    Tries:
-      1) deps.memory_set(key, value, ttl_sec=...) → on TypeError, retries without TTL
-      2) deps.memory.set(key, value, ttl_sec=...) → on TypeError, retries without TTL
-    Silently ignores failures.
+    Best-effort zápis do memory kompatibilní se sync i async implementacemi, s/bez TTL.
+    Použijeme "jednodílný" klíč (včetně org_id v prefixu), abychom neřešili signatury typu
+    memory_set(org_id, key, value) vs memory.set(key, value).
     """
     candidates = []
     setter = getattr(deps, "memory_set", None)
@@ -256,17 +223,7 @@ async def _maybe_mem_set(deps: GraphDeps, key: str, value: Any, *, ttl_sec: Opti
                 continue
         except Exception:
             continue
-    # give up silently
-
-
-def _get_llm_from_deps(deps: GraphDeps):
-    llm = getattr(deps, "llm", None)
-    if llm is not None:
-        return llm
-    if ChatOpenAI is None:
-        return None
-    # Safe default
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0.1, timeout=12, max_retries=1)  # type: ignore[call-arg]
+    # ignore
 
 
 # -----------------------------------------------------------------------------
@@ -328,128 +285,6 @@ def _infer_intent(state: ThreatState) -> ThreatState:
 
 
 # -----------------------------------------------------------------------------
-# Optional NLU — parse free-text into set/bulk_set payloads
-# -----------------------------------------------------------------------------
-
-_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", re.I)
-# Pattern like: T123=3, t-foo 2, threat_phishing:1  (code separators allowed; value 0..4)
-_THREAT_ASSIGN_RX = re.compile(r"\b([a-z0-9._-]{2,})\s*[:=]\s*([0-4])\b", re.I)
-_THREAT_PAIR_RX = re.compile(r"\b([a-z0-9._-]{2,})\s+([0-4])\b", re.I)
-
-
-def _derive_set_from_text_threats(message: str, selection_asset_id: Optional[str]) -> Optional[RiskSetPayload]:
-    """
-    Regex-only fast path (no LLM). Requires an asset_id from selection or explicit UUID.
-    Examples:
-      - "set T123=3 for 7d0e... asset"
-      - "T007 1, phishing=2"
-    """
-    asset_id = selection_asset_id or (_UUID_RE.search(message).group(0) if _UUID_RE.search(message) else None)
-    if not asset_id:
-        return None
-
-    found: dict[str, int] = {}
-    for rx in (_THREAT_ASSIGN_RX, _THREAT_PAIR_RX):
-        for m in rx.finditer(message or ""):
-            code, val = m.group(1), int(m.group(2))
-            if 0 <= val <= 4 and len(code) >= 2:
-                found[code] = val
-
-    if not found:
-        return None
-
-    items = [RiskItem(threat_code=k, probability=v) for k, v in found.items()]
-    return RiskSetPayload(asset_id=str(asset_id), items=items)
-
-
-async def _nlu_threats(deps: GraphDeps, state: ThreatState) -> ThreatState:
-    """
-    Best-effort NLU that fills set_payload / bulk_payload from natural language.
-    - First tries regex-only extraction for patterns like "T123=3", "phishing 2".
-    - If still empty and an LLM is available, asks it for STRICT JSON.
-    - Never invents asset IDs; selection.asset_id or explicit UUID must be present.
-    """
-    raw = (state.message or "").strip()
-    if not raw:
-        return state
-
-    selection_id = (state.selection or {}).get("asset_id")
-
-    # 1) Regex-based extraction (no LLM)
-    guess = _derive_set_from_text_threats(raw, selection_id)
-    if guess and not state.set_payload:
-        state.set_payload = guess
-        if not state.action:
-            state.action = cast(Intent, "set")
-
-    # 2) Optional LLM-backed parsing (STRICT JSON)
-    if not state.set_payload and not state.bulk_payload:
-        llm = _get_llm_from_deps(deps)
-        if llm is not None:
-            system = (
-                "You are a strict NLU for a 'threats' assistant. "
-                "Extract intent and slots from any language (CS/SK/EN; tolerate typos). "
-                "Return ONLY JSON with optional fields: "
-                "{"
-                "  action: one of [list,get,set,bulk_set,explain,upsert],"
-                "  selection: {asset_id},"
-                "  set: {asset_id, items:[{threat_code: string, probability: 0..4, note?: string}]},"
-                "  bulk: {entries:[{asset_id, items:[{threat_code, probability, note?}]}]},"
-                "  upsert: {threat_code, name?, category?, notes?}"
-                "}"
-                "Rules:\n"
-                "- NEVER invent asset IDs.\n"
-                "- If selection.asset_id is provided, you MAY copy it into set.asset_id.\n"
-                "- If unsure, leave fields null. Output STRICT JSON, no prose."
-            )
-            human = {
-                "message": raw,
-                "selection": {"asset_id": selection_id} if selection_id else None,
-            }
-            try:
-                from langchain_core.messages import SystemMessage, HumanMessage  # type: ignore
-                resp = await llm.ainvoke([SystemMessage(content=system), HumanMessage(content=json.dumps(human))])  # type: ignore[arg-type]
-                txt = (getattr(resp, "content", None) or "").strip()
-                i, j = txt.find("{"), txt.rfind("}")
-                data = json.loads(txt[i:j + 1] if i != -1 and j != -1 else txt)
-
-                action = data.get("action")
-                sel = data.get("selection") or {}
-                if sel.get("asset_id") and not selection_id:
-                    selection_id = sel.get("asset_id")
-
-                if data.get("set"):
-                    s = data["set"]
-                    aid = s.get("asset_id") or selection_id
-                    items = [RiskItem(**it) for it in (s.get("items") or [])]
-                    if aid and items:
-                        state.set_payload = RiskSetPayload(asset_id=str(aid), items=items)
-                        state.action = cast(Intent, "set")
-                elif data.get("bulk"):
-                    entries = []
-                    for e in (data["bulk"].get("entries") or []):
-                        aid = e.get("asset_id")
-                        items = [RiskItem(**it) for it in (e.get("items") or [])]
-                        if aid and items:
-                            entries.append(RiskSetPayload(asset_id=str(aid), items=items))
-                    if entries:
-                        state.bulk_payload = RiskBulkPayload(entries=entries)
-                        state.action = cast(Intent, "bulk_set")
-                elif data.get("upsert"):
-                    try:
-                        state.upsert_payload = UpsertThreatPayload(**data["upsert"])
-                        state.action = cast(Intent, "upsert")
-                    except Exception:
-                        pass
-                elif action in ("list", "get", "explain"):
-                    state.action = cast(Intent, action)
-            except Exception as e:
-                logger.info("THREATS NLU LLM failed: %s", e)
-
-    return state
-
-
-# -----------------------------------------------------------------------------
 # Read-only nodes
 # -----------------------------------------------------------------------------
 
@@ -475,7 +310,6 @@ def _list_threats(deps: GraphDeps):
             name = row.get("EN Name") or row.get("name") or row.get("Threat") or ""
             cat = row.get("Threat category") or row.get("category") or ""
             lines.append(f"- {code}: {name}" + (f" [{cat}]" if cat else ""))
-
         state.result = _ui_response("\n".join(lines))
         return state
     return _inner
@@ -582,7 +416,7 @@ def _bulk_set_risk_probabilities(deps: GraphDeps):
             state.result = _ui_response("Missing bulk payload entries.")
             return state
 
-        # Emit WS for each item in each entry
+        # Emit WS pro každý item
         for entry in bulk.entries:
             for it in entry.items:
                 ws_payload = {
@@ -595,7 +429,7 @@ def _bulk_set_risk_probabilities(deps: GraphDeps):
                 }
                 await _emit_risk_ws(deps.ws_hub, ws_payload)
 
-        # Build ChangeSet
+        # Připrav ChangeSet
         change = _build_changeset(
             kind="risk.bulk_set_probabilities",
             org_id=state.org_id,
@@ -610,7 +444,7 @@ def _bulk_set_risk_probabilities(deps: GraphDeps):
         )
         state.change = change
 
-        # Remember list of affected asset_ids for later hints
+        # Ulož si seznam dotčených asset_id pro pozdější hint
         seen: set[str] = set()
         touched: list[str] = []
         for e in bulk.entries:
@@ -663,7 +497,7 @@ async def _submit_changeset_async(state: ThreatState, deps: GraphDeps) -> Threat
 
         state.result = _ui_response(msg, extra={"changeset_id": state.change.get("id")})
 
-        # Best-effort hint after bulk submit (store last touched asset_ids list)
+        # Best-effort hint po bulk submitu
         try:
             if state.intent == "bulk_set" and state.touched_asset_ids:
                 key = f"{state.org_id}:threats.last_touched_asset_ids"
@@ -773,10 +607,6 @@ def create_graph(deps: GraphDeps):
     graph = StateGraph(ThreatState)
 
     # Nodes
-    async def _nlu_node(state: ThreatState) -> ThreatState:
-        return await _nlu_threats(deps, state)
-
-    graph.add_node("nlu_threats", _nlu_node)
     graph.add_node("route", _infer_intent)
     graph.add_node("list_threats", _list_threats(deps))
     graph.add_node("asset_get_risks", _asset_get_risks(deps))
@@ -785,7 +615,7 @@ def create_graph(deps: GraphDeps):
     graph.add_node("upsert_threat", _upsert_threat(deps))
 
     async def _submit_node(state: ThreatState) -> ThreatState:
-        # Submit ChangeSet and optionally store bulk hint.
+        # Submit ChangeSet a případně ulož hint pro bulk.
         return await _submit_changeset_async(state, deps)
 
     async def _explain_node(state: ThreatState) -> ThreatState:
@@ -795,8 +625,7 @@ def create_graph(deps: GraphDeps):
     graph.add_node("explain_threats", _explain_node)
 
     # Entry & routing
-    graph.set_entry_point("nlu_threats")
-    graph.add_edge("nlu_threats", "route")
+    graph.set_entry_point("route")
 
     def _route(state: ThreatState) -> str:
         intent = state.intent or "list"

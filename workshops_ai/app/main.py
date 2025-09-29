@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 try:
     from fastapi.responses import ORJSONResponse  # uses orjson if installed
     _DEFAULT_RESPONSE_CLASS = ORJSONResponse
-except Exception: 
+except Exception:
     _DEFAULT_RESPONSE_CLASS = JSONResponse
 
 from pydantic import BaseModel, Field, ConfigDict
@@ -412,6 +412,62 @@ def create_app() -> FastAPI:
         app.include_router(router)
 
     _mount_or_fallback("assets_router", _mount_assets, _fallback_assets)
+
+    # /graph/threats
+    def _mount_threats():
+        from workshops_ai.routers.threats import router as threats_router  # canonical
+        app.include_router(threats_router, tags=["threats"], dependencies=_AUTH_DEP)
+
+    def _fallback_threats():
+        router = APIRouter()
+        @router.post(
+            "/graph/threats",
+            tags=["threats"],
+            response_class=_DEFAULT_RESPONSE_CLASS,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        async def threats_not_ready(_: Request) -> dict[str, Any]:
+            return {
+                "error": {
+                    "type": "not_ready",
+                    "message": "Threats router not mounted. Implement workshops_ai.routers.threats.router",
+                },
+                "request_id": get_request_id(),
+            }
+        @router.get("/graph/threats/ping", tags=["threats"])
+        async def threats_ping() -> dict[str, Any]:
+            return {"status": "not_ready", "router": "threats"}
+        app.include_router(router)
+
+    _mount_or_fallback("threats_router", _mount_threats, _fallback_threats)
+
+    # /graph/impacts
+    def _mount_impacts():
+        from workshops_ai.routers.impacts import router as impacts_router  # canonical
+        app.include_router(impacts_router, tags=["impacts"], dependencies=_AUTH_DEP)
+
+    def _fallback_impacts():
+        router = APIRouter()
+        @router.post(
+            "/graph/impacts",
+            tags=["impacts"],
+            response_class=_DEFAULT_RESPONSE_CLASS,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        async def impacts_not_ready(_: Request) -> dict[str, Any]:
+            return {
+                "error": {
+                    "type": "not_ready",
+                    "message": "Impacts router not mounted. Implement workshops_ai.routers.impacts.router",
+                },
+                "request_id": get_request_id(),
+            }
+        @router.get("/graph/impacts/ping", tags=["impacts"])
+        async def impacts_ping() -> dict[str, Any]:
+            return {"status": "not_ready", "router": "impacts"}
+        app.include_router(router)
+
+    _mount_or_fallback("impacts_router", _mount_impacts, _fallback_impacts)
 
     return app
 
