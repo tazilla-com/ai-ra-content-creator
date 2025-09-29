@@ -172,7 +172,7 @@ class BackendPort(Protocol):
 
     def staging_open_batch(self, org_id: str, tags: list[str], comment: str | None = None) -> BatchId:
         """
-        Start a staging batch. Implementations MUST audit (userId, ts, tags, source=AI).
+        Start a staging batch. Implementations MUST audit (user_id, ts, tags, source=AI).
         Returns batch_id.
         """
 

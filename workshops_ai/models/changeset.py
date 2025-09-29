@@ -1,9 +1,32 @@
 # /app/models/changeset.py
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, StrictFloat, StrictInt, StrictStr, ConfigDict
+from pydantic import BaseModel, Field, StrictFloat, StrictInt, StrictStr, ConfigDict, model_validator
+
+
+# -----------------------------------------------------------------------------
+# Audit envelope (strict, snake_case "on the wire")
+# -----------------------------------------------------------------------------
+
+class Audit(BaseModel):
+    """
+    Jednotná auditní obálka pro všechny ChangeSety.
+    Snake-case všude (vč. JSON).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: StrictStr
+    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    source: StrictStr = "AI"
+    tags: List[StrictStr] = Field(default_factory=list)
+
+    org_id: Optional[StrictStr] = None
+    session_id: Optional[StrictStr] = None
+    request_id: Optional[StrictStr] = None
+    batch_id: Optional[StrictStr] = None
 
 
 # -----------------------------------------------------------------------------
@@ -70,6 +93,12 @@ class ActionSetImpacts(BaseModel):
     asset_ref: Optional[StrictStr] = None  # e.g. "client:<token>"
     items: List[ImpactItem]
 
+    @model_validator(mode="after")
+    def _require_asset_selector(self) -> "ActionSetImpacts":
+        if not (self.asset_id or self.asset_ref):
+            raise ValueError("One of 'asset_id' or 'asset_ref' must be provided.")
+        return self
+
 
 class ActionSetRisks(BaseModel):
     """
@@ -83,6 +112,12 @@ class ActionSetRisks(BaseModel):
     asset_ref: Optional[StrictStr] = None
     items: List[RiskItem]
 
+    @model_validator(mode="after")
+    def _require_asset_selector(self) -> "ActionSetRisks":
+        if not (self.asset_id or self.asset_ref):
+            raise ValueError("One of 'asset_id' or 'asset_ref' must be provided.")
+        return self
+
 
 class ActionUpsertControls(BaseModel):
     """Upsert a set of controls (per asset or client-side reference)."""
@@ -92,6 +127,12 @@ class ActionUpsertControls(BaseModel):
     asset_ref: Optional[StrictStr] = None
     items: List[ControlUpsert]
 
+    @model_validator(mode="after")
+    def _require_asset_selector(self) -> "ActionUpsertControls":
+        if not (self.asset_id or self.asset_ref):
+            raise ValueError("One of 'asset_id' or 'asset_ref' must be provided.")
+        return self
+
 
 class ActionRemoveControls(BaseModel):
     """Remove listed controls (by code) from the given asset/ref."""
@@ -100,6 +141,12 @@ class ActionRemoveControls(BaseModel):
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
     codes: List[StrictStr]
+
+    @model_validator(mode="after")
+    def _require_asset_selector(self) -> "ActionRemoveControls":
+        if not (self.asset_id or self.asset_ref):
+            raise ValueError("One of 'asset_id' or 'asset_ref' must be provided.")
+        return self
 
 
 class ActionSetAssetMeta(BaseModel):
@@ -112,6 +159,12 @@ class ActionSetAssetMeta(BaseModel):
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
     fields: Dict[str, Any]
+
+    @model_validator(mode="after")
+    def _require_asset_selector(self) -> "ActionSetAssetMeta":
+        if not (self.asset_id or self.asset_ref):
+            raise ValueError("One of 'asset_id' or 'asset_ref' must be provided.")
+        return self
 
 
 class ActionCreateAsset(BaseModel):
@@ -135,7 +188,7 @@ class ActionUpsertThreats(BaseModel):
     items: List[ThreatUpsert]
 
 
-# Union of all action types
+# Discriminated union of all action types (by "op")
 Action = (
     ActionCreateAsset
     | ActionSetAssetMeta
@@ -156,7 +209,8 @@ class ChangeSet(BaseModel):
     Canonical batch envelope for mutating operations.
     - `schema_version` pins the contract version.
     - `idempotency_key` is required; server should reject/ignore duplicates.
-    - `audit` must include tags/userId/timestamp/source as per project rules.
+    - `audit` je jednotný snake_case model s klíči:
+      user_id, ts, source, tags, org_id, session_id, request_id, batch_id
     """
     model_config = ConfigDict(extra="forbid")
 
@@ -164,11 +218,12 @@ class ChangeSet(BaseModel):
     idempotency_key: StrictStr
     org_id: StrictStr
     intent: Literal["preview", "apply"] = "apply"
-    audit: Dict[str, Any]
-    actions: List[Action]
+    audit: Audit
+    actions: List[Action] = Field(..., discriminator="op")
 
 
 __all__ = [
+    "Audit",
     "ImpactItem",
     "RiskItem",
     "ControlUpsert",

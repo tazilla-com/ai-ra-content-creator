@@ -1,9 +1,9 @@
-# File: workshops_ai/app/routers/ws_router.py
-# Purpose: WebSocket endpoint with strict event validation, centralized settings-based auth,
-#          timeout handling, and integration with WsHub for broadcasting AgentEvents.
-# Notes:
-# - Correlation: every WS error frame now includes both `conn_id` and `request_id`.
-# - `request_id` is captured at connect time and stored in Conn; `_ws_error` falls back to app-level getter.
+# File: workshops_ai/routers/ws_router.py
+# -----------------------------------------------------------------------------
+# Purpose
+# WebSocket endpoint with strict event validation, centralized settings-based auth,
+# timeout handling, and integration with WsHub for broadcasting AgentEvents.
+# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from workshops_ai.graph.manager import route_chat
 from workshops_ai.app.services.ws_hub import WsHub  # WS hub for agent broadcasts
 from workshops_ai.app.security import verify_ws_auth  # unified WS auth (API-key/JWT)
 
-# WS rate-limit helper (Redis-based)
+# WS rate-limit helper (e.g., Redis-based)
 from workshops_ai.app.middlewares.rate_limit import allow_ws
 
 # Best-effort request_id getter (HTTP layer populates a ContextVar)
@@ -33,12 +33,15 @@ except Exception:  # pragma: no cover
 
 router = APIRouter()
 
-# Allowed tabs (fail-closed)
-ALLOWED_TABS = {"assets", "impacts", "threats", "controls"}
+# Allowed tabs (fail-closed; aligned with available graphs)
+ALLOWED_TABS = {"assets", "impacts", "threats"}
 
 # Centralized settings
 _settings = get_settings()
-WS_EVENT_TIMEOUT_S: int = int(_settings.ws_timeout_sec) 
+# WS_EVENT_TIMEOUT_S: int = int(_settings.ws_timeout_sec)
+# ↑ PŮVODNĚ: četlo se z „plochého“ atributu (mimo namespace), což nesedí se settings modelem.
+WS_EVENT_TIMEOUT_S: int = int(_settings.ws.timeout_sec)
+# ↑ NOVĚ: namespacované nastavení — odpovídá AppSettings.ws.timeout_sec
 
 # Cookie name used by SessionMiddleware for session id
 COOKIE_NAME = "wsai.sid"
@@ -51,7 +54,7 @@ class InboundEvent(BaseModel):
 
     Types:
       - "ping"        : health check
-      - "switch_tab"  : { active_tab: "assets|impacts|threats|controls" }
+      - "switch_tab"  : { active_tab: "assets|impacts|threats" }
       - "select"      : { asset_id: "..." }
       - "chat"        : { message: "..." }
       - "export"      : no payload (synthetic "export" message)
@@ -151,7 +154,7 @@ async def ws_endpoint(
     ws: WebSocket,
     org_id: str = Query(..., description="Organization ID"),
     user_id: str = Query(..., description="User ID"),
-    active_tab: str = Query("assets", description="assets|impacts|threats|controls"),
+    active_tab: str = Query("assets", description="assets|impacts|threats"),
 ) -> None:
     """
     Real-time chat endpoint:
@@ -160,7 +163,7 @@ async def ws_endpoint(
     - Prevents concurrent long-running actions per connection (busy-guard).
     - Wraps route_chat(...) with timeout and unified error frames (including conn_id & request_id).
     - Registers the socket in WsHub so agents can broadcast AgentEvent JSON frames.
-    - Applies Redis-based rate-limit per session (sid) for "chat" (and optionally "export") events.
+    - Applies rate-limit per session (sid) for "chat" and "export" events.
     """
     # Normalize/validate the initial tab
     active_tab = active_tab if active_tab in ALLOWED_TABS else "assets"
@@ -182,7 +185,7 @@ async def ws_endpoint(
 
     state = Conn(org_id=org_id, user_id=user_id, active_tab=active_tab, sid=sid, request_id=rid)
 
-    # Initial hello (+ info about broadcast mode) — include both IDs for easier client correlation
+    # Initial hello (+ info about broadcast mode)
     await _ws_send(
         ws,
         "hello",
@@ -193,8 +196,7 @@ async def ws_endpoint(
             "request_id": state.request_id,
             "org_id": state.org_id,
             "user_id": state.user_id,
-            "sid": state.sid,  # may be None if cookie was not present
-            # The client will additionally receive raw AgentEvent JSON via WsHub.broadcast_json(...)
+            "sid": state.sid,
             "agent_events": {"subscribed": True, "mode": "raw_json"},
         },
     )
@@ -246,10 +248,21 @@ async def ws_endpoint(
 
             # Long-running actions (chat/export) — guarded + with timeout
             if evt.type in {"chat", "export"}:
-                # WS rate-limit per minute (uses session sid, or 'anon' if missing)
+                # WS rate-limit per minute (uses session sid; fallback to anon:conn)
                 if getattr(_settings, "ratelimit", None) and getattr(_settings.ratelimit, "enabled", False):
                     event_for_rl = "chat" if evt.type == "chat" else "export"
-                    ok = await allow_ws(event_for_rl, state.sid, _settings.ratelimit.per_minute)
+                    sid_for_rl = state.sid or f"anon:{state.conn_id[:8]}"
+                    try:
+                        ok = await allow_ws(event_for_rl, sid_for_rl, _settings.ratelimit.per_minute)
+                    except Exception as rl_err:  # be explicit; don't fail-open
+                        await _ws_error(
+                            ws,
+                            "Rate-limit check failed",
+                            conn_id=state.conn_id,
+                            details=str(rl_err),
+                            state=state,
+                        )
+                        continue
                     if not ok:
                         await _ws_error(ws, "Too many messages", conn_id=state.conn_id, state=state)
                         continue
@@ -274,12 +287,13 @@ async def ws_endpoint(
 
                     ui_res = await asyncio.wait_for(route_chat(ui_req), timeout=WS_EVENT_TIMEOUT_S)
 
-                    await _ws_send(ws, "ui_response", ui_res.model_dump(mode="json"))
+                    # Support both Pydantic model and plain dict
+                    payload = ui_res.model_dump(mode="json") if hasattr(ui_res, "model_dump") else ui_res
+                    await _ws_send(ws, "ui_response", payload)
                     await _ws_send(ws, "progress", {"status": "done", "conn_id": state.conn_id, "request_id": state.request_id})
                 except asyncio.TimeoutError:
                     await _ws_error(ws, f"Timed out after {WS_EVENT_TIMEOUT_S}s", conn_id=state.conn_id, state=state)
                 except WebSocketDisconnect:
-                    # Client disconnected during processing; break to cleanup.
                     break
                 except Exception as e:
                     await _ws_error(
@@ -297,10 +311,8 @@ async def ws_endpoint(
             await _ws_error(ws, f"Unknown event type: {evt.type}", conn_id=state.conn_id, state=state)
 
     except WebSocketDisconnect:
-        # Client disconnected — fall through to finally for unregister.
         pass
     finally:
-        # Always unregister this socket from the hub (best-effort).
         try:
             await WsHub.unregister(ws)
         except Exception:

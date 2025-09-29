@@ -12,7 +12,7 @@
 # - HTTP auth token supports both raw token and already-prefixed "Bearer ...".
 # - File names are defensive and cross-platform friendly.
 # - Asynchronous variant is recommended from WS/agent code paths.
-# - Designed for send-now Impact/Asset agents; supports idempotency keys end-to-end.
+# - Designed for send-now Impact/Asset/Threat graphs; supports idempotency keys end-to-end.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ import httpx
 from pydantic import BaseModel
 
 from workshops_ai.settings import get_settings
+from workshops_ai.tools.telemetry import telemetry_log
 
 __all__ = ["submit_changeset", "asubmit_changeset"]
 
@@ -52,7 +53,6 @@ def _payload(cs: BaseModel | Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _safe_component(s: str | None) -> str:
-    # Keep alnum, dot, dash, underscore; replace others by dash; trim length
     s = (s or "").strip()
     s = re.sub(r"[^A-Za-z0-9._-]+", "-", s)
     return s[:64] or "x"
@@ -94,29 +94,25 @@ def _write_file_sync(payload: Dict[str, Any]) -> str:
 
 
 async def _write_file_async(payload: Dict[str, Any]) -> str:
-    # Offload to a thread to avoid blocking the event loop
     return await asyncio.to_thread(_write_file_sync, payload)
 
 
 def _should_retry(exc_or_status: Any) -> bool:
     """
-    Retry pouze pro:
-      - síťové chyby/timeouty,
+    Retry only for:
+      - network errors / timeouts,
       - HTTP 5xx,
       - HTTP 429.
-    Na 4xx (krom 429) NERETRYUJEME.
+    Do NOT retry other 4xx.
     """
-    # přímo status kód (int)
     if isinstance(exc_or_status, int):
         return exc_or_status >= 500 or exc_or_status == 429
 
-    # httpx HTTPStatusError (má response se status kódem)
     if isinstance(exc_or_status, httpx.HTTPStatusError):
         sc = getattr(exc_or_status, "response", None)
         sc = getattr(sc, "status_code", None)
         return (sc is not None) and (sc >= 500 or sc == 429)
 
-    # ostatní request/network chyby (timeout, connect, atd.) → retry
     if isinstance(exc_or_status, (httpx.TimeoutException, httpx.RequestError)):
         return True
 
@@ -139,7 +135,6 @@ async def _http_post_async(payload: Dict[str, Any], *, idempotency_key: Optional
             try:
                 r = await client.post(endpoint, json=payload, headers=_headers(idempotency_key))
                 if _should_retry(r.status_code) and attempt <= max_retries:
-                    # Exponential backoff with jitter
                     await asyncio.sleep((2 ** (attempt - 1)) + random.random())
                     continue
                 r.raise_for_status()
@@ -182,9 +177,8 @@ def _http_post_sync(payload: Dict[str, Any], *, idempotency_key: Optional[str]) 
             try:
                 r = client.post(endpoint, json=payload, headers=_headers(idempotency_key))
                 if _should_retry(r.status_code) and attempt <= max_retries:
-                    # Simple sync backoff
-                    import time
-                    time.sleep((2 ** (attempt - 1)) + random.random())
+                    import time as _t
+                    _t.sleep((2 ** (attempt - 1)) + random.random())
                     continue
                 r.raise_for_status()
                 try:
@@ -200,8 +194,8 @@ def _http_post_sync(payload: Dict[str, Any], *, idempotency_key: Optional[str]) 
             except (httpx.HTTPError, httpx.TimeoutException) as e:
                 last_error = str(e)
                 if attempt <= max_retries and _should_retry(e):
-                    import time
-                    time.sleep((2 ** (attempt - 1)) + random.random())
+                    import time as _t
+                    _t.sleep((2 ** (attempt - 1)) + random.random())
                     continue
                 return {
                     "mode": "http",
@@ -209,6 +203,32 @@ def _http_post_sync(payload: Dict[str, Any], *, idempotency_key: Optional[str]) 
                     "error": last_error,
                     "idempotency_key": idempotency_key,
                 }
+
+
+def _extract_telemetry_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Derive basic telemetry describing the ChangeSet without leaking large bodies:
+    - number of actions
+    - intent/type
+    - org_id
+    - audit tags and batch_id (if present)
+    - idempotency_key presence
+    """
+    try:
+        actions = payload.get("actions") or []
+        audit = payload.get("audit") or {}
+        tags = list(audit.get("tags") or [])
+        batch_id = audit.get("batch_id")
+        return {
+            "org_id": payload.get("org_id"),
+            "intent": payload.get("intent") or payload.get("type"),
+            "action_count": len(actions) if isinstance(actions, list) else None,
+            "audit_tags": tags if isinstance(tags, list) else None,
+            "audit_batch_id": batch_id,
+            "has_idempotency_key": bool(payload.get("idempotency_key")),
+        }
+    except Exception:
+        return {}
 
 
 # -----------------------------------------------------------------------------
@@ -222,28 +242,40 @@ def submit_changeset(
 ) -> Dict[str, Any]:
     """
     Synchronous submit suitable for CLI/scripts.
-    NOTE: In async code paths (e.g., WS/agents), prefer `asubmit_changeset` to avoid blocking.
+    Note: In async code paths (e.g., WS/graphs), prefer `asubmit_changeset` to avoid blocking.
     """
     cfg = get_settings().tazila
     payload = _payload(cs)
-    # propagate idempotency (header + body + filename)
     if idempotency_key and "idempotency_key" not in payload:
         payload["idempotency_key"] = idempotency_key
+
+    tel = {"mode": None, "phase": "start"} | _extract_telemetry_fields(payload)
+    try:
+        telemetry_log("tazila.submit_changeset", tel)
+    except Exception:
+        pass
 
     mode = str(getattr(cfg, "mode", "file")).lower()
     if mode == "file":
         fpath = _write_file_sync(payload)
-        return {"mode": "file", "path": fpath, "idempotency_key": payload.get("idempotency_key")}
-
-    if mode == "http":
+        result = {"mode": "file", "path": fpath, "idempotency_key": payload.get("idempotency_key")}
+    elif mode == "http":
         result = _http_post_sync(payload, idempotency_key=idempotency_key or payload.get("idempotency_key"))
-        return result
+    else:
+        result = {
+            "mode": "disabled",
+            "reason": "TAZILA mode is disabled or misconfigured",
+            "idempotency_key": payload.get("idempotency_key") or idempotency_key,
+        }
 
-    return {
-        "mode": "disabled",
-        "reason": "TAZILA mode is disabled or misconfigured",
-        "idempotency_key": payload.get("idempotency_key") or idempotency_key,
-    }
+    tel_end = {"mode": result.get("mode"), "phase": "end", "status": result.get("status"), "error": result.get("error")}
+    tel_end |= _extract_telemetry_fields(payload)
+    try:
+        telemetry_log("tazila.submit_changeset", tel_end)
+    except Exception:
+        pass
+
+    return result
 
 
 # -----------------------------------------------------------------------------
@@ -260,24 +292,37 @@ async def asubmit_changeset(
       - file mode: writes JSON via asyncio.to_thread (non-blocking)
       - http mode: posts via httpx.AsyncClient with retry/backoff (non-blocking)
       - disabled: returns {"mode":"disabled"}
+    Supports multi-action ChangeSets; the action list is passed through unchanged.
     """
     cfg = get_settings().tazila
     payload = _payload(cs)
-    # propagate idempotency (header + body + filename)
     if idempotency_key and "idempotency_key" not in payload:
         payload["idempotency_key"] = idempotency_key
+
+    tel = {"mode": None, "phase": "start"} | _extract_telemetry_fields(payload)
+    try:
+        telemetry_log("tazila.asubmit_changeset", tel)
+    except Exception:
+        pass
 
     mode = str(getattr(cfg, "mode", "file")).lower()
     if mode == "file":
         fpath = await _write_file_async(payload)
-        return {"mode": "file", "path": fpath, "idempotency_key": payload.get("idempotency_key")}
-
-    if mode == "http":
+        result = {"mode": "file", "path": fpath, "idempotency_key": payload.get("idempotency_key")}
+    elif mode == "http":
         result = await _http_post_async(payload, idempotency_key=idempotency_key or payload.get("idempotency_key"))
-        return result
+    else:
+        result = {
+            "mode": "disabled",
+            "reason": "TAZILA mode is disabled or misconfigured",
+            "idempotency_key": payload.get("idempotency_key") or idempotency_key,
+        }
 
-    return {
-        "mode": "disabled",
-        "reason": "TAZILA mode is disabled or misconfigured",
-        "idempotency_key": payload.get("idempotency_key") or idempotency_key,
-    }
+    tel_end = {"mode": result.get("mode"), "phase": "end", "status": result.get("status"), "error": result.get("error")}
+    tel_end |= _extract_telemetry_fields(payload)
+    try:
+        telemetry_log("tazila.asubmit_changeset", tel_end)
+    except Exception:
+        pass
+
+    return result

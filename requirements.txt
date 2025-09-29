@@ -11,23 +11,27 @@ pandas
 python-dateutil
 tzdata
 
-# HTTP + retry + logy
+# HTTP + retry + logs
 httpx
 tenacity
 structlog
 
-# RAG 
+# RAG (default Chroma + PDF ingest; Qdrant volitelně)
+chromadb
+pypdf
 qdrant-client[fastembed]
 onnxruntime
 
-# Lang řetězec
+# Lang *chain/graph*
 langchain
 langchain-openai
 langgraph
 langsmith
 openai
+langgraph-checkpoint-sqlite
+langgraph-checkpoint-redis
 
-# Observability (volitelné)
+# Observability (optional)
 opentelemetry-sdk
 opentelemetry-exporter-otlp
 
@@ -36,3 +40,4 @@ PyJWT[crypto]
 
 # Infra / storage
 redis
+aiosqlite

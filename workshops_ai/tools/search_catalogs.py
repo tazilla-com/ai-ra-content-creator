@@ -33,7 +33,6 @@
 from __future__ import annotations
 
 import csv
-import io
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +46,7 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     def telemetry_log(*args, **kwargs):  # type: ignore
         return None
+
 
 # --------------------------------------------------------------------------------------
 # Paths (centralized via settings) + robust fallbacks
@@ -80,6 +80,7 @@ def _resolve_catalog_dir() -> Path:
     # last resort: return the first candidate even if not existing (non-crashing behavior downstream)
     return candidates[0] if candidates else Path.cwd()
 
+
 _CAT_DIR = _resolve_catalog_dir()
 
 _CAT_ASSET_TYPE_FILE = _CAT_DIR / "Asset type.csv"
@@ -89,6 +90,7 @@ _CAT_AT_X_THREAT_FILE = _CAT_DIR / "Asset type x Threat.csv"
 _CAT_THREAT_FILE = _CAT_DIR / "Threat.csv"
 _CAT_THREAT_CATEGORY_FILE = _CAT_DIR / "Threat category.csv"
 _CAT_THREAT_X_CATEGORY_FILE = _CAT_DIR / "Threat x Threat category.csv"
+
 
 # --------------------------------------------------------------------------------------
 # CSV cache (mtime-aware)
@@ -117,14 +119,16 @@ class _CsvCache:
             self.mtime, self.rows = 0.0, []
             return self.rows or []
 
+
 # ---- file reading (encoding + delimiter detection) -----------------------------------
 
 _DELIMS = [",", ";", "\t", "|"]
 _ENCODINGS = ["utf-8-sig", "utf-8", "cp1250", "cp1252", "iso-8859-2"]
 
+
 def _detect_encoding_and_delimiter(path: Path) -> tuple[str, str]:
     """
-    Detect encoding among utf-8-sig → utf-8 → cp1250 → iso-8859-2 and delimiter via csv.Sniffer.
+    Detect encoding among utf-8-sig → utf-8 → cp1250 → cp1252 → iso-8859-2 and delimiter via csv.Sniffer.
     Falls back to ('utf-8-sig', ',') if unsure. Semicolon is common in EU CSVs.
     """
     sample_bytes = b""
@@ -159,7 +163,8 @@ def _detect_encoding_and_delimiter(path: Path) -> tuple[str, str]:
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
-    """Read CSV into list[dict]. Robust to BOM, semicolons, CP1250; trims headers/values.
+    """
+    Read CSV into list[dict]. Robust to BOM, semicolons, CP1250/CP1252; trims headers/values.
     If the initially-detected encoding fails during full read, retry with other encodings.
     """
     detected_enc, delim = _detect_encoding_and_delimiter(path)
@@ -199,11 +204,10 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
     return []
 
 
-
 def _first_present_column(rows: list[dict[str, str]], candidates: Iterable[str]) -> Optional[str]:
     if not rows:
         return None
-    cols_lc = { (c or "").strip().casefold(): c for c in rows[0].keys() }
+    cols_lc = {(c or "").strip().casefold(): c for c in rows[0].keys()}
     for c in candidates:
         key = (c or "").strip().casefold()
         if key in cols_lc:
@@ -331,7 +335,9 @@ def list_threat_categories() -> list[str]:
     col = _first_present_column(
         rows,
         ("category_code", "code", "Category", "Threat category", "threat_category", "EN Name", "Name"),
-    ) or next(iter(rows[0].keys()))
+    ) or next(iter(rows[0].keys() if rows else []), None)
+    if not col:
+        return []
     seen: set[str] = set()
     out: list[str] = []
     for r in rows:
@@ -422,7 +428,7 @@ def _build_threat_index() -> dict[str, dict[str, Any]]:
     unintentional_col = _first_present_column(t_rows, ("unintentional", "Unintentional", "accidental"))
     environmental_col = _first_present_column(t_rows, ("environmental", "Environmental", "env"))
 
-    # --- build a resolver name→code from Threat.csv (handles diacritics) ---
+    # --- resolver name→code from Threat.csv (handles diacritics) ---
     name_slug_to_code: dict[str, str] = {}
     lower_code_map: dict[str, str] = {}
     for r in t_rows:
@@ -449,7 +455,7 @@ def _build_threat_index() -> dict[str, dict[str, Any]]:
         sl = _slug(s)
         return name_slug_to_code.get(sl)
 
-    # --- Threat ↔ category mapping (normalize threat side to code) ---
+    # --- Threat ↔ category mapping ---
     txc = _threat_x_category.load()
     txc_threat_col = _first_present_column(txc, ("threat_code", "Threat", "Threat code", "code", "EN Name"))
     txc_cat_col = _first_present_column(txc, ("category_code", "Category", "Threat category", "threat_category", "code", "EN Name"))
@@ -467,14 +473,11 @@ def _build_threat_index() -> dict[str, dict[str, Any]]:
             if cat not in threat_to_categories[th_code]:
                 threat_to_categories[th_code].append(cat)
 
-    # --- Asset type ↔ threat mapping (normalize threat side to code; respect Value) ---
-# Asset type ↔ threat mapping (respect "Value" truthiness when present)
+    # --- Asset type ↔ threat mapping (respect "Value" truthiness when present) ---
     att = _at_x_threat.load()
     att_asset_col = _first_present_column(att, ("asset_type", "Asset type"))
     att_threat_col = _first_present_column(att, ("threat_code", "Threat", "threat", "EN Name"))
     att_value_col = _first_present_column(att, ("Value", "Include", "Included", "Enabled"))
-
-    from .search_catalogs import normalize_threat_code  # <-- add this import near the loop
 
     threat_to_asset_types: dict[str, list[str]] = {}
     if att and att_threat_col:
@@ -489,7 +492,7 @@ def _build_threat_index() -> dict[str, dict[str, Any]]:
             if not raw_th:
                 continue
 
-            # 👇 normalize name/alias → canonical code (fallback to raw if unknown)
+            # normalize name/alias → canonical code (fallback to raw if unknown)
             th_code = normalize_threat_code(raw_th) or raw_th
 
             threat_to_asset_types.setdefault(th_code, [])
@@ -522,7 +525,6 @@ def _build_threat_index() -> dict[str, dict[str, Any]]:
             "asset_types": ats,
         }
     return idx
-
 
 
 def _truthy(v: Any) -> bool:
@@ -583,8 +585,10 @@ def search_threats(
 
     if apply_asset_type:
         at = apply_asset_type.strip().casefold()
+
         def _has_at(t: dict[str, Any]) -> bool:
             return any((x or "").strip().casefold() == at for x in (t.get("asset_types") or []))
+
         items = [t for t in items if _has_at(t)]
 
     if q:
@@ -633,6 +637,7 @@ def explain_threat(code: str) -> Optional[dict[str, Any]]:
 # --------------------------------------------------------------------------------------
 
 def mapped_threats_for_asset_type(asset_type_code: str) -> list[str]:
+    """Return sorted threat codes mapped to a given asset type (truthy rows only)."""
     if not asset_type_code:
         return []
     rows = _at_x_threat.load()
@@ -641,12 +646,10 @@ def mapped_threats_for_asset_type(asset_type_code: str) -> list[str]:
 
     asset_col = _first_present_column(rows, ("asset_type", "Asset type"))
     threat_col = _first_present_column(rows, ("threat_code", "Threat", "threat", "EN Name"))
-    value_col  = _first_present_column(rows, ("Value", "Include", "Included", "Enabled"))
+    value_col = _first_present_column(rows, ("Value", "Include", "Included", "Enabled"))
 
     if not threat_col:
         return []
-
-    from .search_catalogs import normalize_threat_code
 
     needle = asset_type_code.strip()
     out: set[str] = set()
@@ -665,7 +668,6 @@ def mapped_threats_for_asset_type(asset_type_code: str) -> list[str]:
         code = normalize_threat_code(raw) or raw
         out.add(code)
     return sorted(out)
-
 
 
 # --------------------------------------------------------------------------------------

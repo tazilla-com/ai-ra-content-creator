@@ -1,7 +1,16 @@
 # File: workshops_ai/api/app.py
-# Purpose: HTTP endpoint `POST /chat` – validates UI contract and routes the request
-#          to the Manager/Router. Uses centralized settings + API-key/JWT auth.
-# Quality: Enterprise-grade (strict validation, timeouts, telemetry, safe error handling).
+# -----------------------------------------------------------------------------
+# Purpose
+# Auth-protected HTTP API router for chat (+ mounts /rag):
+#   - POST /chat  → validates UIRequest and routes to LangGraph manager (route_chat)
+#   - /rag/*      → mounts ingest/purge endpoints from rag_router (if available)
+#
+# Guarantees
+# - Strict Pydantic validation (fail-closed).
+# - Unified timeout from settings.chat.timeout_sec.
+# - Consistent UIResponse shape (re-validated on output).
+# - Best-effort telemetry; safe error handling.
+# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -16,7 +25,7 @@ from pydantic import ValidationError
 from workshops_ai.settings import get_settings
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 
-# Centralized HTTP auth (API-key/JWT)
+# Centralized HTTP auth (API-key/JWT).
 # Keep import location consistent with the rest of the app.
 from workshops_ai.app.deps.auth import require_auth  # type: ignore
 
@@ -33,9 +42,9 @@ try:
 except Exception:  # pragma: no cover
     guard_validate_payload = None  # type: ignore[misc,assignment]
 
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Settings (centralized)
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 settings = get_settings()
 
 # Align with the rest of the codebase: use nested `settings.chat.*`
@@ -45,11 +54,12 @@ MAX_MESSAGE_LEN: int = int(getattr(getattr(settings, "chat", object()), "max_mes
 router = APIRouter(dependencies=[Depends(require_auth)])
 
 
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Helpers
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 class ChatAcceptedResponse(UIResponse):
     """Alias kept for OpenAPI examples; the route returns UIResponse directly."""
+
 
 def _read_request_id(request: Request) -> str:
     """
@@ -61,11 +71,13 @@ def _read_request_id(request: Request) -> str:
             return rid.strip()
     return "n/a"
 
+
 def _truncate_for_log(text: str | None, limit: int = 512) -> str | None:
     """Truncate long strings for telemetry logs."""
     if text is None:
         return None
     return text if len(text) <= limit else (text[:limit] + "…")
+
 
 async def _run_with_timeout(awaitable_or_result: Any, timeout_sec: float) -> Any:
     """
@@ -79,16 +91,16 @@ async def _run_with_timeout(awaitable_or_result: Any, timeout_sec: float) -> Any
     return awaitable_or_result
 
 
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Route
-# ----------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 @router.post(
     "/chat",
     response_model=UIResponse,
     response_model_exclude_none=True,
     response_class=JSONResponse,
     status_code=status.HTTP_200_OK,
-    summary="Chat entrypoint: routes UIRequest to the proper domain agent",
+    summary="Chat entrypoint: routes UIRequest to the LangGraph manager",
     tags=["chat"],
 )
 async def chat_endpoint(
@@ -97,7 +109,7 @@ async def chat_endpoint(
 ) -> UIResponse:
     """
     Contract:
-      UIRequest → Manager/Router → UIResponse
+      UIRequest → Manager/Router (LangGraph) → UIResponse
 
     Security/validation:
     - Fail-closed: Pydantic v2 strict parsing (or optional centralized guard).
@@ -137,12 +149,7 @@ async def chat_endpoint(
                 "selection": ui_req.selection.model_dump(mode="json") if hasattr(ui_req, "selection") else None,
                 "staging": ui_req.staging,
                 "message_preview": _truncate_for_log(ui_req.message, 256),
-                "language": getattr(ui_req, "language", None),
-                "number_of_assets": getattr(ui_req, "number_of_assets", None),
-                "has_org_profile": bool(getattr(ui_req, "organization_profile", None)),
-                "has_services": bool(getattr(ui_req, "services", None)),
-                "has_existing_assets": bool(getattr(ui_req, "existing_assets", None)),
-                "has_website_content": bool(getattr(ui_req, "website_content", None)),
+                "locale": getattr(ui_req, "locale", None),
                 "emit_changes_enabled": getattr(getattr(ui_req, "policy", None), "emit_changes_enabled", True),
                 "source": "API",
             },
@@ -210,3 +217,16 @@ async def chat_endpoint(
         pass
 
     return ui_resp
+
+
+# -----------------------------------------------------------------------------
+# Mount /rag (ingest/purge)
+# -----------------------------------------------------------------------------
+# Prefer mounting the dedicated RAG router if available. It should define endpoints
+# like POST /ingest and POST /purge without a prefix; we mount it here under /rag.
+try:
+    from workshops_ai.app.routers.rag_router import router as rag_router  # type: ignore
+    router.include_router(rag_router, prefix="/rag", tags=["rag"])
+except Exception:
+    # If the RAG router is not yet implemented, keep chat API operational.
+    pass

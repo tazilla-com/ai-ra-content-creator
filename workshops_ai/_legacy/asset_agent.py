@@ -24,7 +24,10 @@ from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 from workshops_ai.tools.telemetry import telemetry_log
 
 from workshops_ai.backend.port import BackendPort
-from workshops_ai.backend.csv_backend import CsvBackend  # type: ignore
+# from workshops_ai.backend.csv_backend import CsvBackend  # type: ignore
+# ↑ PŮVODNĚ pevný import CSV backendu (porušuje port abstrakci)
+from workshops_ai.backend.provider import get_backend_port  # type: ignore
+# ↑ NOVĚ: provider vrací singleton BackendPort (snadná výměna za API backend)
 
 # ChangeSet & outbox
 from workshops_ai.models.changeset import (
@@ -843,7 +846,10 @@ _BACKEND_SINGLETON: BackendPort | None = None
 def _get_backend() -> BackendPort:
     global _BACKEND_SINGLETON
     if _BACKEND_SINGLETON is None:
-        _BACKEND_SINGLETON = CsvBackend()
+        # _BACKEND_SINGLETON = CsvBackend()
+        # ↑ PŮVODNĚ přímé vytvoření CSV backendu (fixně svazuje agenta s CSV implementací)
+        _BACKEND_SINGLETON = get_backend_port()
+        # ↑ NOVĚ: přes provider získáme BackendPort (CSV/API) podle konfigurace
     return _BACKEND_SINGLETON
 
 async def _call_async(func, *args, **kwargs):

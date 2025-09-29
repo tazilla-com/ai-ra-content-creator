@@ -1,454 +1,224 @@
 # File: workshops_ai/graph/manager.py
 # -----------------------------------------------------------------------------
-# Purpose
-# Minimal-yet-enterprise router for Workshop Agents.
-# Now supports three tabs and dispatches accordingly:
-#   - active_tab == "assets"   → AssetAgent (emit-only)
-#   - active_tab == "impacts"  → ImpactAgent (LangChain tools, send-now)
-#   - active_tab == "threats"  → ThreatAgent (LangChain tools, send-now)
-#
-# Design notes
-# - Contract-first: route_chat(UIRequest) -> UIResponse (strict Pydantic types).
-# - Tool-gating by active_tab (security-by-design; no cross-tab calls).
-# - Lightweight intent detector (read | propose | change | create | explain) for assets path
-#   to keep backward compatibility with AssetAgent signature.
-# - Per-request telemetry (best-effort), structured messages in the agent.
-# - Defensive imports (avoid cycles). If an agent isn’t wired yet, return a graceful UIResponse.
-# - All tabs operate in EMIT-ONLY / SEND-NOW semantics (WS optimistic + submit ChangeSet).
-# - Agent execution timeout (fail-fast; configurable via settings.manager.* timeouts).
-#   Env mapping (via settings.ManagerSettings):
-#     WORKSHOPS_AI_MANAGER__AGENT_TIMEOUT_SEC=45
-#     WORKSHOPS_AI_MANAGER__THREATS_TIMEOUT_SEC=90
+# Unified LangGraph router (assets | impacts | threats).
+# - route_chat(UIRequest) -> UIResponse
+# - Graph factory + checkpointer (stateful)
+# - Per-tab timeouts from settings.manager.*
+# - Emit-only policy (optimistic WS + async submit in graphs)
+# - Dependency factory call is signature-aware to avoid kwarg mismatches.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Final, Literal, TypedDict, cast
+import inspect
+import json
+from typing import Any, Final, Optional, cast
 
 from pydantic import ValidationError
 
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 from workshops_ai.tools.telemetry import telemetry_log
-from workshops_ai.tools.memory import memory_get, memory_set
 from workshops_ai.settings import get_settings
 
-# -----------------------------------------------------------------------------
-# Types & constants
-# -----------------------------------------------------------------------------
-
-Intent = Literal["read", "propose", "change", "create", "explain"]
-
-
-class ToolGate(TypedDict):
-    tools: list[str]     # human-readable names of allowed tools
-    writes_allowed: bool # whether emit/writes are permitted
-
-
-TOOL_GATES: Final[dict[str, ToolGate]] = {
-    "assets":   {
-        "tools": ["assets_list", "asset_get", "create_asset", "set_asset_meta"],
-        "writes_allowed": True,
-    },
-    # Impacts = send-now tools; no staging/commit in UI
-    "impacts":  {
-        "tools": [
-            "list_impacts",
-            "asset_get_impacts",
-            "set_impact_level",
-            "bulk_set_impact_levels",
-            "explain_impacts",
-        ],
-        "writes_allowed": True,
-    },
-    # Threats enabled with writes (send-now semantics)
-    "threats":  {
-        "tools": [
-            "list_threats",
-            "explain_threats",
-            "set_risk_probability",
-            "bulk_set_risk_probability",
-            "upsert_threat",
-        ],
-        "writes_allowed": True,
-    },
-    "controls": {"tools": ["list_controls", "get_control_coverage"], "writes_allowed": False},
-}
-
-DEFAULT_RESPONSE: Final[UIResponse] = UIResponse(
-    messages=["Nothing to process."],
-    proposals=None,
-    staging={"needs_commit": False},
+from workshops_ai.graph.factory import (  # type: ignore
+    GraphDeps,
+    make_default_deps,
+    build_graph,
+    ainvoke_with_timeout,
 )
 
-# --- Timeouts (read from Settings; production-friendly) -----------------------
 _SETTINGS = get_settings()
-# Global default timeout for all agents (fallback)
+
+# --- Timeouts -----------------------------------------------------------------
 _AGENT_TIMEOUT_SEC: Final[int] = int(_SETTINGS.manager.agent_timeout_sec)
-# Per-tab overrides (use override if provided, otherwise fall back to global)
-_IMPACTS_TIMEOUT_SEC: Final[int] = _AGENT_TIMEOUT_SEC
 _THREATS_TIMEOUT_SEC: Final[int] = int(_SETTINGS.manager.threats_timeout_sec or _AGENT_TIMEOUT_SEC)
+
+_SUPPORTED_TABS: Final[set[str]] = {"assets", "impacts", "threats"}
 
 # -----------------------------------------------------------------------------
 # Public entrypoint
 # -----------------------------------------------------------------------------
-
 async def route_chat(req: UIRequest) -> UIResponse:
-    """
-    Main router entrypoint.
-    IMPORTANT:
-    - This function forwards the incoming `UIRequest` instance **unchanged** to the agents.
-      No field is dropped or rewritten (incl. locale, selection, policy, etc.).
-    """
     _audit_in(req)
 
-    # Defensive shape validation (API layer already validated; this is extra safety).
+    # Defensive validation
     if not isinstance(req, UIRequest):
         try:
             req = UIRequest.model_validate(cast(Any, req))
         except ValidationError:
             return _fail("Input does not match UIRequest contract.", None)
 
-    gate = TOOL_GATES.get((req.active_tab or "").lower())
-    if gate is None:
-        # Unknown tab – reply explicitly and do not attempt any tools.
+    tab = (req.active_tab or "").strip().lower()
+    if tab not in _SUPPORTED_TABS:
         return UIResponse(
-            messages=[f"Tab “{req.active_tab}” is not supported yet. Use Assets, Impacts or Threats."],
+            messages=[f'Tab "{req.active_tab}" is not supported. Use assets, impacts, threats.'],
             proposals=None,
             staging={"needs_commit": False},
+            policy={"emit_changes_enabled": True},
         )
 
-    active_tab = (req.active_tab or "").lower()
+    # Build dependencies (backend, ws hub, retriever, checkpointer, settings).
+    deps = _deps(tab)  # signature-aware DI builder  :contentReference[oaicite:9]{index=9}
 
-    # Route by tab (tool-gating is enforced by only constructing the specific agent)
-    if active_tab == "assets":
-        intent = _infer_intent(req.message)  # keep old AssetAgent signature compatibility
-        return await _dispatch_assets(req, intent)
+    # Remember org-scoped context (best-effort via Redis ephemeral memory).
+    await _remember_context(tab, req, deps)
 
-    if active_tab == "impacts":
-        return await _dispatch_impacts(req)
-
-    if active_tab == "threats":
-        return await _dispatch_threats(req)
-
-    # Known but not implemented tabs – reply clearly, no silent fallthrough.
-    return UIResponse(
-        messages=[f"Tab “{req.active_tab}” will be available in the next iteration."],
-        proposals=None,
-        staging={"needs_commit": False},
-    )
-
-# -----------------------------------------------------------------------------
-# Dispatchers
-# -----------------------------------------------------------------------------
-
-async def _dispatch_assets(req: UIRequest, intent: Intent) -> UIResponse:
-    """Call AssetAgent with tool-gating and safe fallbacks (EMIT-ONLY semantics)."""
-    # Persist lightweight per-tab memory (best-effort, non-blocking).
+    # --- Build graph -----------------------------------------------------------
     try:
-        memory_set(req.org_id, "assets.last_intent", intent)
-        if (aid := _selection_asset_id(req)) is not None:
-            memory_set(req.org_id, "assets.last_selected_asset_id", aid)
-    except Exception:
-        pass
-
-    try:
-        # Lazy import to avoid early cycles if modules are scaffolded later.
-        # AssetAgent historical entrypoint was a module-level `run(req, intent)`.
-        from workshops_ai.agents.asset_agent import run as asset_run  # type: ignore
+        graph = build_graph(tab, deps)
     except Exception as e:
-        telemetry_log("manager.asset_agent_not_available", {"error": str(e)})
-        return UIResponse(
-            messages=[
-                "AssetAgent is not available (module not loaded). "
-                "Check `workshops_ai/agents/asset_agent.py` (function `run`)."
-            ],
-            proposals=None,
-            staging={"needs_commit": False},
-            policy={"emit_changes_enabled": True},  # emit-only tab
-        )
+        telemetry_log("manager.build_graph_failed", {"tab": tab, "error": str(e)})
+        return _fail("Failed to initialize agent graph.", req, details=str(e))
 
+    # --- Inputs for the graph (do NOT pass the whole UIRequest) ---------------
+    inputs = {
+        "org_id": req.org_id,
+        "active_tab": tab,
+        "message": req.message,
+        "selection": (
+            req.selection.model_dump()
+            if hasattr(req.selection, "model_dump")
+            else dict(getattr(req, "selection", {}) or {})
+        ),
+        "user_id": req.user_id,
+        "staging": req.staging,
+        "language": getattr(req, "language", None),
+    }
+
+    # --- Per-tab timeout & LangGraph config -----------------------------------
+    timeout = _timeout_for_tab(tab)
+    cfg = {
+        "configurable": {
+            "thread_id": f"{req.org_id}:{tab}:{req.user_id}",
+            "checkpoint_ns": getattr(deps.settings, "checkpoint_ns", "lg:ckpt"),
+        }
+    }  # ensure stateful threads + namespacing  :contentReference[oaicite:10]{index=10}
+
+    # --- Execute ---------------------------------------------------------------
     try:
-        # Fail-fast guard: timeout agent execution
-        result = await asyncio.wait_for(asset_run(req, intent), timeout=_AGENT_TIMEOUT_SEC)
+        result = await ainvoke_with_timeout(graph, inputs, timeout=timeout, config=cfg)
     except asyncio.TimeoutError:
-        telemetry_log("manager.asset_agent_timeout", {"timeout_sec": _AGENT_TIMEOUT_SEC})
-        return _fail("AssetAgent execution timed out.", req, details={"timeout_sec": _AGENT_TIMEOUT_SEC})
+        return _fail(f"{tab.capitalize()}Agent execution timed out.", req)
     except Exception as e:
-        telemetry_log("manager.asset_agent_runtime_error", {"error": str(e)})
-        return _fail("AssetAgent execution failed. Please check agent logs.", req, details=str(e))
+        telemetry_log("manager.graph_invoke_error", {"tab": tab, "error": str(e)})
+        return _fail("Agent execution failed.", req, details=str(e))
 
-    # Defensive shape validation for the outgoing payload
+    # --- Outbound validation + emit-only policy --------------------------------
     try:
-        resp = UIResponse.model_validate(result)
-        # Ensure optimistic UI policy is on
-        policy = dict(getattr(resp, "policy", {}) or {})
-        policy["emit_changes_enabled"] = True
-        resp.policy = policy  # type: ignore[attr-defined]
+        resp = result if isinstance(result, UIResponse) else UIResponse.model_validate(result)
+        pol = dict(getattr(resp, "policy", {}) or {})
+        pol["emit_changes_enabled"] = True
+        resp.policy = pol  # type: ignore[attr-defined]
+
+        await _remember_post_run(tab, req, resp, deps)
         return resp
     except ValidationError as ve:
-        telemetry_log("manager.response_validation_error", {"errors": ve.errors()})
-        return _fail("Agent response failed UIResponse validation.", req, details=ve.errors())
-
-
-async def _dispatch_impacts(req: UIRequest) -> UIResponse:
-    """
-    Call ImpactAgent (LangChain tools, SEND-NOW).
-    ImpactAgent sets policy.emit_changes_enabled=True in its own response as well.
-    """
-    # Persist lightweight per-tab memory (best-effort)
-    try:
-        memory_set(req.org_id, "impacts.last_message", (req.message or "")[:200])
-        if (aid := _selection_asset_id(req)) is not None:
-            memory_set(req.org_id, "impacts.last_selected_asset_id", aid)
-        # Optional locale shadow for observability
-        if getattr(req, "locale", None):
-            memory_set(req.org_id, "impacts.locale", str(req.locale))
-    except Exception:
-        pass
-
-    # Lazy imports to avoid import cycles
-    try:
-        from workshops_ai.agents.impact_agent import ImpactAgent  # class-based, LangChain tools
-    except Exception as e:
-        telemetry_log("manager.impact_agent_not_available", {"error": str(e)})
-        return UIResponse(
-            messages=[
-                "ImpactAgent is not available (module not loaded). "
-                "Check `workshops_ai/agents/impact_agent.py` (class `ImpactAgent`)."
-            ],
-            proposals=None,
-            staging={"needs_commit": False},
-            policy={"emit_changes_enabled": True},
-        )
-
-    # Obtain backend port (defensive multi-try; adjust to your actual provider)
-    backend = _get_backend_port()
-    if backend is None:
-        telemetry_log("manager.backend_port_missing", {})
-        return UIResponse(
-            messages=["Backend port is not available. Please ensure the CSV/API backend is initialized."],
-            proposals=None,
-            staging={"needs_commit": False},
-            policy={"emit_changes_enabled": True},
-        )
-
-    # WsHub for broadcasts
-    try:
-        from workshops_ai.app.services.ws_hub import WsHub
-    except Exception as e:
-        telemetry_log("manager.ws_hub_missing", {"error": str(e)})
-        return UIResponse(
-            messages=["WsHub is not available. Please check `workshops_ai/app/services/ws_hub.py`."],
-            proposals=None,
-            staging={"needs_commit": False},
-            policy={"emit_changes_enabled": True},
-        )
-
-    # Construct agent and run
-    try:
-        agent = ImpactAgent(backend_port=backend, ws_hub=WsHub)
-        result = await asyncio.wait_for(agent.run(req), timeout=_IMPACTS_TIMEOUT_SEC)
-    except asyncio.TimeoutError:
-        telemetry_log("manager.impact_agent_timeout", {"timeout_sec": _IMPACTS_TIMEOUT_SEC})
-        return _fail("ImpactAgent execution timed out.", req, details={"timeout_sec": _IMPACTS_TIMEOUT_SEC})
-    except Exception as e:
-        telemetry_log("manager.impact_agent_runtime_error", {"error": str(e)})
-        return _fail("ImpactAgent execution failed. Please check agent logs.", req, details=str(e))
-
-    # Validate outgoing payload & ensure optimistic policy
-    try:
-        resp = UIResponse.model_validate(result)
-        policy = dict(getattr(resp, "policy", {}) or {})
-        policy["emit_changes_enabled"] = True
-        resp.policy = policy  # type: ignore[attr-defined]
-        return resp
-    except ValidationError as ve:
-        telemetry_log("manager.response_validation_error", {"errors": ve.errors()})
-        return _fail("Agent response failed UIResponse validation.", req, details=ve.errors())
-
-
-async def _dispatch_threats(req: UIRequest) -> UIResponse:
-    """
-    Call ThreatAgent (LangChain tools, SEND-NOW).
-    ThreatAgent sets policy.emit_changes_enabled=True in its own response as well.
-    """
-    # Persist lightweight per-tab memory (best-effort)
-    try:
-        memory_set(req.org_id, "threats.last_message", (req.message or "")[:200])
-        if (aid := _selection_asset_id(req)) is not None:
-            memory_set(req.org_id, "threats.last_selected_asset_id", aid)
-        if getattr(req, "locale", None):
-            memory_set(req.org_id, "threats.locale", str(req.locale))
-    except Exception:
-        pass
-
-    # Lazy import to avoid import cycles; ThreatAgent entrypoint is module-level run(req)
-    try:
-        from workshops_ai.agents.threat_agent import run as threat_run  # type: ignore
-    except Exception as e:
-        telemetry_log("manager.threat_agent_not_available", {"error": str(e)})
-        return UIResponse(
-            messages=[
-                "ThreatAgent is not available (module not loaded). "
-                "Check `workshops_ai/agents/threat_agent.py` (function `run`)."
-            ],
-            proposals=None,
-            staging={"needs_commit": False},
-            policy={"emit_changes_enabled": True},
-        )
-
-    # Run with fail-fast timeout
-    try:
-        result = await asyncio.wait_for(threat_run(req), timeout=_THREATS_TIMEOUT_SEC)
-    except asyncio.TimeoutError:
-        telemetry_log("manager.threat_agent_timeout", {"timeout_sec": _THREATS_TIMEOUT_SEC})
-        return _fail("ThreatAgent execution timed out.", req, details={"timeout_sec": _THREATS_TIMEOUT_SEC})
-    except Exception as e:
-        telemetry_log("manager.threat_agent_runtime_error", {"error": str(e)})
-        return _fail("ThreatAgent execution failed. Please check agent logs.", req, details=str(e))
-
-    # Validate outgoing payload & ensure optimistic policy
-    try:
-        resp = UIResponse.model_validate(result)
-        policy = dict(getattr(resp, "policy", {}) or {})
-        policy["emit_changes_enabled"] = True
-        resp.policy = policy  # type: ignore[attr-defined]
-        return resp
-    except ValidationError as ve:
-        telemetry_log("manager.response_validation_error", {"errors": ve.errors()})
-        return _fail("Agent response failed UIResponse validation.", req, details=ve.errors())
+        telemetry_log("manager.response_validation_error", {"tab": tab, "errors": ve.errors()})
+        return _fail("Graph response failed UIResponse validation.", req, details=ve.errors())
 
 # -----------------------------------------------------------------------------
-# Backend resolver (defensive; adjust to your project structure)
+# DI helpers (signature-aware to avoid kwarg mismatch if factory evolves)
 # -----------------------------------------------------------------------------
+def _deps(tab: str) -> GraphDeps:
+    """
+    Build GraphDeps via the factory. We introspect make_default_deps(...) and only
+    pass the keywords it actually supports (prevents runtime kwarg errors).  :contentReference[oaicite:11]{index=11}
+    """
+    backend = _resolve_backend_port()
+    ws_hub = _resolve_ws_hub()
+    make_retriever = _resolve_retriever_factory()
 
-def _get_backend_port() -> Any | None:
-    """
-    Try to obtain a BackendPort instance in a defensive way.
-    Adjust the import path to your actual backend provider.
-    """
-    # 1) Preferred provider: workshops_ai.backend.provider.get_backend_port()
+    candidate_kwargs: dict[str, Any] = {
+        "tab": tab,
+        "settings": _SETTINGS,
+        "backend_port": backend,
+        "ws_hub": ws_hub,
+        "make_retriever": make_retriever,
+    }
+    try:
+        sig = inspect.signature(make_default_deps)
+        supported = set(sig.parameters.keys())
+        safe_kwargs = {k: v for k, v in candidate_kwargs.items() if k in supported}
+    except Exception:
+        safe_kwargs = {k: v for k, v in candidate_kwargs.items() if k != "tazila_client"}
+
+    return make_default_deps(**safe_kwargs)  # type: ignore[call-arg]
+
+def _resolve_backend_port() -> Any | None:
     try:
         from workshops_ai.backend.provider import get_backend_port  # type: ignore
         return get_backend_port()
     except Exception:
         pass
-
-    # 2) CSV backend with a factory: workshops_ai.backend.csv_backend.get_backend_port()
     try:
         from workshops_ai.backend.csv_backend import get_backend_port  # type: ignore
         return get_backend_port()
     except Exception:
         pass
-
-    # 3) Global singleton style: workshops_ai.backend.port.backend_port
     try:
         from workshops_ai.backend.port import backend_port  # type: ignore
         return backend_port
     except Exception:
         pass
-
     return None
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-
-def _infer_intent(message: str | None) -> Intent:
-    """
-    Lightweight intent heuristics (Czech/Slovak/English keywords).
-    Order matters: explain → propose → create → change → read.
-    Conservative default is 'read'.
-    """
-    if not message:
-        return "read"
-    m = message.lower().strip()
-
-    # Explain/help
-    if any(k in m for k in (
-        "explain", "help", "nápověda", "napoveda", "vysvětli", "vysvetli",
-        "prečo", "preco", "ako funguje", "why"
-    )):
-        return "explain"
-
-    # Propose (suggestions)
-    if any(k in m for k in (
-        "navrh", "návrh", "navrhni", "suggest", "proposal",
-        "doporuč", "doporučuj", "recommend"
-    )):
-        return "propose"
-
-    # Create/add/new (new record)
-    if any(k in m for k in (
-        "create", "add ", "add a ", "add an ", "new ", "new:",
-        "vytvoř", "vytvor", "založ", "zalozit", "založiť",
-        "přidej", "pridej", "přidat", "pridat",
-        "nový", "novy", "nové", "nove"
-    )):
-        return "create"
-
-    # Change/update (modify existing)
-    if any(k in m for k in (
-        "change", "update", "edit", "modify", "set ",
-        "upravit", "uprav", "zmeni", "změň", "zmenit", "změnit",
-        "nastav"
-    )):
-        return "change"
-
-    # Read/list/detail
-    if any(k in m for k in (
-        "list", "seznam", "vyjmenuj", "show", "detail", "zobraz",
-        "najdi", "read", "view", "display"
-    )):
-        return "read"
-
-    return "read"
-
-
-
-def _selection_asset_id(req: UIRequest) -> str | None:
+def _resolve_ws_hub():
     try:
-        sel = getattr(req, "selection", None)
-        if sel is None:
-            return None
-        # Pydantic model (prefer attribute)
-        aid = getattr(sel, "asset_id", None)
-        # Fallback: kdyby někde výjimečně prošel dict
-        if aid is None and isinstance(sel, dict):
-            aid = sel.get("asset_id")
-        return cast(str | None, aid)
+        from workshops_ai.app.services.ws_hub import WsHub  # type: ignore
+        return WsHub
     except Exception:
         return None
 
-
-def _fail(msg: str, req: UIRequest | None, *, details: Any | None = None) -> UIResponse:
+def _resolve_retriever_factory():
     try:
-        telemetry_log("manager.fail", {
-            "message": msg,
-            "org_id": getattr(req, "org_id", None) if req else None,
-            "details": details
-        })
+        from workshops_ai.rag.retriever import make_retriever  # type: ignore
+        return make_retriever
     except Exception:
-        pass
-    return UIResponse(messages=[msg], proposals=None, staging={"needs_commit": False})
+        return None
 
+def _timeout_for_tab(tab: str) -> int:
+    if tab == "threats":
+        return _THREATS_TIMEOUT_SEC
+    return _AGENT_TIMEOUT_SEC
 
+# -----------------------------------------------------------------------------
+# Lightweight audit + memory context (best-effort; graphs remain functional without it)
+# -----------------------------------------------------------------------------
 def _audit_in(req: UIRequest) -> None:
     try:
-        pol = getattr(req, "policy", None)
-        if isinstance(pol, dict):
-            emit = bool(pol.get("emit_changes_enabled", True))
-        else:
-            emit = bool(getattr(pol, "emit_changes_enabled", True))
-        telemetry_log("manager.route_in", {
+        payload = req.model_dump() if hasattr(req, "model_dump") else cast(Any, req)
+        telemetry_log("manager.route_chat_in", {"req": payload})
+    except Exception:
+        pass
+
+def _fail(msg: str, req: Optional[UIRequest], details: Any = None) -> UIResponse:
+    if req:
+        telemetry_log("manager.fail", {"msg": msg, "details": details})
+    return UIResponse(
+        messages=[msg],
+        proposals=None,
+        staging={"needs_commit": False, "batch_id": None, "diff": None},
+        policy={"emit_changes_enabled": True},
+    )
+
+async def _remember_context(tab: str, req: UIRequest, deps: GraphDeps) -> None:
+    """Store a few org-scoped hints to help cross-tab flows."""
+    try:
+        mset = deps.memory_set
+        if not mset:
+            return
+        await mset(f"{req.org_id}:{tab}:last_user", req.user_id, ttl_sec=3600)
+    except Exception:
+        pass
+
+async def _remember_post_run(tab: str, req: UIRequest, resp: UIResponse, deps: GraphDeps) -> None:
+    try:
+        telemetry_log("manager.route_chat_out", {
+            "tab": tab,
             "org_id": req.org_id,
             "user_id": req.user_id,
-            "active_tab": req.active_tab,
-            "has_selection": bool(req.selection),
-            "staging": req.staging,
-            "locale": getattr(req, "locale", None),
-            "emit_changes_enabled": emit,
+            "messages": resp.messages[:3] if resp.messages else [],
         })
     except Exception:
         pass

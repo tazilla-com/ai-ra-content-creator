@@ -11,9 +11,9 @@
 # - unregister(ws)
 # - update_client_meta(ws, *, org_id=None, user_id=None, tab=None)
 # - connected_count() -> int
-# - broadcast(event: str, payload: dict)         # will infer target tab from event
+# - broadcast(event: str, payload: dict)         # sync wrapper; infers target tab
 # - emit(event: str, payload: dict)              # alias of broadcast
-# - broadcast_json(payload: dict)                # expects "event" in payload
+# - broadcast_json(payload: dict)                # async; expects "event" in payload
 # - aemit_impact_set_level(payload: dict)        # validates WSImpactSetEvent
 # - aemit_risk_set_probability(payload: dict)    # validates WSRiskSetEvent or wraps plain item
 # -----------------------------------------------------------------------------
@@ -77,7 +77,7 @@ class WsHub:
         IMPORTANT: call websocket.accept() in your router before registering.
         """
         client = _Client(ws=ws, org_id=org_id, user_id=user_id, tab=tab)
-        # Start keepalive ticker (JSON-level ping; 20–30s is usually enough)
+        # Start keepalive ticker (JSON-level ping; ~25s is a good compromise)
         client.keepalive = asyncio.create_task(cls._keepalive_task(client))
 
         async with cls._lock:
@@ -93,10 +93,10 @@ class WsHub:
 
         if client and client.keepalive:
             client.keepalive.cancel()
-            # swallow cancellation exceptions
             try:
                 await client.keepalive
             except Exception:
+                # swallow cancellation exceptions
                 pass
 
     @classmethod
@@ -127,21 +127,26 @@ class WsHub:
         """Number of currently tracked WebSocket clients."""
         return len(cls._clients)
 
-    # -- Broadcasting -----------------------------------------------------------
+    # -- Broadcasting (sync wrappers for graphs' SEND-NOW calls) ----------------
 
     @classmethod
-    async def broadcast(cls, event: str, payload: dict[str, Any]) -> None:
+    def broadcast(cls, event: str, payload: dict[str, Any]) -> None:
         """
-        Broadcast a JSON message adding the 'event' field automatically.
-        The target tab is inferred from the event name.
+        Fire-and-forget broadcast of a JSON message, adding the 'event' field.
+        Safe to call from non-async code (graphs use this in SEND-NOW paths).
         """
         message = {"event": event, **payload}
-        await cls.broadcast_json(message)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(cls.broadcast_json(message))
+        except RuntimeError:
+            # No running loop (unlikely in FastAPI) – run a short-lived loop.
+            asyncio.run(cls.broadcast_json(message))
 
     @classmethod
-    async def emit(cls, event: str, payload: dict[str, Any]) -> None:
+    def emit(cls, event: str, payload: dict[str, Any]) -> None:
         """Alias of broadcast(...)."""
-        await cls.broadcast(event, payload)
+        cls.broadcast(event, payload)
 
     @classmethod
     async def broadcast_json(cls, payload: dict[str, Any]) -> None:
@@ -232,11 +237,13 @@ class WsHub:
         """
         if not event:
             return None
-        if event.startswith("impact."):
+        if event.startswith("impact.") or event.startswith("impacts."):
             return "impacts"
         # Both "risk.set_probability" and potential legacy "threat.set_probability"
         if event.startswith("risk.") or event.startswith("threat."):
             return "threats"
+        if event.startswith("asset."):
+            return "assets"
         return None
 
     @staticmethod

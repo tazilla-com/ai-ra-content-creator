@@ -2,14 +2,14 @@
 # Purpose:
 #   Centralized, Pydantic v2-based application settings with:
 #   - Nested ENV loading via delimiter "__" (e.g., WORKSHOPS_AI_SECURITY__API_KEYS=…)
+#   - Backward-compatible aliases for legacy flat env vars used in the project
 #   - Robust CSV/JSON list parsing (for CORS origins, API keys, etc.)
 #   - Safe redaction for secrets when logging
 #   - Test-friendly caching and explicit cache reset
 #
-# How to use:
+# Usage:
 #   from workshops_ai.settings import get_settings
 #   settings = get_settings()  # cached singleton
-
 
 from __future__ import annotations
 
@@ -79,8 +79,6 @@ class SecuritySettings(BaseModel):
         default="HS256",
         description="JWT algorithm, e.g. HS256/RS256/ES256.",
     )
-    # For HS* algorithms this is the shared secret; for RS*/ES* this is typically a public key
-    # or you provide a JWKS URL (see jwks_url).
     jwt_secret: str = Field(
         default_factory=lambda: secrets.token_urlsafe(32),
         description="JWT secret (HS*) or public key (RS*/ES*).",
@@ -99,10 +97,13 @@ class PathsSettings(BaseModel):
     """
     Filesystem roots for data/state/catalogs.
 
-    ENV mapping:
+    Canonical ENV (nested):
       WORKSHOPS_AI_PATHS__DATA_DIR=./workshops_ai/data
       WORKSHOPS_AI_PATHS__STATE_DIR=./workshops_ai/data/state
       WORKSHOPS_AI_PATHS__CATALOGS_DIR=./workshops_ai/data/catalogs
+
+    Legacy (flat) ENV supported via AppSettings.model_post_init():
+      WORKSHOPS_AI_DATA_DIR, WORKSHOPS_AI_STATE_DIR, WORKSHOPS_AI_CAT_DIR
     """
     data_dir: str = "data"
     state_dir: str = "data/state"
@@ -112,7 +113,7 @@ class PathsSettings(BaseModel):
 class TazilaSettings(BaseModel):
     """
     Outbound ChangeSet export settings:
-      - 'file': write JSON payloads to an outbox directory (non-blocking submit path)
+      - 'file': write JSON payloads to an outbox directory (non-blocking path)
       - 'http': POST JSON to remote API (httpx/AsyncClient; retry/backoff elsewhere)
       - 'disabled': no-op (returns a structured reason)
 
@@ -138,7 +139,6 @@ class RedisSettings(BaseModel):
       WORKSHOPS_AI_REDIS__URL=redis://redis:6379/0
     """
     url: Optional[str] = None  # e.g. redis://localhost:6379/0
-    # Future: tls, username/password, pool size, etc.
 
 
 class RateLimitSettings(BaseModel):
@@ -189,11 +189,14 @@ class LLMSettings(BaseModel):
     """
     LLM client configuration used by agents.
 
-    ENV mapping:
+    Canonical (nested) ENV:
       WORKSHOPS_AI_LLM__MODEL=gpt-4o-mini
       WORKSHOPS_AI_LLM__TEMPERATURE=0.0
       WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC=60
       WORKSHOPS_AI_LLM__OPENAI_MAX_RETRIES=3
+
+    Legacy (flat) ENV handled in AppSettings.model_post_init():
+      LLM_MODEL, LLM_TEMPERATURE
     """
     model: str = "gpt-4o-mini"
     temperature: float = 0.0
@@ -208,6 +211,9 @@ class ChatSettings(BaseModel):
     ENV mapping:
       WORKSHOPS_AI_CHAT__TIMEOUT_SEC=60
       WORKSHOPS_AI_CHAT__MAX_MESSAGE_LEN=4000
+
+    Legacy (flat) ENV:
+      WORKSHOPS_AI_MAX_MESSAGE_LEN (handled in AppSettings.model_post_init()).
     """
     timeout_sec: int = 60
     max_message_len: int = 4000
@@ -217,9 +223,12 @@ class WSSettings(BaseModel):
     """
     WebSocket knobs.
 
-    ENV mapping:
+    Canonical ENV:
       WORKSHOPS_AI_WS__TIMEOUT_SEC=75
       WORKSHOPS_AI_WS__COOKIE_NAME=wsai.sid
+
+    Legacy (flat) ENV:
+      WORKSHOPS_AI_WS_TIMEOUT_SEC (handled in AppSettings.model_post_init()).
     """
     timeout_sec: int = 75
     cookie_name: str = "wsai.sid"
@@ -227,14 +236,16 @@ class WSSettings(BaseModel):
 
 class LangchainSettings(BaseModel):
     """
-    LangChain/LangSmith tracing config. We keep these under our settings so the app
-    has a single source of truth and can propagate to environment as needed.
+    LangChain/LangSmith tracing config.
 
-    ENV mapping:
+    Canonical (nested) ENV:
       WORKSHOPS_AI_LANGCHAIN__TRACING_V2=false
       WORKSHOPS_AI_LANGCHAIN__ENDPOINT=...
       WORKSHOPS_AI_LANGCHAIN__API_KEY=...
       WORKSHOPS_AI_LANGCHAIN__PROJECT=workshops-ai
+
+    Legacy (flat) ENV handled in AppSettings.model_post_init():
+      LANGCHAIN_TRACING_V2, LANGCHAIN_ENDPOINT, LANGCHAIN_API_KEY, LANGCHAIN_PROJECT
     """
     tracing_v2: bool = False
     endpoint: Optional[str] = None
@@ -258,6 +269,62 @@ class ManagerSettings(BaseModel):
     threats_timeout_sec: Optional[int] = None  # None => use agent_timeout_sec
 
 
+class RagSettings(BaseModel):
+    """
+    Retrieval-Augmented Generation (RAG) configuration.
+
+    Canonical (nested) ENV:
+      WORKSHOPS_AI_RAG__ENABLED=true
+      WORKSHOPS_AI_RAG__STORE=chroma
+      WORKSHOPS_AI_RAG__DATA_DIR=./data/chroma
+      WORKSHOPS_AI_RAG__NAMESPACE=rag
+      WORKSHOPS_AI_RAG__EMBED_PROVIDER=fastembed
+      WORKSHOPS_AI_RAG__EMBED_MODEL=BAAI/bge-small-en-v1.5
+      WORKSHOPS_AI_RAG__TOP_K=6
+      WORKSHOPS_AI_RAG__MMR_ENABLED=true|false
+      WORKSHOPS_AI_RAG__MMR_LAMBDA=0.5
+      WORKSHOPS_AI_RAG__MMR_POOL=12
+      WORKSHOPS_AI_RAG__CHUNK_SIZE=1200
+      WORKSHOPS_AI_RAG__CHUNK_OVERLAP=200
+      WORKSHOPS_AI_RAG__MAX_PAGES=0
+      WORKSHOPS_AI_RAG__UUID5_NAMESPACE=00000000-0000-5000-a000-000000000000
+
+    Back-compat:
+      - 'chroma_dir' kept for older code paths; prefer 'data_dir'.
+    """
+    enabled: bool = True
+    store: Literal["chroma"] = "chroma"
+
+    # index paths / namespacing
+    data_dir: str = "data/chroma"
+    chroma_dir: Optional[str] = None  # old name; if set, prefer this over data_dir
+    namespace: str = "rag"
+
+    # embeddings
+    embed_provider: Literal["fastembed", "openai"] = "fastembed"
+    embed_model: str = "BAAI/bge-small-en-v1.5"  # or text-embedding-3-small if openai
+
+    # retriever params
+    top_k: int = 6
+    use_mmr: bool = True          # old name
+    mmr_enabled: Optional[bool] = None  # new explicit flag
+    mmr_lambda: float = 0.5
+    mmr_pool: int = 12
+
+    # ingest params
+    chunk_size: int = 1200
+    chunk_overlap: int = 200
+    max_pages: int = 0
+    uuid5_namespace: str = "00000000-0000-5000-a000-000000000000"
+
+    # convenience
+    def effective_index_dir(self) -> str:
+        return self.chroma_dir or self.data_dir
+
+    def effective_use_mmr(self) -> bool:
+        return self.mmr_enabled if self.mmr_enabled is not None else self.use_mmr
+
+
 # ------------------------------------------------------------------------------
 # Root settings
 # ------------------------------------------------------------------------------
@@ -277,11 +344,12 @@ class AppSettings(BaseSettings):
       WORKSHOPS_AI_SECURITY__API_KEYS=["dev-key"]
       WORKSHOPS_AI_PATHS__DATA_DIR=/mnt/data
       WORKSHOPS_AI_LLM__MODEL=gpt-4o-mini
-      ENABLE_DOCS=false
+      ENABLE_DOCS=false  (legacy flat toggle; also supports WORKSHOPS_AI_ENABLE_DOCS)
     """
     model_config = SettingsConfigDict(
         env_prefix="WORKSHOPS_AI_",
         env_file=".env",
+        env_file_encoding="utf-8",
         extra="ignore",
         env_nested_delimiter="__",
     )
@@ -293,13 +361,13 @@ class AppSettings(BaseSettings):
     log_level: str = "INFO"
     app_host: str = "0.0.0.0"
     app_port: int = 8000
-    enable_docs: bool = False  # may be also toggled by ENABLE_DOCS in your process env
-    reload: bool = True        # dev default; uvicorn --reload typically controls this
+    enable_docs: bool = False
+    reload: bool = True
 
     # CORS
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
 
-    # Feature groups (namespaced, map to WORKSHOPS_AI_<SECTION>__*)
+    # Feature groups (namespaced)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     paths: PathsSettings = Field(default_factory=PathsSettings)
     tazila: TazilaSettings = Field(default_factory=TazilaSettings)
@@ -311,14 +379,69 @@ class AppSettings(BaseSettings):
     chat: ChatSettings = Field(default_factory=ChatSettings)
     ws: WSSettings = Field(default_factory=WSSettings)
     langchain: LangchainSettings = Field(default_factory=LangchainSettings)
-    manager: ManagerSettings = Field(default_factory=ManagerSettings)  # <-- NEW (agent timeouts)
+    manager: ManagerSettings = Field(default_factory=ManagerSettings)
+    rag: RagSettings = Field(default_factory=RagSettings)
+
+    # AI manager/router spec (used by HTTP/WS chat routers)
+    # ENV: WORKSHOPS_AI_AI_MANAGER_SPEC=workshops_ai.graph.manager:route_chat
+    ai_manager_spec: str = "workshops_ai.graph.manager:route_chat"
+
+    # LangGraph checkpointer knobs (flat keys to match .env and checkpointer factory)
+    # ENV (flat, not nested):
+    #   WORKSHOPS_AI_CHECKPOINTER=redis|sqlite|memory
+    #   WORKSHOPS_AI_REDIS_URL=redis://localhost:6379/0
+    #   WORKSHOPS_AI_CHECKPOINT_NS=lg:ckpt
+    #   WORKSHOPS_AI_CHECKPOINT_TTL_SEC=86400
+    #   WORKSHOPS_AI_SQLITE_CKPT_PATH=/mnt/data/checkpoints.db
+    checkpointer: Optional[str] = None
+    redis_url: Optional[str] = None
+    checkpoint_ns: str = "lg:ckpt"
+    checkpoint_ttl_sec: Optional[int] = None
+    sqlite_ckpt_path: str = "/mnt/data/checkpoints.db"
+
+    # ---- Per-tab agent timeouts (flat env) ----
+    agent_timeout_sec_assets: Optional[int] = Field(
+        default=None, validation_alias="AGENT_TIMEOUT_SEC_ASSETS"
+    )
+    agent_timeout_sec_impacts: Optional[int] = Field(
+        default=None, validation_alias="AGENT_TIMEOUT_SEC_IMPACTS"
+    )
+    agent_timeout_sec_threats: Optional[int] = Field(
+        default=None, validation_alias="AGENT_TIMEOUT_SEC_THREATS"
+    )
+
+    # Paths
+    data_dir_legacy: Optional[str] = Field(default=None, validation_alias="DATA_DIR")
+    state_dir_legacy: Optional[str] = Field(default=None, validation_alias="STATE_DIR")
+    cat_dir_legacy: Optional[str] = Field(default=None, validation_alias="CAT_DIR")
+
+    # WS/chat legacy flat
+    ws_timeout_sec_legacy: Optional[int] = Field(default=None, validation_alias="WS_TIMEOUT_SEC")
+    max_message_len_legacy: Optional[int] = Field(default=None, validation_alias="MAX_MESSAGE_LEN")
+
+    # Host/port legacy (no WORKSHOPS_AI_ prefix in .env)
+    app_host_env: Optional[str] = Field(default=None, validation_alias="APP_HOST")
+    app_port_env: Optional[int] = Field(default=None, validation_alias="APP_PORT")
+
+    # Docs legacy flat
+    enable_docs_flat: Optional[bool] = Field(default=None, validation_alias="ENABLE_DOCS")
+
+    # LangChain legacy flat
+    langchain_tracing_v2_flat: Optional[bool] = Field(default=None, validation_alias="LANGCHAIN_TRACING_V2")
+    langchain_endpoint_flat: Optional[str] = Field(default=None, validation_alias="LANGCHAIN_ENDPOINT")
+    langchain_api_key_flat: Optional[str] = Field(default=None, validation_alias="LANGCHAIN_API_KEY")
+    langchain_project_flat: Optional[str] = Field(default=None, validation_alias="LANGCHAIN_PROJECT")
+
+    # LLM legacy flat
+    llm_model_flat: Optional[str] = Field(default=None, validation_alias="LLM_MODEL")
+    llm_temperature_flat: Optional[float] = Field(default=None, validation_alias="LLM_TEMPERATURE")
 
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors(cls, v):
         return _parse_csv_or_json_list(v)
 
-    # ---- Compatibility shims (older code paths expect top-level attributes) ----
+    # ---- Convenience / compatibility helpers ----
     @property
     def chat_timeout_sec(self) -> int:
         """Legacy: return chat timeout as a top-level property."""
@@ -333,6 +456,21 @@ class AppSettings(BaseSettings):
     def ws_timeout_sec(self) -> int:
         """Legacy: return WebSocket timeout as a top-level property."""
         return self.ws.timeout_sec
+
+    # Effective timeout per tab with overrides from .env
+    def agent_timeout_for_tab(self, tab: str) -> int:
+        t = tab.lower()
+        if t == "assets" and self.agent_timeout_sec_assets:
+            return self.agent_timeout_sec_assets
+        if t == "impacts" and self.agent_timeout_sec_impacts:
+            return self.agent_timeout_sec_impacts
+        if t == "threats":
+            return (
+                self.agent_timeout_sec_threats
+                or self.manager.threats_timeout_sec
+                or self.manager.agent_timeout_sec
+            )
+        return self.manager.agent_timeout_sec
 
     def redacted_dict(self) -> dict:
         """
@@ -362,6 +500,56 @@ class AppSettings(BaseSettings):
             lc["api_key"] = "***"
 
         return data
+
+    # Post-processing to apply legacy/flat env knobs
+    def model_post_init(self, __context: Any) -> None:  # type: ignore[override]
+        # ENABLE_DOCS (flat) wins if present
+        if self.enable_docs_flat is not None:
+            self.enable_docs = bool(self.enable_docs_flat)
+
+        # Host/port (APP_HOST / APP_PORT) if provided
+        if self.app_host_env:
+            self.app_host = self.app_host_env
+        if self.app_port_env:
+            self.app_port = self.app_port_env
+
+        # Paths legacy mapping
+        if self.data_dir_legacy:
+            self.paths.data_dir = self.data_dir_legacy
+        if self.state_dir_legacy:
+            self.paths.state_dir = self.state_dir_legacy
+        if self.cat_dir_legacy:
+            self.paths.catalogs_dir = self.cat_dir_legacy
+
+        # WS timeout legacy (flat)
+        if self.ws_timeout_sec_legacy:
+            self.ws.timeout_sec = self.ws_timeout_sec_legacy
+
+        # Chat max message length legacy (flat)
+        if self.max_message_len_legacy:
+            self.chat.max_message_len = self.max_message_len_legacy
+
+        # LangChain flat env overrides (common upstream names)
+        if self.langchain_tracing_v2_flat is not None:
+            self.langchain.tracing_v2 = bool(self.langchain_tracing_v2_flat)
+        if self.langchain_endpoint_flat:
+            self.langchain.endpoint = self.langchain_endpoint_flat
+        if self.langchain_api_key_flat:
+            self.langchain.api_key = self.langchain_api_key_flat
+        if self.langchain_project_flat:
+            self.langchain.project = self.langchain_project_flat
+
+        # LLM flat env overrides
+        if self.llm_model_flat:
+            self.llm.model = self.llm_model_flat
+        if self.llm_temperature_flat is not None:
+            # pydantic already coerces to float; keep as-is
+            self.llm.temperature = float(self.llm_temperature_flat)
+
+        # RAG back-compat: prefer chroma_dir if provided
+        if self.rag.chroma_dir:
+            # keep both but ensure effective_index_dir() uses chroma_dir
+            pass
 
 
 # ------------------------------------------------------------------------------

@@ -145,7 +145,7 @@ async def demo_page() -> str:
 
       try {
         // Add api_key as query param as well (proxies/CORS tolerant)
-        const chatUrl = new URL('/chat', window.location.origin);
+        const chatUrl = new URL('/api/chat', window.location.origin);
         if (key) chatUrl.searchParams.set('api_key', key);
 
         const res = await fetch(chatUrl.toString(), {

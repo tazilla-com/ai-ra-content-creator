@@ -117,7 +117,9 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
         },
         # --------------------------- ImpactAgent -------------------------------
         "impacts": {
+            # both keys provided so older/newer agents never 404 on i18n
             "select_asset": "Please select an asset to show its impacts.",
+            "need_asset": "Please select an asset to show its impacts.",
             "no_impacts": "No impacts have been set for the selected asset yet.",
             "current_impacts_header": "Current impacts:",
             "impact_line": "- {impact_code}: {level}",
@@ -134,6 +136,7 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
         # --------------------------- ThreatAgent -------------------------------
         "threats": {
             "select_asset": "Optionally select an asset to tailor risk probability.",
+            "need_asset": "Optionally select an asset to tailor risk probability.",  # alias
             "list_header": "Threats:",
             "explain_intro": "Relevance rationale:",
             "unknown_threat": "Unknown threat_code: {threat_code}",
@@ -172,6 +175,7 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
         },
         "impacts": {
             "select_asset": "Vyberte, prosím, aktívum, pre ktoré mám zobraziť dopady.",
+            "need_asset": "Vyberte, prosím, aktívum, pre ktoré mám zobraziť dopady.",  # alias
             "no_impacts": "Pre vybrané aktívum zatiaľ nie sú nastavené žiadne dopady.",
             "current_impacts_header": "Aktuálne dopady:",
             "impact_line": "- {impact_code}: {level}",
@@ -187,6 +191,7 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
         },
         "threats": {
             "select_asset": "Voliteľne vyberte aktívum na spresnenie pravdepodobnosti rizika.",
+            "need_asset": "Voliteľne vyberte aktívum na spresnenie pravdepodobnosti rizika.",  # alias
             "list_header": "Hrozby:",
             "explain_intro": "Odôvodnenie relevancie:",
             "unknown_threat": "Neznámy threat_code: {threat_code}",
@@ -225,6 +230,7 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
         },
         "impacts": {
             "select_asset": "Vyber prosím aktivum, u kterého mám zobrazit dopady.",
+            "need_asset": "Vyber prosím aktivum, u kterého mám zobrazit dopady.",  # alias
             "no_impacts": "U vybraného aktiva zatím nejsou nastaveny žádné dopady.",
             "current_impacts_header": "Aktuální dopady:",
             "impact_line": "- {impact_code}: {level}",
@@ -240,6 +246,7 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
         },
         "threats": {
             "select_asset": "Volitelně vyber aktivum pro upřesnění pravděpodobnosti rizika.",
+            "need_asset": "Volitelně vyber aktivum pro upřesnění pravděpodobnosti rizika.",  # alias
             "list_header": "Hrozby:",
             "explain_intro": "Odůvodnění relevance:",
             "unknown_threat": "Neznámý threat_code: {threat_code}",

@@ -4,3 +4,10 @@ pip install --no-cache-dir -r requirements.txt -c constraints.txt
 
 python -m uvicorn workshops_ai.app.main:app --reload --host 127.0.0.1 --port 8000
 
+docker compose build --no-cache api
+docker compose up -d --force-recreate
+
+iwr http://localhost:8000/livez        
+docker compose exec api python -c "from workshops_ai.settings import get_settings; s=get_settings(); print('api_keys:', s.security.api_keys); print('enable_api_key:', s.security.enable_api_key); print('enable_jwt:', s.security.enable_jwt); print('redis:', s.redis.url)"
+
+docker compose logs -f api

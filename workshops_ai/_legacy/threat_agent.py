@@ -239,7 +239,7 @@ def _mk_changeset_for_risks(*, items_by_asset: dict[str, list[RiskItem]]) -> Cha
     audit = {
         "tags": ["AI", "batch-threats"],
         "source": "AI",
-        "userId": user_id,
+        "user_id": user_id,
         "ts": ts,
     }
 
@@ -436,7 +436,7 @@ async def tool_upsert_threat(
         idempotency_key=str(uuid.uuid4()),
         org_id=org_id,
         intent="apply",
-        audit={"tags": ["AI", "threat-upsert"], "source": "AI", "userId": user_id, "ts": _now_iso()},
+        audit={"tags": ["AI", "threat-upsert"], "source": "AI", "user_id": user_id, "ts": _now_iso()},
         actions=[
             {  # type: ignore[typeddict-item]
                 "op": "upsert_threats",

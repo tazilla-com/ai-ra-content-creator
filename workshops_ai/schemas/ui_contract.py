@@ -1,9 +1,17 @@
 # File: workshops_ai/schemas/ui_contract.py
-# Purpose: Pydantic v2 models for the UI ↔ Agent chat contract.
-# - Fail-closed (extra fields are forbidden)
-# - Canonical EN codes for tabs; selection is per-tab (extensible)
-# - Response staging object mirrors the global “staging → diff → explicit commit” rule
-# - Strings are stripped; messages are non-empty, trimmed
+# -----------------------------------------------------------------------------
+# Purpose
+# Pydantic v2 models for the UI ↔ Agent chat contract.
+#
+# Design
+# - Fail-closed (extra fields are forbidden).
+# - Canonical EN codes for tabs; selection is per-tab (extensible).
+# - Response staging object mirrors the global “staging → diff → explicit commit” rule.
+# - Strings are stripped; messages are non-empty, trimmed.
+# - `policy.emit_changes_enabled` is preserved end-to-end.
+# - `locale` is accepted (alongside `language`) to align with telemetry/manager usage.
+# - Optional `history_token` allows clients to resume a LangGraph thread (checkpoint).
+# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -134,6 +142,11 @@ class UIRequest(BaseModel):
         default=None,
         description="IETF language tag like 'cs', 'sk', 'en-US'.",
     )
+    # Added to align with telemetry/manager which already read `locale`
+    locale: Optional[StrictStr] = Field(
+        default=None,
+        description="Locale hint similar to `language` (e.g., 'cs_CZ'); UI may send either.",
+    )
     number_of_assets: Optional[StrictInt] = Field(
         default=None, ge=1, le=1000,
         description="Agent hint for list/summary limits.",
@@ -164,13 +177,19 @@ class UIRequest(BaseModel):
         description="Runtime policy switches (e.g., dry-run emission gate).",
     )
 
+    # Optional cursor for LangGraph history/checkpoint resume (thread id / token)
+    history_token: Optional[StrictStr] = Field(
+        default=None,
+        description="Opaque token to resume a conversation thread/history (checkpointer).",
+    )
+
     @field_validator("message")
     @classmethod
     def _message_not_none(cls, v: str) -> str:
         # Allow empty string (e.g., pure selection-driven actions), but never None
         return "" if v is None else v
 
-    @field_validator("language")
+    @field_validator("language", "locale")
     @classmethod
     def _normalize_lang(cls, v: Optional[str]) -> Optional[str]:
         return v.strip() if isinstance(v, str) else v
@@ -204,7 +223,6 @@ class UIResponsePolicy(BaseModel):
     )
 
 
-# NEW: UIResponse with optional 'policy'
 class UIResponse(BaseModel):
     """
     Chat output contract to UI.
@@ -228,12 +246,10 @@ class UIResponse(BaseModel):
         default=None,
         description="Optional synchronous echo of agent events returned with the response.",
     )
-    # +++ newly allowed +++
     policy: Optional[UIResponsePolicy] = Field(
         default=None,
         description="Response-side policy switches and hints for the UI.",
     )
-    # +++++++++++++++++++++
 
     @field_validator("messages")
     @classmethod

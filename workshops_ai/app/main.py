@@ -344,7 +344,7 @@ def create_app() -> FastAPI:
     # /chat
     def _mount_chat():
         from workshops_ai.routers.chat_router import router as chat_router
-        app.include_router(chat_router, tags=["chat"], dependencies=_AUTH_DEP)
+        app.include_router(chat_router, prefix="/api", tags=["chat"], dependencies=_AUTH_DEP)
 
     def _fallback_chat():
         router = APIRouter()
