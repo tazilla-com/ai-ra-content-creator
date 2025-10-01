@@ -1,10 +1,10 @@
-# workshops_ai/routers/impacts.py
+# File: workshops_ai/routers/impacts.py
 from __future__ import annotations
 
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Body, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Body, status, Query, Header
 from fastapi.responses import JSONResponse
 from pydantic import RootModel, ValidationError
 
@@ -14,6 +14,9 @@ from workshops_ai.tools.telemetry import telemetry_log
 # Graph bits
 from workshops_ai.graph.factory import GraphDeps, make_default_deps
 from workshops_ai.graph.impact_graph import create_graph, ImpactState
+
+# Unified DTO for write requests
+from workshops_ai.api.schema.impact import AssetImpact
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/graph", tags=["impacts"])
@@ -48,7 +51,6 @@ def _get_graph_deps(request: Request) -> GraphDeps:
         llm=getattr(app_state, "llm", None),
         memory_get=getattr(app_state, "memory_get", None),
         memory_set=getattr(app_state, "memory_set", None),
-        checkpointer=getattr(app_state, "checkpointer", None),     # if your factory accepts it
     )
     return _GRAPH_DEPS
 
@@ -71,6 +73,9 @@ class _LooseImpactInput(RootModel[dict[str, Any]]):
     pass
 
 
+# --------------------------------------------------------------------------------------
+# Generic graph endpoint (accepts full ImpactState as dict)
+# --------------------------------------------------------------------------------------
 @router.post("/impacts", response_class=JSONResponse, summary="Execute IMPACTS graph")
 async def run_impacts_graph(
     request: Request,
@@ -114,6 +119,85 @@ async def run_impacts_graph(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"message": "Impacts graph execution failed", "error": str(e)},
+        ) from e
+
+    try:
+        state_out = ImpactState.model_validate(out if isinstance(out, dict) else out)
+    except Exception:
+        return JSONResponse(content={"raw": out}, status_code=status.HTTP_200_OK)
+
+    result = state_out.result or {
+        "messages": ["No result."],
+        "proposals": None,
+        "staging": {"needs_commit": False, "batch_id": None, "diff": None},
+        "policy": {"emit_changes_enabled": True},
+    }
+    return JSONResponse(content=result, status_code=status.HTTP_200_OK)
+
+
+# --------------------------------------------------------------------------------------
+# DTO endpoint (request body is the unified AssetImpact)
+# For OpenAPI consistency and stricter validation on write.
+# It wraps the validated DTO into a minimal graph state and triggers action="set".
+# --------------------------------------------------------------------------------------
+@router.post(
+    "/impacts/set",
+    response_class=JSONResponse,
+    summary="Set a single impact level (DTO body: AssetImpact) via IMPACTS graph",
+)
+async def set_single_impact_via_graph(
+    request: Request,
+    dto: AssetImpact,                              # <- strict request body (OpenAPI shows the DTO)
+    org_id: str = Query(..., description="Organization ID"),
+    user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    _auth=Depends(require_auth),
+):
+    deps = _get_graph_deps(request)
+    graph = _get_compiled_graph(deps)
+
+    # Prepare minimal state for the graph. We forward the validated DTO as plain dict.
+    state_payload: dict[str, Any] = {
+        "org_id": org_id,
+        "user_id": user_id,
+        "active_tab": "impacts",
+        "action": "set",
+        # The graph side (impact_graph) validates as AssetImpact and uses mappers.
+        "payload": dto.model_dump(),
+        # Optional: keep selection.asset_id for downstream reads or UI hints.
+        "selection": {"asset_id": dto.asset_id},
+    }
+
+    try:
+        telemetry_log(
+            "graph.impacts.set",
+            {"org_id": org_id, "asset_id": dto.asset_id, "impact_code": dto.impact_code, "level": dto.level},
+        )
+    except Exception:
+        pass
+
+    # Validate state against ImpactState (so we keep a single entry format)
+    try:
+        state_in = ImpactState.model_validate(state_payload)
+    except ValidationError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"message": "Invalid impacts set input", "errors": ve.errors()},
+        ) from ve
+
+    cfg: dict[str, Any] = {"configurable": {}}
+    user = state_in.user_id or "anon"
+    cfg["configurable"]["thread_id"] = f"{state_in.org_id}:{deps.tab}:{user}"
+    checkpoint_ns = getattr(deps, "checkpoint_ns", None)
+    if checkpoint_ns:
+        cfg["configurable"]["checkpoint_ns"] = checkpoint_ns
+
+    try:
+        out = await graph.ainvoke(state_in.model_dump(), config=cfg)
+    except Exception as e:
+        logger.exception("impacts graph (set) execution failed: %s", e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"message": "Impacts graph (set) execution failed", "error": str(e)},
         ) from e
 
     try:

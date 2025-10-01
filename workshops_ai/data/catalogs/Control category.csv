@@ -1,18 +1,18 @@
-Name;Notes;EN Name;EN Notes;SK Name;SK Notes
-Information security policies;;Information security policies;;Politiky informaènej bezpeènosti;
-Organization of information security;;Organization of information security;;Organizácia informaènej bezpeènosti;
-Human resource security;;Human resource security;;Personálna bezpeènos;
-Threat intelligence;;Threat intelligence;;Threat intelligence;
-Asset management;;Asset management;;Riadenie aktív;
-Access control;;Access control;;Riadenie prístupov;
-Cryptography;;Cryptography;;Šifrovanie, kryptografia;
-Physical and environmental security;;Physical and environmental security;;Fyzická bezpeènos a bezpeènos prostredia;
-Business continuity management;;Business continuity management;;Riadenie kontinuity;
-Operations security;;Operations security;;Bezpeènos prevádzky;
-Vulnerability Management;;Vulnerability Management;;Riadenie zranite¾ností;
-Communications security;;Communications security;;Komunikaèná bezpeènos;
-System acquisition, development and maintenance;;System acquisition, development and maintenance;;Akvizícia, vıvoj a údrba informaènıch systémov;
-Supplier relationships;;Supplier relationships;;Riadenie vzahov s dodávate¾mi;
-Compliance;;Compliance;;Súlad;
-Logging and monitoring;;Logging and monitoring;;Zaznamenávanie dát a monitorovanie;
-Other;;Other;;Iné;
+Name,Notes,EN Name,EN Notes,SK Name,SK Notes
+Information security policies,,Information security policies,,Politiky informaÄnej bezpeÄnosti,
+Organization of information security,,Organization of information security,,OrganizÃ¡cia informaÄnej bezpeÄnosti,
+Human resource security,,Human resource security,,PersonÃ¡lna bezpeÄnosÅ¥,
+Threat intelligence,,Threat intelligence,,Threat intelligence,
+Asset management,,Asset management,,Riadenie aktÃ­v,
+Access control,,Access control,,Riadenie prÃ­stupov,
+Cryptography,,Cryptography,,"Å ifrovanie, kryptografia",
+Physical and environmental security,,Physical and environmental security,,FyzickÃ¡ bezpeÄnosÅ¥ a bezpeÄnosÅ¥ prostredia,
+Business continuity management,,Business continuity management,,Riadenie kontinuity,
+Operations security,,Operations security,,BezpeÄnosÅ¥ prevÃ¡dzky,
+Vulnerability Management,,Vulnerability Management,,Riadenie zraniteÄ¾nostÃ­,
+Communications security,,Communications security,,KomunikaÄnÃ¡ bezpeÄnosÅ¥,
+"System acquisition, development and maintenance",,"System acquisition, development and maintenance",,"AkvizÃ­cia, vÃ½voj a ÃºdrÅ¾ba informaÄnÃ½ch systÃ©mov",
+Supplier relationships,,Supplier relationships,,Riadenie vzÅ¥ahov s dodÃ¡vateÄ¾mi,
+Compliance,,Compliance,,SÃºlad,
+Logging and monitoring,,Logging and monitoring,,ZaznamenÃ¡vanie dÃ¡t a monitorovanie,
+Other,,Other,,InÃ©,

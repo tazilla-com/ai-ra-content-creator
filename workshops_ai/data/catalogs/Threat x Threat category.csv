@@ -1,73 +1,73 @@
-Threat;Threat category
-Pollution, dust,  corrosion, frost;Physical threats
-Water, humidity;Physical threats
-Heat radiation;Physical threats
-Harmful radiation, radiation, or electromagnetic pulses;Physical threats
-Interference of electrical signals;Physical threats
-Fire;Physical threats
-Toxic substances in the area;Physical threats
-Surrounding events and accidents with negative impact;Physical threats
-Terrorist attack, sabotage, explosion;Physical threats
-Coercion, extortion, corruption;Physical threats
-Unauthorized entry into premises;Physical threats
-Unauthorized use of devices and unauthorized access to devices;Physical threats
-Physical theft or physical damage to devices or media;Physical threats
-Theft, infiltration, or modification of data during physical transfer;Physical threats
-Climatic or meteorological event;Natural threats
-Seismic event;Natural threats
-Volcanic event;Natural threats
-Pandemic / epidemic event;Natural threats
-Damage caused by animals;Natural threats
-The existence of a known software vulnerability;Compromise of functions or services
-Unauthorized manipulation of software or a hacker attack;Compromise of functions or services
-Malware infiltration;Compromise of functions or services
-Infiltration and modification of data – damage or loss of data;Compromise of functions or services
-Communication interception;Compromise of functions or services
-Web communication infiltration;Compromise of functions or services
-Unauthorized or misdirected messages;Compromise of functions or services
-Falsification of identity, rights or permissions and their misuse;Compromise of functions or services
-Theft of digital identity;Compromise of functions or services
-Unauthorized location detection;Compromise of functions or services
-Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);Compromise of functions or services
-Retrieving data from improperly recycled or discarded media;Compromise of functions or services
-Data input from untrusted sources;Compromise of functions or services
-Unauthorized intentional activity by users;Human actions
-Unauthorized intentional activity by privileged users;Human actions
-Unauthorized intentional actions by operators or employees providing support services;Human actions
-User error;Human actions
-Error of a privileged user;Human actions
-Error or failure of operations, maintenance, or an employee performing support services;Human actions
-Repudiation (Denial of activity);Human actions
-Improper use of equipment;Human actions
-Disclosure of information;Human actions
-Incorrect disclosure of information;Human actions
-Use of unauthorized software;Human actions
-Use of unauthorized hardware;Human actions
-Illegal and unauthorized processing of data;Human actions
-Human communication failure;Human actions
-Denial of service;Technical failures and infrastructure disruptions
-Software or service failure;Technical failures and infrastructure disruptions
-Device or system failure;Technical failures and infrastructure disruptions
-Overloading of the information system;Technical failures and infrastructure disruptions
-Telecommunication network failure;Technical failures and infrastructure disruptions
-Power system failure, power loss, or fluctuations in performance;Technical failures and infrastructure disruptions
-Failure of the cooling or ventilation system;Technical failures and infrastructure disruptions
-Office equipment failure;Technical failures and infrastructure disruptions
-Degradation of equipment or storage media (obsolescence);Technical failures and infrastructure disruptions
-Disruption of availability during an audit or other authorized security assessment;Technical failures and infrastructure disruptions
-Poor planning and adaptation shortcomings;Organizational threats
-Lack of staff;Organizational threats
-Lack of resources;Organizational threats
-Employee strike or refusal to act;Organizational threats
-Social Engineering;Organizational threats
-Reputation damage;Organizational threats
-Service provider failure;Organizational threats
-Software design or development errors;Organizational threats
-Using software that does not meet security requirements;Organizational threats
-Violation of internal policies or standards;Legal and regulatory threats
-Violation of laws or regulations;Legal and regulatory threats
-Copyright violation;Legal and regulatory threats
-Detectability – violation of anonymity or pseudonymity;Violation of privacy
-Identifiability;Violation of privacy
-Linkability;Violation of privacy
-Non-compliance with the legal basis - violation of the rights of the data subject;Violation of privacy
+Threat,Threat category
+"Pollution, dust,  corrosion, frost",Physical threats
+"Water, humidity",Physical threats
+Heat radiation,Physical threats
+"Harmful radiation, radiation, or electromagnetic pulses",Physical threats
+Interference of electrical signals,Physical threats
+Fire,Physical threats
+Toxic substances in the area,Physical threats
+Surrounding events and accidents with negative impact,Physical threats
+"Terrorist attack, sabotage, explosion",Physical threats
+"Coercion, extortion, corruption",Physical threats
+Unauthorized entry into premises,Physical threats
+Unauthorized use of devices and unauthorized access to devices,Physical threats
+Physical theft or physical damage to devices or media,Physical threats
+"Theft, infiltration, or modification of data during physical transfer",Physical threats
+Climatic or meteorological event,Natural threats
+Seismic event,Natural threats
+Volcanic event,Natural threats
+Pandemic / epidemic event,Natural threats
+Damage caused by animals,Natural threats
+The existence of a known software vulnerability,Compromise of functions or services
+Unauthorized manipulation of software or a hacker attack,Compromise of functions or services
+Malware infiltration,Compromise of functions or services
+Infiltration and modification of data â€“ damage or loss of data,Compromise of functions or services
+Communication interception,Compromise of functions or services
+Web communication infiltration,Compromise of functions or services
+Unauthorized or misdirected messages,Compromise of functions or services
+"Falsification of identity, rights or permissions and their misuse",Compromise of functions or services
+Theft of digital identity,Compromise of functions or services
+Unauthorized location detection,Compromise of functions or services
+"Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST)",Compromise of functions or services
+Retrieving data from improperly recycled or discarded media,Compromise of functions or services
+Data input from untrusted sources,Compromise of functions or services
+Unauthorized intentional activity by users,Human actions
+Unauthorized intentional activity by privileged users,Human actions
+Unauthorized intentional actions by operators or employees providing support services,Human actions
+User error,Human actions
+Error of a privileged user,Human actions
+"Error or failure of operations, maintenance, or an employee performing support services",Human actions
+Repudiation (Denial of activity),Human actions
+Improper use of equipment,Human actions
+Disclosure of information,Human actions
+Incorrect disclosure of information,Human actions
+Use of unauthorized software,Human actions
+Use of unauthorized hardware,Human actions
+Illegal and unauthorized processing of data,Human actions
+Human communication failure,Human actions
+Denial of service,Technical failures and infrastructure disruptions
+Software or service failure,Technical failures and infrastructure disruptions
+Device or system failure,Technical failures and infrastructure disruptions
+Overloading of the information system,Technical failures and infrastructure disruptions
+Telecommunication network failure,Technical failures and infrastructure disruptions
+"Power system failure, power loss, or fluctuations in performance",Technical failures and infrastructure disruptions
+Failure of the cooling or ventilation system,Technical failures and infrastructure disruptions
+Office equipment failure,Technical failures and infrastructure disruptions
+Degradation of equipment or storage media (obsolescence),Technical failures and infrastructure disruptions
+Disruption of availability during an audit or other authorized security assessment,Technical failures and infrastructure disruptions
+Poor planning and adaptation shortcomings,Organizational threats
+Lack of staff,Organizational threats
+Lack of resources,Organizational threats
+Employee strike or refusal to act,Organizational threats
+Social Engineering,Organizational threats
+Reputation damage,Organizational threats
+Service provider failure,Organizational threats
+Software design or development errors,Organizational threats
+Using software that does not meet security requirements,Organizational threats
+Violation of internal policies or standards,Legal and regulatory threats
+Violation of laws or regulations,Legal and regulatory threats
+Copyright violation,Legal and regulatory threats
+Detectability â€“ violation of anonymity or pseudonymity,Violation of privacy
+Identifiability,Violation of privacy
+Linkability,Violation of privacy
+Non-compliance with the legal basis - violation of the rights of the data subject,Violation of privacy

@@ -1,17 +1,22 @@
-# File: workshops_ai/graph/threat_graph.py
+# File: workshops_ai/graph/impact_graph.py
 # -----------------------------------------------------------------------------
 # Purpose
-# LangGraph graph for the THREATS tab (SEND-NOW semantics).
+# LangGraph graph for the IMPACTS tab (SEND-NOW semantics).
 #
 # Capabilities
-# - list_threats                  : read threat catalog (optionally filtered by asset_type)
-# - asset_get_risks               : read current risk probabilities for a selected asset
-# - set_risk_probability          : set/update risk probabilities for one asset (0..4)
-# - bulk_set_risk_probabilities   : set/update probabilities across multiple assets
-# - upsert_threat                 : create/update an org-scoped custom threat (server-side persist)
-# - explain_threats (RAG)         : retrieve context snippets; falls back to LLM if RAG missing
+# - list_impacts            : read impact catalog (canonical EN codes)
+# - asset_get_impacts       : read current impact levels for a selected asset
+# - set_impact_level        : set/update impact levels for one asset (CIA scale 0..4)
+# - bulk_set_impact_levels  : set/update impact levels across multiple assets
+# - explain_impacts (RAG)   : retrieve context snippets for an explanation (optional)
 #
-# Output (UIResponse-like dict)
+# Semantics
+# - Write paths are "emit-only": first broadcast schema-validated WS events, then async
+#   submit a ChangeSet with an idempotency key (no staging/commit roundtrip).
+# - If the submit fails / no backend client is available, JSON is written to outbox.
+# - Read paths return immediately.
+#
+# Output (UIResponse-like dict; manager enforces emit-only policy as well)
 # {
 #   "messages": ["assistant text..."],
 #   "proposals": null,
@@ -19,6 +24,13 @@
 #   "policy": {"emit_changes_enabled": true}
 # }
 #
+# Notes
+# - Graph is compiled with an injected checkpointer → per-org/tab history.
+# - WS events prefer WsHub.aemit_impact_set_event(...) (list-shape); if unavailable,
+#   we fall back to WsHub.aemit_impact_set_level(...) per-item.
+# - ChangeSets are produced by mappers (DTO → runtime shape) and submitted; fallback is outbox.
+# - Explain node falls back to LLM if retriever is missing/unavailable.
+# - Optional NLU node parses free text into set/bulk_set payloads when possible.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -30,78 +42,79 @@ import re
 import uuid
 import json
 import os
-from typing import Any, Literal, Optional, cast, List
+import unicodedata
+from typing import Any, Literal, Optional, cast, List, Dict
 
 from pydantic import BaseModel, Field
 
 from workshops_ai.graph.factory import GraphDeps
 
+# Unified DTO + mappers (NEW)
+from workshops_ai.api.schema import AssetImpact
+from workshops_ai.agents.utils.mappers import (
+    map_asset_impact_to_ws_event,
+    map_asset_impact_to_changeset,
+)
+
 try:
     from langgraph.graph import StateGraph, END  # type: ignore
 except Exception as e:  # pragma: no cover
-    raise RuntimeError("langgraph must be installed to use threat_graph") from e
+    raise RuntimeError("langgraph must be installed to use impact_graph") from e
 
 logger = logging.getLogger(__name__)
 
+# Optional LLM (LangChain OpenAI); runtime-safe fallbacks
+try:
+    from langchain_openai import ChatOpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    ChatOpenAI = None  # type: ignore
+
 
 # -----------------------------------------------------------------------------
-# State & payloads
+# State
 # -----------------------------------------------------------------------------
 
-Intent = Literal["list", "get", "set", "bulk_set", "explain", "upsert"]
+Intent = Literal["list", "get", "set", "bulk_set", "explain"]
 
 
-class RiskItem(BaseModel):
-    threat_code: str
-    probability: int = Field(ge=0, le=4)
+class ImpactItem(BaseModel):
+    impact_code: str
+    level: int = Field(ge=0, le=4)
     note: Optional[str] = None
 
 
-class RiskSetPayload(BaseModel):
+class ImpactSetPayload(BaseModel):
     asset_id: str
-    items: list[RiskItem]
+    items: list[ImpactItem]
 
 
-class RiskBulkPayload(BaseModel):
-    entries: list[RiskSetPayload]
+class ImpactBulkPayload(BaseModel):
+    entries: list[ImpactSetPayload]
 
 
-class UpsertThreatPayload(BaseModel):
-    threat_code: str
-    name: Optional[str] = None
-    category: Optional[str] = None
-    notes: Optional[str] = None
-
-
-class ThreatState(BaseModel):
+class ImpactState(BaseModel):
     # Routing context / inputs
     org_id: str
-    active_tab: str = Field(default="threats")
+    active_tab: str = Field(default="impacts")
     message: Optional[str] = None
-    selection: Optional[dict] = None  # e.g., {"asset_id":"...", "asset_type":"..."}
+    selection: Optional[dict] = None  # optionally {"asset_id": "..."}
     user_id: Optional[str] = None
     locale: Optional[str] = None
 
-    # Wizard context (consumed in write paths)
-    organization_profile: Optional[dict] = None
-    services: Optional[list[dict]] = None
-    existing_assets: Optional[list[dict]] = None
-    website_content: Optional[dict] = None
-    number_of_assets: Optional[int] = None
-    language: Optional[str] = None
-
     # Structured inputs (preferred)
     action: Optional[Intent] = None
-    set_payload: Optional[RiskSetPayload] = None
-    bulk_payload: Optional[RiskBulkPayload] = None
-    upsert_payload: Optional[UpsertThreatPayload] = None
+    set_payload: Optional[ImpactSetPayload] = None
+    bulk_payload: Optional[ImpactBulkPayload] = None
     question: Optional[str] = None  # for explain
+
+    # NEW: generic payload intended for unified DTO validation (AssetImpact)
+    payload: Optional[dict] = None
 
     # Working fields
     intent: Optional[Intent] = None
     change: Optional[dict] = None
     result: Optional[dict] = None
-    touched_asset_ids: Optional[List[str]] = None  # pro bulk hint po submitu
+    touched_asset_ids: Optional[List[str]] = None
 
 
 # -----------------------------------------------------------------------------
@@ -124,14 +137,18 @@ def _ui_response(text: str, *, extra: Optional[dict] = None) -> dict:
     return base
 
 
+_LEVEL_VALUE = [5, 20, 50, 70, 100]  # index 0..4 → display/value scale
+
+
 def _build_changeset(*, kind: str, org_id: str, user_id: Optional[str], data: dict) -> dict:
     cid = str(uuid.uuid4())
     audit = {
         "source": "AI",
-        "tags": ["AI", "threat-graph", f"batch-{cid[:8]}"],
+        "tags": ["AI", "impact-graph", f"batch-{cid[:8]}"],
         "user_id": user_id,
         "timestamp": _now_iso(),
     }
+    # include idempotency key directly in the payload for file-mode naming, too
     return {
         "id": cid,
         "idempotency_key": cid,
@@ -144,7 +161,7 @@ def _build_changeset(*, kind: str, org_id: str, user_id: Optional[str], data: di
 
 async def _asubmit_changeset_or_outbox(payload: dict, deps: GraphDeps) -> None:
     """
-    Zkusí Tazila klienta (async/sync). Když není / selže → outbox JSON.
+    Try Tazila client (async/sync). If not present or fails, dump JSON into outbox.
     Outbox path priority:
       settings.tazila.outbox_path → env WORKSHOPS_AI_TAZILA__OUTBOX_PATH → /app/workshops_ai/data/outbox
     """
@@ -191,11 +208,13 @@ async def _asubmit_changeset_or_outbox(payload: dict, deps: GraphDeps) -> None:
         logger.warning("Outbox write failed: %s", e)
 
 
-async def _maybe_mem_set(deps: GraphDeps, key: string, value: Any, *, ttl_sec: Optional[int] = None) -> None:
+async def _maybe_mem_set(deps: GraphDeps, key: str, value: Any, *, ttl_sec: Optional[int] = None) -> None:
     """
-    Best-effort zápis do memory kompatibilní se sync i async implementacemi, s/bez TTL.
-    Použijeme "jednodílný" klíč (včetně org_id v prefixu), abychom neřešili signatury typu
-    memory_set(org_id, key, value) vs memory.set(key, value).
+    Best-effort memory write (supports sync/async impl and optional TTL).
+    Tries:
+      1) deps.memory_set(key, value, ttl_sec=...) → on TypeError retries without TTL
+      2) deps.memory.set(key, value, ttl_sec=...) → on TypeError retries without TTL
+    Silently ignores failures.
     """
     candidates = []
     setter = getattr(deps, "memory_set", None)
@@ -208,12 +227,14 @@ async def _maybe_mem_set(deps: GraphDeps, key: string, value: Any, *, ttl_sec: O
             candidates.append(mset)
 
     for fn in candidates:
+        # with TTL
         try:
             res = fn(key, value, ttl_sec=ttl_sec) if ttl_sec is not None else fn(key, value)
             if asyncio.iscoroutine(res):
                 await res
             return
         except TypeError:
+            # try without TTL
             try:
                 res = fn(key, value)
                 if asyncio.iscoroutine(res):
@@ -223,59 +244,41 @@ async def _maybe_mem_set(deps: GraphDeps, key: string, value: Any, *, ttl_sec: O
                 continue
         except Exception:
             continue
-    # ignore
+    # give up silently
+
+
+def _get_llm_from_deps(deps: GraphDeps):
+    llm = getattr(deps, "llm", None)
+    if llm is not None:
+        return llm
+    if ChatOpenAI is None:
+        return None
+    # Safe default
+    return ChatOpenAI(model="gpt-4o-mini", temperature=0.1, timeout=12, max_retries=1)  # type: ignore[call-arg]
 
 
 # -----------------------------------------------------------------------------
-# WS emit helpers
+# Intent
 # -----------------------------------------------------------------------------
 
-async def _emit_risk_ws(ws_hub: Any, payload: dict) -> None:
-    try:
-        if hasattr(ws_hub, "aemit_risk_set_probability"):
-            await ws_hub.aemit_risk_set_probability(payload)  # type: ignore[attr-defined]
-        elif hasattr(ws_hub, "emit"):
-            ws_hub.emit("risk.updated", payload)
-        elif hasattr(ws_hub, "broadcast"):
-            ws_hub.broadcast("risk.updated", payload)
-    except Exception as e:  # pragma: no cover
-        logger.warning("WS risk emit failed: %s", e)
-
-
-async def _emit_threat_upsert_ws(ws_hub: Any, payload: dict) -> None:
-    try:
-        if hasattr(ws_hub, "aemit_threat_upserted"):
-            await ws_hub.aemit_threat_upserted(payload)  # type: ignore[attr-defined]
-        elif hasattr(ws_hub, "emit"):
-            ws_hub.emit("threat.upserted", payload)
-        elif hasattr(ws_hub, "broadcast"):
-            ws_hub.broadcast("threat.upserted", payload)
-    except Exception as e:  # pragma: no cover
-        logger.warning("WS threat upsert emit failed: %s", e)
-
-
-# -----------------------------------------------------------------------------
-# Intent inference
-# -----------------------------------------------------------------------------
-
-def _infer_intent(state: ThreatState) -> ThreatState:
-    if state.action in ("list", "get", "set", "bulk_set", "explain", "upsert"):
+def _infer_intent(state: ImpactState) -> ImpactState:
+    if state.action in ("list", "get", "set", "bulk_set", "explain"):
         state.intent = cast(Intent, state.action)
         return state
 
     text = (state.message or "").lower()
-    if re.search(r"\b(upsert|create custom threat|new threat)\b", text):
-        state.intent = "upsert"
-        return state
     if re.search(r"\b(explain|why|context|rag)\b", text):
         state.intent = "explain"
         return state
+
     if re.search(r"\b(bulk|multiple|all assets)\b", text):
         state.intent = "bulk_set"
         return state
-    if re.search(r"\b(set|update|prob(ability)?|risk)\b", text):
+
+    if re.search(r"\b(set|update|level|impact)\b", text):
         state.intent = "set"
         return state
+
     if (state.selection or {}).get("asset_id") or re.search(r"\b(get|show|detail)\b", text):
         state.intent = "get"
         return state
@@ -285,125 +288,313 @@ def _infer_intent(state: ThreatState) -> ThreatState:
 
 
 # -----------------------------------------------------------------------------
+# NLU (optional) — parse free text into set/bulk_set payloads
+# -----------------------------------------------------------------------------
+
+_NORM_LEVEL_RX = re.compile(r"\b([cia]|confidentiality|integrity|availability|avail)\b[^0-9-]*([0-4])\b", re.I)
+_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", re.I)
+_QUOTES_RX = re.compile(r"[\"“”']\s*([^\"“”']+?)\s*[\"“”']")  # reserved if you later map names→IDs
+
+def _norm_txt(s: str) -> str:
+    return unicodedata.normalize("NFKD", (s or "")).encode("ascii", "ignore").decode("ascii").lower()
+
+
+def _derive_set_from_text(message: str, selection_asset_id: Optional[str]) -> Optional[ImpactSetPayload]:
+    """
+    Regex-only fast path (no LLM). Requires an asset_id from selection or text.
+    Examples that work:
+      - "set C=3 and A=2 for 7d0e... asset"
+      - "C2 I1 A0" (with selected asset)
+    """
+    t = _norm_txt(message)
+    asset_id = selection_asset_id or (_UUID_RE.search(message).group(0) if _UUID_RE.search(message) else None)
+    if not asset_id:
+        return None
+
+    levels: list[ImpactItem] = []
+    for m in _NORM_LEVEL_RX.finditer(t):
+        dim, val = m.group(1).lower(), int(m.group(2))
+        code = "C" if dim.startswith("c") else "I" if dim.startswith("i") else "A"
+        levels.append(ImpactItem(impact_code=code, level=val))
+    if not levels:
+        return None
+    return ImpactSetPayload(asset_id=asset_id, items=levels)
+
+
+async def _nlu_impacts(deps: GraphDeps, state: ImpactState) -> ImpactState:
+    """
+    Best-effort NLU that fills set_payload / bulk_payload from natural language.
+    - First tries regex-only extraction for common "C/I/A=<0..4>" patterns.
+    - If still empty and an LLM is available, asks it for STRICT JSON.
+    - Never invents asset IDs; selection.asset_id or explicit UUID must be present.
+    """
+    raw = (state.message or "").strip()
+    if not raw:
+        return state
+
+    selection_id = (state.selection or {}).get("asset_id")
+
+    # 1) Fast regex-based extraction (no LLM dependency)
+    guess = _derive_set_from_text(raw, selection_id)
+    if guess and not state.set_payload:
+        state.set_payload = guess
+        if not state.action:
+            state.action = cast(Intent, "set")
+
+    # 2) LLM-backed parsing if still nothing
+    if not state.set_payload and not state.bulk_payload:
+        llm = _get_llm_from_deps(deps)
+        if llm is not None:
+            system = (
+                "You are a strict NLU for an 'impacts' assistant. "
+                "Extract intent and slots from any language (CS/SK/EN; tolerate typos). "
+                "Return ONLY JSON with these optional fields: "
+                "{"
+                "  action: one of [list,get,set,bulk_set,explain],"
+                "  selection: {asset_id},"
+                "  set: {asset_id, items:[{impact_code: 'C'|'I'|'A', level: 0..4, note?: string}]},"
+                "  bulk: {entries:[{asset_id, items:[{impact_code, level, note?}]}]}"
+                "}"
+                "Rules:\n"
+                "- NEVER invent asset IDs.\n"
+                "- If selection.asset_id is provided, you MAY copy it into set.asset_id.\n"
+                "- If unsure, leave fields null. Output STRICT JSON, no prose."
+            )
+            human = {
+                "message": raw,
+                "selection": {"asset_id": selection_id} if selection_id else None,
+            }
+            try:
+                from langchain_core.messages import SystemMessage, HumanMessage  # type: ignore
+                resp = await llm.ainvoke([SystemMessage(content=system), HumanMessage(content=json.dumps(human))])  # type: ignore[arg-type]
+                txt = (getattr(resp, "content", None) or "").strip()
+                i, j = txt.find("{"), txt.rfind("}")
+                data = json.loads(txt[i:j + 1] if i != -1 and j != -1 else txt)
+
+                action = data.get("action")
+                sel = data.get("selection") or {}
+                if sel.get("asset_id") and not selection_id:
+                    selection_id = sel.get("asset_id")
+
+                if data.get("set"):
+                    s = data["set"]
+                    aid = s.get("asset_id") or selection_id
+                    items = [ImpactItem(**it) for it in (s.get("items") or [])]
+                    if aid and items:
+                        state.set_payload = ImpactSetPayload(asset_id=str(aid), items=items)
+                        state.action = cast(Intent, "set")
+                elif data.get("bulk"):
+                    entries = []
+                    for e in (data["bulk"].get("entries") or []):
+                        aid = e.get("asset_id")
+                        items = [ImpactItem(**it) for it in (e.get("items") or [])]
+                        if aid and items:
+                            entries.append(ImpactSetPayload(asset_id=str(aid), items=items))
+                    if entries:
+                        state.bulk_payload = ImpactBulkPayload(entries=entries)
+                        state.action = cast(Intent, "bulk_set")
+                elif action in ("list", "get", "explain"):
+                    state.action = cast(Intent, action)
+            except Exception as e:
+                logger.info("IMPACTS NLU LLM failed: %s", e)
+
+    return state
+
+
+# -----------------------------------------------------------------------------
 # Read-only nodes
 # -----------------------------------------------------------------------------
 
-def _list_threats(deps: GraphDeps):
-    def _inner(state: ThreatState) -> ThreatState:
-        apply_asset_type = (state.selection or {}).get("asset_type")
+def _list_impacts(deps: GraphDeps):
+    def _inner(state: ImpactState) -> ImpactState:
         try:
-            threats = deps.backend_port.list_threats(apply_asset_type=apply_asset_type)
+            impacts = deps.backend_port.list_impacts()
         except Exception as e:
-            state.result = _ui_response(f"Failed to read threat catalog: {e}")
+            state.result = _ui_response(f"Failed to read impact catalog: {e}")
             return state
 
-        if not isinstance(threats, list):
-            state.result = _ui_response("Threat catalog is unavailable.")
+        if not isinstance(impacts, list):
+            state.result = _ui_response("Impact catalog is unavailable.")
             return state
 
-        hdr = f"Threat catalog ({len(threats)})"
-        if apply_asset_type:
-            hdr += f" filtered by asset_type='{apply_asset_type}'"
-        lines = [hdr + ":"]
-        for row in threats[:30]:
-            code = row.get("threat_code") or row.get("EN Code") or row.get("code") or "?"
-            name = row.get("EN Name") or row.get("name") or row.get("Threat") or ""
-            cat = row.get("Threat category") or row.get("category") or ""
-            lines.append(f"- {code}: {name}" + (f" [{cat}]" if cat else ""))
+        lines = [f"Impact catalog ({len(impacts)}):"]
+        for row in impacts[:20]:
+            code = row.get("impact_code") or row.get("code") or row.get("EN Code") or "?"
+            name = row.get("EN Name") or row.get("name") or row.get("Impact") or ""
+            lines.append(f"- {code}: {name}")
         state.result = _ui_response("\n".join(lines))
         return state
     return _inner
 
 
-def _asset_get_risks(deps: GraphDeps):
-    def _inner(state: ThreatState) -> ThreatState:
+def _asset_get_impacts(deps: GraphDeps):
+    def _inner(state: ImpactState) -> ImpactState:
         asset_id = (state.selection or {}).get("asset_id")
         if not asset_id:
             state.result = _ui_response("No asset selected. Provide selection.asset_id.")
             return state
 
         try:
-            risks = deps.backend_port.asset_get_risks(asset_id)
+            levels = deps.backend_port.asset_get_impacts(asset_id)
         except Exception as e:
-            state.result = _ui_response(f"Failed to read risks for '{asset_id}': {e}")
+            state.result = _ui_response(f"Failed to read impacts for '{asset_id}': {e}")
             return state
 
-        if not isinstance(risks, list):
-            state.result = _ui_response(f"No risk data for asset '{asset_id}'.")
+        if not isinstance(levels, list):
+            state.result = _ui_response(f"No impact data for asset '{asset_id}'.")
             return state
 
-        summary = [f"Risks for {asset_id} ({len(risks)} items):"]
-        for it in risks[:30]:
-            code = it.get("threat_code") or it.get("code")
-            p = it.get("probability")
-            summary.append(f"- {code}: P={p}")
-        state.result = _ui_response("\n".join(summary), extra={"asset_id": asset_id, "risks": risks})
+        summary = [f"Impacts for {asset_id} ({len(levels)} items):"]
+        for it in levels[:30]:
+            code = it.get("impact_code") or it.get("code")
+            lvl = it.get("level")
+            summary.append(f"- {code}: {lvl}")
+        state.result = _ui_response("\n".join(summary), extra={"asset_id": asset_id, "impacts": levels})
         return state
     return _inner
 
 
 # -----------------------------------------------------------------------------
-# Write nodes — SEND-NOW
+# Write nodes — SEND-NOW (set / bulk_set)
 # -----------------------------------------------------------------------------
 
-def _set_risk_probability(deps: GraphDeps):
-    async def _inner(state: ThreatState) -> ThreatState:
-        payload = state.set_payload
-        if payload is None:
-            update = getattr(state, "update", None) or {}
+_CODE_TO_NAME: Dict[str, str] = {
+    "C": "Confidentiality",
+    "I": "Integrity",
+    "A": "Availability",
+}
+
+def _adapt_set_payload_to_dto(payload: ImpactSetPayload, *, asset_name: Optional[str] = None) -> AssetImpact:
+    """
+    Minimal adapter for backward compatibility when callers still send ImpactSetPayload.
+    Builds an AssetImpact DTO so the rest of the write path stays unified.
+    """
+    impacts = [
+        {"impactName": _CODE_TO_NAME.get(it.impact_code, it.impact_code), "impactLevel": int(it.level)}
+        for it in payload.items
+    ]
+    dto_raw = {
+        "assetId": payload.asset_id,
+        "assetName": asset_name,
+        "impacts": impacts,
+    }
+    return AssetImpact.model_validate(dto_raw)
+
+
+async def _emit_ws_from_dto(dto: AssetImpact, deps: GraphDeps, org_id: str, actor: Optional[str]) -> None:
+    """
+    Prefer a single list-shaped event via aemit_impact_set_event(dto-based payload).
+    If not available, fall back to per-item aemit_impact_set_level to preserve UI compatibility.
+    """
+    hub = getattr(deps, "ws_hub", None)
+    if hub is None:
+        return
+
+    # 1) Try the list-shaped emitter expected by new UI/event contracts
+    ws_batch = map_asset_impact_to_ws_event(dto)
+    if hasattr(hub, "aemit_impact_set_event"):
+        try:
+            await hub.aemit_impact_set_event(ws_batch)  # type: ignore[attr-defined]
+            return
+        except Exception as e:  # pragma: no cover
+            logger.warning("WS batch emit failed, falling back to per-item: %s", e)
+
+    # 2) Fallback: emit per item (legacy UI still supported)
+    if hasattr(hub, "aemit_impact_set_level"):
+        try:
+            asset_id = str(getattr(dto, "assetId", None) or "")
+            for it in (dto.impacts or []):
+                level_idx = max(0, min(4, int(it.impactLevel)))
+                event = {
+                    "event": "impact.set_level",
+                    "org_id": org_id,
+                    "asset_id": asset_id,
+                    "impact_code": it.impactName,
+                    "level_index": level_idx,
+                    "level_value": _LEVEL_VALUE[level_idx],
+                    "note": getattr(it, "note", None),
+                    "actor": actor,
+                    "ts": _now_iso(),
+                }
+                await hub.aemit_impact_set_level(event)  # type: ignore[attr-defined]
+        except Exception as e:  # pragma: no cover
+            logger.warning("WS per-item emit failed: %s", e)
+
+
+def _set_impact_level(deps: GraphDeps):
+    async def _inner(state: ImpactState) -> AssetState:  # type: ignore[name-defined]
+        dto: Optional[AssetImpact] = None
+
+        # 1) Preferred: validate the provided unified DTO payload
+        if state.payload:
             try:
-                items = [RiskItem(**it) for it in (update.get("items") or [])]
-                payload = RiskSetPayload(
-                    asset_id=update.get("asset_id") or (state.selection or {}).get("asset_id"),
-                    items=items,
-                )
+                dto = AssetImpact.model_validate(state.payload)
             except Exception as e:
-                state.result = _ui_response(f"Invalid set payload: {e}")
+                state.result = _ui_response(f"Invalid AssetImpact payload: {e}")
                 return state
 
-        if not payload or not payload.asset_id or not payload.items:
-            state.result = _ui_response("Missing set payload (asset_id and items[threat_code, probability]).")
+        # 2) Back-compat: build DTO from legacy ImpactSetPayload (if present)
+        if dto is None:
+            payload = state.set_payload
+            if payload is None:
+                # Try to assemble from a generic 'update' dict if caller used that
+                update = getattr(state, "update", None) or {}
+                try:
+                    payload = ImpactSetPayload(
+                        asset_id=update.get("asset_id") or (state.selection or {}).get("asset_id"),
+                        items=[ImpactItem(**it) for it in (update.get("items") or [])],
+                    )
+                except Exception as e:
+                    state.result = _ui_response(f"Invalid set payload: {e}")
+                    return state
+
+            if not payload or not payload.asset_id or not payload.items:
+                state.result = _ui_response("Missing set payload (asset_id and items[impact_code, level]).")
+                return state
+
+            # Fetch asset name for nicer DTO (optional)
+            asset_name = None
+            try:
+                asset = deps.backend_port.asset_get(payload.asset_id)
+                asset_name = asset.get("name") if isinstance(asset, dict) else None
+            except Exception:
+                pass
+
+            dto = _adapt_set_payload_to_dto(payload, asset_name=asset_name)
+
+        # Emit WS event(s) using the new mapper shape (with legacy fallback)
+        try:
+            await _emit_ws_from_dto(dto, deps, org_id=state.org_id, actor=state.user_id)
+        except Exception as e:  # pragma: no cover
+            logger.warning("WS emit failed: %s", e)
+
+        # Build changeset via mapper (keeps runtime submit contract)
+        try:
+            changeset = map_asset_impact_to_changeset(dto, org_id=state.org_id)
+        except Exception as e:
+            state.result = _ui_response(f"Failed to build ChangeSet: {e}")
             return state
 
-        for it in payload.items:
-            ws_payload = {
-                "org_id": state.org_id,
-                "asset_id": payload.asset_id,
-                "threat_code": it.threat_code,
-                "probability": it.probability,
-                "actor": state.user_id,
-                "ts": _now_iso(),
-            }
-            await _emit_risk_ws(deps.ws_hub, ws_payload)
-
-        change = _build_changeset(
-            kind="risk.set_probabilities",
-            org_id=state.org_id,
-            user_id=state.user_id,
-            data={
-                "asset_id": payload.asset_id,
-                "items": [it.model_dump() for it in payload.items],
-                "context": _context_from_wizard(state),
-            },
-        )
-        state.change = change
-        state.touched_asset_ids = [payload.asset_id]
+        state.change = changeset
+        # remember touched asset for small UX aids
+        aid = getattr(dto, "assetId", None)
+        state.touched_asset_ids = [str(aid)] if aid else None
         return state
     return _inner
 
 
-def _bulk_set_risk_probabilities(deps: GraphDeps):
-    async def _inner(state: ThreatState) -> ThreatState:
+def _bulk_set_impact_levels(deps: GraphDeps):
+    async def _inner(state: ImpactState) -> ImpactState:
         bulk = state.bulk_payload
         if bulk is None:
             raw = getattr(state, "bulk", None) or {}
             entries = raw.get("entries") or []
             try:
-                bulk = RiskBulkPayload(
+                bulk = ImpactBulkPayload(
                     entries=[
-                        RiskSetPayload(
+                        ImpactSetPayload(
                             asset_id=e.get("asset_id"),
-                            items=[RiskItem(**it) for it in (e.get("items") or [])],
+                            items=[ImpactItem(**it) for it in (e.get("items") or [])],
                         )
                         for e in entries
                     ]
@@ -416,111 +607,87 @@ def _bulk_set_risk_probabilities(deps: GraphDeps):
             state.result = _ui_response("Missing bulk payload entries.")
             return state
 
-        # Emit WS pro každý item
+        # Emit per item per asset (legacy-compatible) — we keep this path simple
         for entry in bulk.entries:
             for it in entry.items:
-                ws_payload = {
-                    "org_id": state.org_id,
-                    "asset_id": entry.asset_id,
-                    "threat_code": it.threat_code,
-                    "probability": it.probability,
-                    "actor": state.user_id,
-                    "ts": _now_iso(),
-                }
-                await _emit_risk_ws(deps.ws_hub, ws_payload)
+                try:
+                    hub = getattr(deps, "ws_hub", None)
+                    if hub and hasattr(hub, "aemit_impact_set_level"):
+                        level_idx = max(0, min(4, int(it.level)))
+                        event = {
+                            "event": "impact.set_level",
+                            "org_id": state.org_id,
+                            "asset_id": entry.asset_id,
+                            "impact_code": it.impact_code,
+                            "level_index": level_idx,
+                            "level_value": _LEVEL_VALUE[level_idx],
+                            "note": it.note,
+                            "actor": state.user_id,
+                            "ts": _now_iso(),
+                        }
+                        await hub.aemit_impact_set_level(event)  # type: ignore[attr-defined]
+                except Exception as e:  # pragma: no cover
+                    logger.warning("WS emit failed for %s/%s: %s", entry.asset_id, it.impact_code, e)
 
-        # Připrav ChangeSet
         change = _build_changeset(
-            kind="risk.bulk_set_probabilities",
+            kind="impact.bulk_set_levels",
             org_id=state.org_id,
             user_id=state.user_id,
             data={
                 "entries": [
                     {"asset_id": e.asset_id, "items": [it.model_dump() for it in e.items]}
                     for e in bulk.entries
-                ],
-                "context": _context_from_wizard(state),
+                ]
             },
         )
         state.change = change
-
-        # Ulož si seznam dotčených asset_id pro pozdější hint
-        seen: set[str] = set()
-        touched: list[str] = []
+        seen = set()
+        touched: List[str] = []
         for e in bulk.entries:
-            if e.asset_id and e.asset_id not in seen:
-                seen.add(e.asset_id)
-                touched.append(e.asset_id)
+            aid = str(e.asset_id)
+            if aid not in seen:
+                seen.add(aid)
+                touched.append(aid)
         state.touched_asset_ids = touched
         return state
     return _inner
 
 
-def _upsert_threat(deps: GraphDeps):
-    async def _inner(state: ThreatState) -> ThreatState:
-        payload = state.upsert_payload
-        if payload is None:
-            raw = getattr(state, "threat", None) or {}
-            try:
-                payload = UpsertThreatPayload(**raw)
-            except Exception as e:
-                state.result = _ui_response(f"Invalid upsert payload: {e}")
-                return state
-
-        if not payload or not payload.threat_code:
-            state.result = _ui_response("Missing upsert_payload.threat_code.")
-            return state
-
-        await _emit_threat_upsert_ws(deps.ws_hub, {"org_id": state.org_id, **payload.model_dump()})
-
-        change = _build_changeset(
-            kind="threat.upsert",
-            org_id=state.org_id,
-            user_id=state.user_id,
-            data={**payload.model_dump(), "context": _context_from_wizard(state)},
-        )
-        state.change = change
-        return state
-    return _inner
-
-
-async def _submit_changeset_async(state: ThreatState, deps: GraphDeps) -> ThreatState:
+async def _submit_changeset_async(state: ImpactState, deps: GraphDeps) -> ImpactState:
     if state.change:
         await _asubmit_changeset_or_outbox(state.change, deps)
+        msg = "Impact levels submitted." if state.intent in ("set", "bulk_set") else "Change submitted."
+        extra = {"changeset_id": state.change.get("id")}
+        state.result = _ui_response(msg, extra=extra)
 
-        if state.intent in ("set", "bulk_set"):
-            msg = "Risk probabilities submitted."
-        elif state.intent == "upsert":
-            msg = "Threat upsert submitted."
-        else:
-            msg = "Change submitted."
-
-        state.result = _ui_response(msg, extra={"changeset_id": state.change.get("id")})
-
-        # Best-effort hint po bulk submitu
+        # Best-effort hint after bulk submit (store last touched asset_ids list)
         try:
             if state.intent == "bulk_set" and state.touched_asset_ids:
-                key = f"{state.org_id}:threats.last_touched_asset_ids"
+                key = f"{state.org_id}:impacts.last_touched_asset_ids"
                 val = json.dumps(list(state.touched_asset_ids), separators=(",", ":"))
                 await _maybe_mem_set(deps, key, val, ttl_sec=24 * 60 * 60)
-        except Exception:
-            pass
+        except Exception as e:  # best-effort
+            logger.info("Failed to remember impacts.last_touched_asset_ids: %s", e)
     else:
         state.result = _ui_response("Nothing to submit.")
     return state
 
 
 # -----------------------------------------------------------------------------
-# Explain (RAG with LLM fallback)
+# LLM fallback helpers (for explain)
 # -----------------------------------------------------------------------------
 
 def _build_llm_prompt(question: str, *, locale: Optional[str]) -> str:
-    lang = (locale or "en").lower()
+    lang = (locale or "").lower()
     return (
-        "You are a cybersecurity assistant focused on threats and risk probabilities. "
-        f"Language hint: {lang}. Provide a concise, actionable explanation (≤120 words). "
-        "When enterprise corpus is unavailable, rely on widely-accepted best practices.\n"
-        f"Question:\n{question}\nAnswer:"
+        "You are a cybersecurity assistant specializing in business impact analysis (CIA: Confidentiality, "
+        "Integrity, Availability). The user asked a question about 'impacts'. "
+        f"Language hint: {lang or 'en'}. "
+        "Provide a concise, actionable explanation (≤120 words). "
+        "If enterprise documents are unavailable, rely on general best-practice knowledge. "
+        "Question:\n"
+        f"{question}\n"
+        "Answer:"
     )
 
 
@@ -535,6 +702,7 @@ async def _call_llm(llm: Any, prompt: str) -> Optional[str]:
             out = await maybe if asyncio.iscoroutine(maybe) else maybe
         else:
             return None
+
         if out is None:
             return None
         if isinstance(out, str):
@@ -552,15 +720,19 @@ async def _call_llm(llm: Any, prompt: str) -> Optional[str]:
         return None
 
 
-async def _explain_threats_async(state: ThreatState, deps: GraphDeps) -> ThreatState:
+# -----------------------------------------------------------------------------
+# Explain (RAG) — read-only helper with LLM fallback
+# -----------------------------------------------------------------------------
+
+async def _explain_impacts_async(state: ImpactState, deps: GraphDeps) -> ImpactState:
     q = (state.question or state.message or "").strip()
     if not q:
-        state.result = _ui_response("Provide a question (state.question or message) to explain threats/risks.")
+        state.result = _ui_response("Provide a question (state.question or message) to explain impacts.")
         return state
 
     retriever = None
     try:
-        retriever = deps.make_retriever(state.org_id, "threats")
+        retriever = deps.make_retriever(state.org_id, "impacts")
     except Exception as e:
         logger.info("RAG retriever unavailable: %s", e)
 
@@ -571,8 +743,8 @@ async def _explain_threats_async(state: ThreatState, deps: GraphDeps) -> ThreatS
             else:
                 docs = retriever.search(q, k=5)  # type: ignore[attr-defined]
         except Exception as e:
-            logger.info("RAG search failed, trying LLM fallback: %s", e)
             docs = []
+            logger.info("RAG search failed, will try LLM fallback: %s", e)
 
         snippets: list[str] = []
         for d in docs or []:
@@ -586,16 +758,20 @@ async def _explain_threats_async(state: ThreatState, deps: GraphDeps) -> ThreatS
             msg = "Context for your question (top snippets):\n" + "\n".join(snippets[:5])
             state.result = _ui_response(msg, extra={"question": q, "snippets": snippets[:5]})
             return state
+    else:
+        logger.info("RAG retriever not configured; using LLM fallback if available.")
 
     llm = getattr(deps, "llm", None)
     if llm:
-        prompt = _build_llm_prompt(q, locale=state.locale or state.language)
+        prompt = _build_llm_prompt(q, locale=state.locale)
         text = await _call_llm(llm, prompt)
         if text:
             state.result = _ui_response(text, extra={"question": q, "source": "llm_fallback"})
             return state
 
-    state.result = _ui_response("No contextual corpus available and LLM fallback did not return an answer.")
+    state.result = _ui_response(
+        "No contextual corpus is available right now and LLM fallback did not return an answer."
+    )
     return state
 
 
@@ -604,66 +780,65 @@ async def _explain_threats_async(state: ThreatState, deps: GraphDeps) -> ThreatS
 # -----------------------------------------------------------------------------
 
 def create_graph(deps: GraphDeps):
-    graph = StateGraph(ThreatState)
+    graph = StateGraph(ImpactState)
 
     # Nodes
-    graph.add_node("route", _infer_intent)
-    graph.add_node("list_threats", _list_threats(deps))
-    graph.add_node("asset_get_risks", _asset_get_risks(deps))
-    graph.add_node("set_risk_probability", _set_risk_probability(deps))
-    graph.add_node("bulk_set_risk_probabilities", _bulk_set_risk_probabilities(deps))
-    graph.add_node("upsert_threat", _upsert_threat(deps))
+    async def _nlu_node(state: ImpactState) -> ImpactState:
+        return await _nlu_impacts(deps, state)
 
-    async def _submit_node(state: ThreatState) -> ThreatState:
-        # Submit ChangeSet a případně ulož hint pro bulk.
+    graph.add_node("nlu_impacts", _nlu_node)
+    graph.add_node("route", _infer_intent)
+    graph.add_node("list_impacts", _list_impacts(deps))
+    graph.add_node("asset_get_impacts", _asset_get_impacts(deps))
+    graph.add_node("set_impact_level", _set_impact_level(deps))
+    graph.add_node("bulk_set_impact_levels", _bulk_set_impact_levels(deps))
+
+    async def _submit_node(state: ImpactState) -> ImpactState:
         return await _submit_changeset_async(state, deps)
 
-    async def _explain_node(state: ThreatState) -> ThreatState:
-        return await _explain_threats_async(state, deps)
+    async def _explain_node(state: ImpactState) -> ImpactState:
+        return await _explain_impacts_async(state, deps)
 
     graph.add_node("submit_changeset", _submit_node)
-    graph.add_node("explain_threats", _explain_node)
+    graph.add_node("explain_impacts", _explain_node)
 
     # Entry & routing
-    graph.set_entry_point("route")
+    graph.set_entry_point("nlu_impacts")
+    graph.add_edge("nlu_impacts", "route")
 
-    def _route(state: ThreatState) -> str:
+    def _route(state: ImpactState) -> str:
         intent = state.intent or "list"
         if intent == "list":
-            return "list_threats"
+            return "list_impacts"
         if intent == "get":
-            return "asset_get_risks"
+            return "asset_get_impacts"
         if intent == "set":
-            return "set_risk_probability"
+            return "set_impact_level"
         if intent == "bulk_set":
-            return "bulk_set_risk_probabilities"
-        if intent == "upsert":
-            return "upsert_threat"
+            return "bulk_set_impact_levels"
         if intent == "explain":
-            return "explain_threats"
-        return "list_threats"
+            return "explain_impacts"
+        return "list_impacts"
 
     graph.add_conditional_edges(
         "route",
         _route,
         {
-            "list_threats": "list_threats",
-            "asset_get_risks": "asset_get_risks",
-            "set_risk_probability": "set_risk_probability",
-            "bulk_set_risk_probabilities": "bulk_set_risk_probabilities",
-            "upsert_threat": "upsert_threat",
-            "explain_threats": "explain_threats",
+            "list_impacts": "list_impacts",
+            "asset_get_impacts": "asset_get_impacts",
+            "set_impact_level": "set_impact_level",
+            "bulk_set_impact_levels": "bulk_set_impact_levels",
+            "explain_impacts": "explain_impacts",
         },
     )
 
     # Write paths → submit; read/explain paths → end
-    graph.add_edge("set_risk_probability", "submit_changeset")
-    graph.add_edge("bulk_set_risk_probabilities", "submit_changeset")
-    graph.add_edge("upsert_threat", "submit_changeset")
+    graph.add_edge("set_impact_level", "submit_changeset")
+    graph.add_edge("bulk_set_impact_levels", "submit_changeset")
 
-    graph.add_edge("list_threats", END)
-    graph.add_edge("asset_get_risks", END)
-    graph.add_edge("explain_threats", END)
+    graph.add_edge("list_impacts", END)
+    graph.add_edge("asset_get_impacts", END)
+    graph.add_edge("explain_impacts", END)
     graph.add_edge("submit_changeset", END)
 
     # Compile with injected checkpointer for per-org/tab history

@@ -7,15 +7,19 @@
 # - Fail-closed (extra fields are forbidden).
 # - Canonical EN codes for tabs; selection is per-tab (extensible).
 # - Response staging object mirrors the global “staging → diff → explicit commit” rule.
-# - Strings are stripped; messages are non-empty, trimmed.
+# - Strings are stripped; messages can be strings OR JSON DTO dumps.
 # - `policy.emit_changes_enabled` is preserved end-to-end.
 # - `locale` is accepted (alongside `language`) to align with telemetry/manager usage.
 # - Optional `history_token` allows clients to resume a LangGraph thread (checkpoint).
+#
+# Notes
+# - Legacy local OrganizationProfile/ServiceItem models were removed to prevent drift.
+#   We import canonical DTOs from `workshops_ai.api.schema` instead.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, Union
 from uuid import UUID
 
 from pydantic import (
@@ -26,11 +30,15 @@ from pydantic import (
     StrictStr,
     HttpUrl,
     field_validator,
+    ConfigDict,
 )
-from pydantic.config import ConfigDict
 
 # Agent event model used for optional synchronous event echo in UIResponse
 from workshops_ai.models.agent_event import AgentEvent
+
+# Canonical DTOs (deduplicate vs. local copies)
+from workshops_ai.api.schema.organization import Organization as OrganizationProfile
+from workshops_ai.api.schema.service import Service as ServiceItem
 
 # ---------------------------------------------------------------------------
 # Shared / aliases
@@ -38,6 +46,7 @@ from workshops_ai.models.agent_event import AgentEvent
 
 ActiveTab = Literal["assets", "impacts", "threats", "controls"]
 JSONDict = Dict[str, Any]
+MessageItem = Union[StrictStr, JSONDict]  # <-- allow text or DTO dumps
 
 
 # ---------------------------------------------------------------------------
@@ -64,23 +73,6 @@ class PolicyConfig(BaseModel):
     )
 
 
-class OrganizationProfile(BaseModel):
-    """
-    Free-form organization profile. Intentionally allows arbitrary keys so that
-    backend can pass rich org context without schema churn.
-    """
-    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
-
-
-class ServiceItem(BaseModel):
-    """Company service description used to enrich asset proposals."""
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    name: StrictStr
-    description: Optional[StrictStr] = None
-    sector: Optional[StrictStr] = None  # canonicalization is handled by the agent
-
-
 class ExistingAssetIn(BaseModel):
     """
     Pre-existing asset snippet coming from the wizard/back-end, used as context
@@ -91,7 +83,7 @@ class ExistingAssetIn(BaseModel):
     id: Optional[UUID] = None
     name: StrictStr
     description: Optional[StrictStr] = None
-    isPrimary: Optional[bool] = None
+    isPrimary: Optional[StrictBool] = None
     confidentiality: Optional[StrictStr] = None
     integrity: Optional[StrictStr] = None
     availability: Optional[StrictStr] = None
@@ -121,7 +113,11 @@ class UIRequest(BaseModel):
     Everything else is optional here to keep backward compatibility; upstream
     wizard may require session_id/language on its side.
     """
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, validate_assignment=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+        validate_assignment=True,
+    )
 
     org_id: StrictStr = Field(..., min_length=1, description="Organization identifier (tenant).")
     active_tab: ActiveTab = Field(..., description="Current UI tab guiding tool-gating.")
@@ -157,11 +153,11 @@ class UIRequest(BaseModel):
     )
     organization_profile: Optional[OrganizationProfile] = Field(
         default=None,
-        description="Organization profile (free-form).",
+        description="Organization profile (canonical DTO).",
     )
     services: Optional[list[ServiceItem]] = Field(
         default=None,
-        description="List of company services to inform asset proposals.",
+        description="List of company services to inform asset proposals (canonical DTO).",
     )
     existing_assets: Optional[list[ExistingAssetIn]] = Field(
         default=None,
@@ -183,15 +179,20 @@ class UIRequest(BaseModel):
         description="Opaque token to resume a conversation thread/history (checkpointer).",
     )
 
-    @field_validator("message")
+    @field_validator("message", mode="before")
     @classmethod
-    def _message_not_none(cls, v: str) -> str:
+    def _message_not_none(cls, v: Any) -> str:
         # Allow empty string (e.g., pure selection-driven actions), but never None
-        return "" if v is None else v
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        # Hard fail for non-string inputs to preserve StrictStr semantics
+        raise TypeError("message must be a string")
 
-    @field_validator("language", "locale")
+    @field_validator("language", "locale", mode="before")
     @classmethod
-    def _normalize_lang(cls, v: Optional[str]) -> Optional[str]:
+    def _normalize_lang(cls, v: Any) -> Optional[str]:
         return v.strip() if isinstance(v, str) else v
 
 
@@ -229,10 +230,10 @@ class UIResponse(BaseModel):
     """
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, validate_assignment=True)
 
-    messages: list[StrictStr] = Field(
+    messages: list[MessageItem] = Field(
         ...,
         min_length=1,
-        description="Assistant text lines to render in the chat.",
+        description="Assistant lines to render: either strings or JSON DTO dumps.",
     )
     proposals: Optional[JSONDict] = Field(
         default=None,
@@ -253,10 +254,25 @@ class UIResponse(BaseModel):
 
     @field_validator("messages")
     @classmethod
-    def _trim_and_nonempty(cls, v: list[str]) -> list[str]:
-        cleaned = [m.strip() for m in v if isinstance(m, str)]
-        if not cleaned or any(m == "" for m in cleaned):
-            raise ValueError("messages must contain at least one non-empty string")
+    def _validate_messages(cls, v: list[MessageItem]) -> list[MessageItem]:
+        """
+        - For strings: strip and ensure non-empty.
+        - For dicts: accept as-is (DTO dumps).
+        - Ensure at least one item remains after trimming.
+        """
+        cleaned: list[MessageItem] = []
+        for item in v:
+            if isinstance(item, str):
+                s = item.strip()
+                if s:
+                    cleaned.append(s)
+            elif isinstance(item, dict):
+                cleaned.append(item)
+            else:
+                # Should not happen given the union, but be defensive.
+                raise ValueError("messages items must be string or JSON object")
+        if not cleaned:
+            raise ValueError("messages must contain at least one non-empty item")
         return cleaned
 
 
@@ -264,8 +280,8 @@ __all__ = [
     "ActiveTab",
     "Selection",
     "PolicyConfig",
-    "OrganizationProfile",
-    "ServiceItem",
+    "OrganizationProfile",  
+    "ServiceItem",          
     "ExistingAssetIn",
     "WebsitePage",
     "WebsiteContent",

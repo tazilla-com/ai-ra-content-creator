@@ -18,11 +18,24 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from workshops_ai.settings import get_settings
 from workshops_ai.schemas.ui_contract import UIRequest
 from workshops_ai.graph.manager import route_chat
-from workshops_ai.app.services.ws_hub import WsHub  # WS hub for agent broadcasts
 from workshops_ai.app.security import verify_ws_auth  # unified WS auth (API-key/JWT)
 
+# WS Hub (agent → client broadcasts)
+try:
+    from workshops_ai.app.services.ws_hub import WsHub
+except Exception:  # pragma: no cover
+    class WsHub:  # minimal no-op fallback
+        @staticmethod
+        async def register(ws: WebSocket) -> None: ...
+        @staticmethod
+        async def unregister(ws: WebSocket) -> None: ...
+
 # WS rate-limit helper (e.g., Redis-based)
-from workshops_ai.app.middlewares.rate_limit import allow_ws
+try:
+    from workshops_ai.app.middlewares.rate_limit import allow_ws
+except Exception:  # pragma: no cover
+    async def allow_ws(event: str, key: str, per_minute: int) -> bool:
+        return True
 
 # Best-effort request_id getter (HTTP layer populates a ContextVar)
 try:
@@ -38,10 +51,8 @@ ALLOWED_TABS = {"assets", "impacts", "threats"}
 
 # Centralized settings
 _settings = get_settings()
-# WS_EVENT_TIMEOUT_S: int = int(_settings.ws_timeout_sec)
-# ↑ PŮVODNĚ: četlo se z „plochého“ atributu (mimo namespace), což nesedí se settings modelem.
+# Correct namespaced read (previous flat attr caused mismatches):
 WS_EVENT_TIMEOUT_S: int = int(_settings.ws.timeout_sec)
-# ↑ NOVĚ: namespacované nastavení — odpovídá AppSettings.ws.timeout_sec
 
 # Cookie name used by SessionMiddleware for session id
 COOKIE_NAME = "wsai.sid"
@@ -168,7 +179,7 @@ async def ws_endpoint(
     # Normalize/validate the initial tab
     active_tab = active_tab if active_tab in ALLOWED_TABS else "assets"
 
-    # Security validation BEFORE accept()
+    # Security validation BEFORE accept() to reject early if unauthorized
     await verify_ws_auth(ws)
 
     # Accept the connection after passing security
@@ -254,7 +265,7 @@ async def ws_endpoint(
                     sid_for_rl = state.sid or f"anon:{state.conn_id[:8]}"
                     try:
                         ok = await allow_ws(event_for_rl, sid_for_rl, _settings.ratelimit.per_minute)
-                    except Exception as rl_err:  # be explicit; don't fail-open
+                    except Exception as rl_err:  # explicit; don't fail-open
                         await _ws_error(
                             ws,
                             "Rate-limit check failed",
@@ -279,10 +290,16 @@ async def ws_endpoint(
                         continue
 
                     ui_req = _build_ui_request(state, text, staging=False)
+
                     await _ws_send(
                         ws,
                         "progress",
-                        {"status": "running", "conn_id": state.conn_id, "request_id": state.request_id, "tab": state.active_tab},
+                        {
+                            "status": "running",
+                            "conn_id": state.conn_id,
+                            "request_id": state.request_id,
+                            "tab": state.active_tab,
+                        },
                     )
 
                     ui_res = await asyncio.wait_for(route_chat(ui_req), timeout=WS_EVENT_TIMEOUT_S)

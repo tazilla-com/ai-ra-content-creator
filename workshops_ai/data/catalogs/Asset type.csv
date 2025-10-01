@@ -1,20 +1,20 @@
-Name;Notes;Is dependent;EN Name;EN Notes;SK Name;SK Notes
-Electronic data/Business process;;FALSE;Electronic data/Business process;;ElektronickÈ d·ta/Biznis proces;
-Paper data;;FALSE;Paper data;;PapierovÈ d·ta;
-Information system;;TRUE;Information system;;InformaËn˝ systÈm;
-Server infrastructure;;FALSE;Server infrastructure;;Serverov· infraötrukt˙ra;
-Network infrastructure ;;FALSE;Network infrastructure ;;Sieùov· infraötrukt˙ra ;
-Virtualization platform;;FALSE;Virtualization platform;;VirtualizaËn· platforma;
-Operating system ;;FALSE;Operating system ;;OperaËn˝ systÈm ;
-Application software;;FALSE;Application software;;AplikaËn˝ softvÈr;
-Cloud services;;FALSE;Cloud services;;CloudovÈ sluûby;
-Data storage;;FALSE;Data storage;;D·tovÈ ˙loûisk·;
-Equipment, machines;;FALSE;Equipment, machines;;Zaradenie, stroje;
-IoT;;FALSE;IoT;;IoT;
-PC;;FALSE;PC;;PC;
-Laptop;;FALSE;Laptop;;Notebook;
-Mobile devices;;FALSE;Mobile devices;;MobilnÈ zariadenia;
-Portable data media;;FALSE;Portable data media;;PrenosnÈ d·tovÈ mÈdi·;
-Location;;FALSE;Location;;Lokalita;
-Staff;;FALSE;Staff;;Person·l;
-Other;;FALSE;Other;;InÈ;
+Name,Notes,Is dependent,EN Name,EN Notes,SK Name,SK Notes
+Electronic data/Business process,,FALSE,Electronic data/Business process,,Elektronick√© d√°ta/Biznis proces,
+Paper data,,FALSE,Paper data,,Papierov√© d√°ta,
+Information system,,TRUE,Information system,,Informaƒçn√Ω syst√©m,
+Server infrastructure,,FALSE,Server infrastructure,,Serverov√° infra≈°trukt√∫ra,
+Network infrastructure,,FALSE,Network infrastructure,,Sie≈•ov√° infra≈°trukt√∫ra,
+Virtualization platform,,FALSE,Virtualization platform,,Virtualizaƒçn√° platforma,
+Operating system,,FALSE,Operating system,,Operaƒçn√Ω syst√©m,
+Application software,,FALSE,Application software,,Aplikaƒçn√Ω softv√©r,
+Cloud services,,FALSE,Cloud services,,Cloudov√© slu≈æby,
+Data storage,,FALSE,Data storage,,D√°tov√© √∫lo≈æisk√°,
+"Equipment, machines",,FALSE,"Equipment, machines",,"Zaradenie, stroje",
+IoT,,FALSE,IoT,,IoT,
+PC,,FALSE,PC,,PC,
+Laptop,,FALSE,Laptop,,Notebook,
+Mobile devices,,FALSE,Mobile devices,,Mobiln√© zariadenia,
+Portable data media,,FALSE,Portable data media,,Prenosn√© d√°tov√© m√©di√°,
+Location,,FALSE,Location,,Lokalita,
+Staff,,FALSE,Staff,,Person√°l,
+Other,,FALSE,Other,,In√©,

@@ -1,13 +1,13 @@
-Impact;Impact category
-Unavailability;Availability
-Disclosure outside the organization;Confidentiality
-Disclosure to unauthorized personnel;Confidentiality
-Intentional breach of integrity;Integrity
-Unintentional breach of integrity;Integrity
-Legislation;Legislation
-Finance;Finance
-Operation external;Availability
-Operation internal;Availability
-Loss of all data;Availability
-Reputation;Reputation
-Clients;Clients
+Impact,Impact category
+Unavailability,Availability
+Disclosure outside the organization,Confidentiality
+Disclosure to unauthorized personnel,Confidentiality
+Intentional breach of integrity,Integrity
+Unintentional breach of integrity,Integrity
+Legislation,Legislation
+Finance,Finance
+Operation external,Availability
+Operation internal,Availability
+Loss of all data,Availability
+Reputation,Reputation
+Clients,Clients

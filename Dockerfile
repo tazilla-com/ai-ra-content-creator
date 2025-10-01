@@ -43,7 +43,7 @@ RUN useradd -u 1001 -ms /bin/bash appuser
 # Install from prebuilt wheels
 COPY --from=builder /wheels /wheels
 COPY requirements.txt ./requirements.txt
-COPY constraints.txt ./constraints.txt
+# COPY constraints.txt ./constraints.txt
 
 # hadolint ignore=DL3013
 RUN --mount=type=cache,target=/root/.cache/pip \

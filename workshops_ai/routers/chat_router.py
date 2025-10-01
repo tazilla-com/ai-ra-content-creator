@@ -4,8 +4,9 @@ from __future__ import annotations
 """
 Chat Router (UIRequest → route_chat → UIResponse)
 -------------------------------------------------
-- Auth-protected POST /chat endpoint used by the UI.
-- Strictly validates incoming payload as UIRequest and returns UIResponse.
+- Auth-protected POST /api/chat endpoint used by the UI.
+- Strictly validates incoming payload as UIRequest; falls back to legacy ChatIn.
+- Returns a strictly validated UIResponse.
 - Calls the unified LangGraph manager (workshops_ai.graph.manager:route_chat).
 - Single timeout from settings.chat.timeout_sec.
 - Best-effort telemetry; safe error mapping.
@@ -15,7 +16,7 @@ import asyncio
 import inspect
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Body
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
@@ -23,13 +24,13 @@ from workshops_ai.settings import get_settings
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 
 # --- Security dependency (API key / JWT) --------------------------------------
-# Prefer the central path; fall back to legacy; dev may run without auth.
 try:
-    from workshops_ai.app.security import require_auth  # type: ignore[reportMissingImports]
+    from workshops_ai.app.security import require_auth  # preferred path
     _AUTH_DEPS = [Depends(require_auth)]
 except Exception:  # pragma: no cover
     try:
-        from workshops_ai.app.deps.auth import require_auth  # type: ignore[reportMissingImports]
+        # optional legacy fallback
+        from workshops_ai.app.deps.auth import require_auth  # type: ignore
         _AUTH_DEPS = [Depends(require_auth)]
     except Exception:  # pragma: no cover
         _AUTH_DEPS = []
@@ -42,7 +43,7 @@ except Exception:  # pragma: no cover
         return
 
 settings = get_settings()
-router = APIRouter(dependencies=_AUTH_DEPS)
+router = APIRouter(prefix="/api", dependencies=_AUTH_DEPS)
 
 CHAT_TIMEOUT_SEC: float = float(getattr(getattr(settings, "chat", object()), "timeout_sec", 60))
 MAX_MESSAGE_LEN: int = int(getattr(getattr(settings, "chat", object()), "max_message_len", 4000))
@@ -69,6 +70,26 @@ async def _run_with_timeout(awaitable_or_result: Any, timeout_sec: float) -> Any
     return awaitable_or_result
 
 
+def _to_ui_request(payload: dict[str, Any]) -> UIRequest:
+    """
+    Prefer the new UIRequest; if that fails, try legacy ChatIn and bridge.
+    """
+    try:
+        return UIRequest.model_validate(payload)
+    except ValidationError:
+        # Legacy bridge (schemas/chat.py) — optional and backward-compatible
+        try:
+            from workshops_ai.schemas.chat import ChatIn  # lazy import
+            legacy = ChatIn.model_validate(payload)
+            return legacy.to_ui()
+        except Exception as e2:
+            # Re-raise a unified 422 with both contexts lost (we keep it simple for clients)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"message": "Invalid UIRequest (and legacy ChatIn fallback failed)"},
+            ) from e2
+
+
 # ----------------------------------------------------------------------
 # Route
 # ----------------------------------------------------------------------
@@ -83,7 +104,7 @@ async def _run_with_timeout(awaitable_or_result: Any, timeout_sec: float) -> Any
 )
 async def chat_endpoint(
     request: Request,
-    payload: dict[str, Any],
+    payload: dict[str, Any] = Body(...)
 ) -> UIResponse:
     """
     Contract:
@@ -93,15 +114,10 @@ async def chat_endpoint(
     - Strict Pydantic v2 validation (fail-closed).
     - Message length limit (MAX_MESSAGE_LEN).
     - Unified timeout (CHAT_TIMEOUT_SEC).
+    - Backward-compatible acceptance of legacy ChatIn (auto-bridged).
     """
-    # 1) Validate inbound payload (strict → UIRequest)
-    try:
-        ui_req = UIRequest.model_validate(payload)
-    except ValidationError as ve:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"message": "Invalid UIRequest", "errors": ve.errors()},
-        ) from ve
+    # 1) Validate inbound payload (UIRequest or legacy)
+    ui_req = _to_ui_request(payload)
 
     # 2) Message-length guard
     if ui_req.message and len(ui_req.message) > MAX_MESSAGE_LEN:
@@ -118,11 +134,10 @@ async def chat_endpoint(
                 "user_id": ui_req.user_id,
                 "org_id": ui_req.org_id,
                 "active_tab": ui_req.active_tab,
-                "selection": ui_req.selection.model_dump(mode="json") if hasattr(ui_req, "selection") else None,
+                "selection": getattr(ui_req, "selection", None),
                 "staging": ui_req.staging,
                 "message_preview": _truncate_for_log(ui_req.message, 256),
                 "language": getattr(ui_req, "language", None),
-                "number_of_assets": getattr(ui_req, "number_of_assets", None),
                 "has_org_profile": bool(getattr(ui_req, "organization_profile", None)),
                 "has_services": bool(getattr(ui_req, "services", None)),
                 "has_existing_assets": bool(getattr(ui_req, "existing_assets", None)),
@@ -136,7 +151,7 @@ async def chat_endpoint(
 
     # 4) Route strictly to the LangGraph manager
     try:
-        from workshops_ai.graph.manager import route_chat  # lazy import to avoid early import cycles
+        from workshops_ai.graph.manager import route_chat  # lazy import to avoid import cycles
         result = await _run_with_timeout(route_chat(ui_req), timeout_sec=CHAT_TIMEOUT_SEC)
 
         # 5) Validate outbound payload (strict → UIResponse)
@@ -158,6 +173,7 @@ async def chat_endpoint(
             detail={"message": "Response validation failed", "errors": ve.errors()},
         ) from ve
     except HTTPException:
+        # already mapped with appropriate status code
         raise
     except Exception as ex:
         raise HTTPException(

@@ -40,14 +40,9 @@ from __future__ import annotations
 
 from typing import Iterable, Mapping, Protocol, Sequence, TypedDict, runtime_checkable
 
-# Pydantic domain models (thin type hints; actual definitions live in models/schema/*)
-# For AssetAgent MVP we only need Asset. The others are for later agents.
-try:  # soft import to avoid circulars during scaffolding
-    from workshops_ai.models.schema.asset import Asset  # type: ignore
-except Exception:  # pragma: no cover
-    # Minimal fallback so type checkers don’t explode if schema isn’t generated yet.
-    class Asset:  # type: ignore[deadCode]
-        ...
+# Unified DTOs (type hints only)
+from workshops_ai.api.schema import Asset
+
 
 # ------------------------------------------------------------------------------
 # Lightweight item shapes for staging (used later by Impacts/Threats/Controls)

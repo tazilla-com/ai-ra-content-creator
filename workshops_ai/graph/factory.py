@@ -9,12 +9,13 @@
 #   - ainvoke_with_timeout(graph, inputs, timeout=...)  # async
 #   - invoke_with_timeout(graph, inputs, timeout=...)   # sync
 #   - make_default_deps() -> GraphDeps                  # default deps for routers
-#   - build_checkpointer(settings)                      # checkpointer constructor (alias)
+#   - make_langgraph_config(...) -> dict                # builds required 'configurable' keys
+#   - build_checkpointer(settings=None)                 # compatibility alias
 #
 # Notes
 # - Imports are localized to avoid heavy module loads and circular deps.
 # - Dependencies are minimal; graphs must gracefully handle missing optional services.
-# - Checkpointer is selected via the centralized builder in graph/checkpointer.py.
+# - Checkpointer is selected via centralized builder in graph/checkpointer.py.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ except Exception:  # pragma: no cover
 from workshops_ai.settings import get_settings
 from workshops_ai.graph.checkpointer import make_checkpointer as _central_make_checkpointer
 
+
 # -----------------------------------------------------------------------------
 # Minimal retriever protocol + factory type
 # -----------------------------------------------------------------------------
@@ -48,14 +50,18 @@ class Retriever(Protocol):
     async def asearch(self, query: str, *, k: int = 4) -> list[dict]: ...
     def search(self, query: str, *, k: int = 4) -> list[dict]: ...
 
+
 MakeRetriever = Callable[[str, str], Optional[Retriever]]
+
 
 # Redis-backed ephemeral memory accessors (per-org/session)
 class MemoryGet(Protocol):
     async def __call__(self, key: str) -> Optional[str]: ...
 
+
 class MemorySet(Protocol):
     async def __call__(self, key: str, value: str, *, ttl_sec: Optional[int] = None) -> None: ...
+
 
 # -----------------------------------------------------------------------------
 # Dependency bundle injected into each graph
@@ -75,12 +81,16 @@ class GraphDeps:
     llm: Any | None = None
     memory_get: MemoryGet | None = None
     memory_set: MemorySet | None = None
+    # NEW: expose checkpoint namespace so routers/tests can pass it to LangGraph
+    checkpoint_ns: str | None = None
+
 
 # -----------------------------------------------------------------------------
 # Graph construction
 # -----------------------------------------------------------------------------
 
 _SUPPORTED_TABS: Final[set[str]] = {"assets", "impacts", "threats"}
+
 
 def build_graph(tab: str, deps: GraphDeps) -> RunnableGraph:
     """
@@ -91,7 +101,9 @@ def build_graph(tab: str, deps: GraphDeps) -> RunnableGraph:
     """
     key = (tab or "").strip().lower()
     if key not in _SUPPORTED_TABS:
-        raise ValueError(f"Unsupported tab '{tab}'. Must be one of: assets, impacts, threats.")
+        raise ValueError(
+            "Unsupported tab '{tab}'. Must be one of: assets, impacts, threats.".format(tab=tab)
+        )
 
     # Localized imports to avoid import-time side effects and cycles.
     if key == "assets":
@@ -104,6 +116,7 @@ def build_graph(tab: str, deps: GraphDeps) -> RunnableGraph:
     graph = create_graph(deps)
     return graph
 
+
 # -----------------------------------------------------------------------------
 # Ephemeral memory (Redis), safe no-op fallback if Redis missing
 # -----------------------------------------------------------------------------
@@ -111,23 +124,26 @@ def build_graph(tab: str, deps: GraphDeps) -> RunnableGraph:
 def make_redis_memory(settings: Any):
     """
     Return (async) memory_get, memory_set functions backed by Redis if available,
-    else safe no-ops. Keys are stored under f"{checkpoint_ns}:mem:{key}".
+    else safe no-ops. Keys are stored under f\"{checkpoint_ns}:mem:{key}\".
     """
-    redis_url = getattr(settings, "redis_url", None) or (getattr(getattr(settings, "redis", None), "url", None))
+    redis_url = getattr(settings, "redis_url", None) or getattr(
+        getattr(settings, "redis", None), "url", None
+    )
     ns = getattr(settings, "checkpoint_ns", None) or "lg:ckpt"
 
     if not redis_url or AsyncRedis is None:
         async def _get(_key: str) -> Optional[str]:
             return None
+
         async def _set(_key: str, _value: str, *, ttl_sec: Optional[int] = None) -> None:
             return None
+
         return _get, _set
 
     client = AsyncRedis.from_url(redis_url, decode_responses=True)
 
     async def memory_get(key: str) -> Optional[str]:
-        val = await client.get(f"{ns}:mem:{key}")
-        return val
+        return await client.get(f"{ns}:mem:{key}")
 
     async def memory_set(key: str, value: str, *, ttl_sec: Optional[int] = None) -> None:
         k = f"{ns}:mem:{key}"
@@ -146,9 +162,10 @@ def make_redis_memory(settings: Any):
                 loop.run_until_complete(client.close())
         except Exception:
             pass
-    atexit.register(_finalizer)
 
+    atexit.register(_finalizer)
     return memory_get, memory_set
+
 
 # -----------------------------------------------------------------------------
 # Default dependencies factory
@@ -170,11 +187,11 @@ def make_default_deps(
 
     Provided:
       - settings           : loaded via get_settings() if not provided
-      - checkpointer       : Redis/SQLite/Memory per settings
+      - checkpointer       : Redis/SQLite/Memory per settings (built internally)
       - backend_port       : CSV/API backend if available (can be None; graphs should degrade)
-      - ws_hub             : None (graphs shouldn't rely on it hard)
+      - ws_hub             : optional; graphs should not hard-depend on it
       - make_retriever     : RAG retriever factory (optional; graphs degrade to LLM fallback)
-      - llm                : None by default
+      - llm                : optional LLM instance
       - memory_get/set     : Redis-based ephemeral helpers when redis_url is set; else no-op
     """
     s = settings or get_settings()
@@ -182,7 +199,7 @@ def make_default_deps(
     # Checkpointer from the centralized builder (robust across versions)
     saver = _central_make_checkpointer(settings=s)
 
-    # Backend (allow external injection; otherwise try CSV provider)
+    # Backend (allow external injection; otherwise try provider → CSV fallback)
     if backend_port is None:
         try:
             from workshops_ai.backend.provider import get_backend_port  # type: ignore
@@ -209,6 +226,12 @@ def make_default_deps(
         memory_get = memory_get or mget
         memory_set = memory_set or mset
 
+    # Surface checkpoint namespace (from flat settings first; allow nested fallback)
+    ns = getattr(s, "checkpoint_ns", None)
+    if not ns:
+        # If your AppSettings nests checkpointer config, try to read it here
+        ns = getattr(getattr(s, "checkpointer", object()), "namespace", None)
+
     return GraphDeps(
         backend_port=backend_port,
         ws_hub=ws,
@@ -219,10 +242,12 @@ def make_default_deps(
         llm=llm,
         memory_get=memory_get,
         memory_set=memory_set,
+        checkpoint_ns=ns,
     )
 
+
 # -----------------------------------------------------------------------------
-# Invoke helpers with timeout (support optional 'config'), with robust async→sync fallback
+# Invoke helpers with timeout (support optional 'config'), robust async→sync fallback
 # -----------------------------------------------------------------------------
 
 async def _invoke_async(graph: RunnableGraph, inputs: Any, config: Optional[dict]) -> Any:
@@ -237,20 +262,73 @@ async def _invoke_async(graph: RunnableGraph, inputs: Any, config: Optional[dict
     # Rare legacy case: graph has no ainvoke at all -> use sync in a thread
     loop = asyncio.get_running_loop()
     if config is not None and hasattr(graph, "invoke"):
-        return await loop.run_in_executor(None, lambda: graph.invoke(inputs, config=config))  # type: ignore[misc]
+        return await loop.run_in_executor(
+            None, lambda: graph.invoke(inputs, config=config)  # type: ignore[misc]
+        )
     if hasattr(graph, "invoke"):
         return await loop.run_in_executor(None, lambda: graph.invoke(inputs))  # type: ignore[misc]
     return await loop.run_in_executor(None, lambda: graph(inputs))  # type: ignore[operator]
 
-async def ainvoke_with_timeout(graph: RunnableGraph, inputs: Any, *, timeout: int, config: Optional[dict] = None) -> Any:
+
+async def ainvoke_with_timeout(
+    graph: RunnableGraph,
+    inputs: Any,
+    *,
+    timeout: int,
+    config: Optional[dict] = None
+) -> Any:
     return await asyncio.wait_for(_invoke_async(graph, inputs, config=config), timeout=timeout)
 
-def invoke_with_timeout(graph: RunnableGraph, inputs: Any, *, timeout: int, config: Optional[dict] = None) -> Any:
+
+def invoke_with_timeout(
+    graph: RunnableGraph,
+    inputs: Any,
+    *,
+    timeout: int,
+    config: Optional[dict] = None
+) -> Any:
     return asyncio.run(ainvoke_with_timeout(graph, inputs, timeout=timeout, config=config))
 
-# Alias for compatibility with places that import build_checkpointer from factory
-def build_checkpointer(*, settings: Any | None = None) -> Any:
+
+# -----------------------------------------------------------------------------
+# Utility: build the LangGraph 'configurable' dict (thread_id/namespace)
+# -----------------------------------------------------------------------------
+
+def make_langgraph_config(
+    *,
+    org_id: str,
+    tab: str,
+    user_id: str | None,
+    deps: GraphDeps
+) -> dict:
+    """
+    Compose a LangGraph config with required 'configurable' keys for the checkpointer.
+    - thread_id      : required by LangGraph checkpointers
+    - checkpoint_ns  : optional but recommended (taken from deps.checkpoint_ns)
+    """
+    cfg: dict[str, Any] = {"configurable": {}}
+    user = (user_id or "anon").strip() or "anon"
+    cfg["configurable"]["thread_id"] = f"{org_id}:{tab}:{user}"
+    if deps.checkpoint_ns:
+        cfg["configurable"]["checkpoint_ns"] = deps.checkpoint_ns
+    return cfg
+
+
+# -----------------------------------------------------------------------------
+# Compatibility alias (accepts optional argument)
+# -----------------------------------------------------------------------------
+
+def build_checkpointer(settings: Any | None = None) -> Any:
+    """
+    Compatibility wrapper.
+    - If called as build_checkpointer() -> uses get_settings() internally.
+    - If called as build_checkpointer(settings) or build_checkpointer(settings=...)
+      -> forwards to the centralized builder.
+    """
+    if settings is None:
+        settings = get_settings()
     return _central_make_checkpointer(settings=settings)
+
 
 __all__ = [
     "GraphDeps",
@@ -259,5 +337,6 @@ __all__ = [
     "invoke_with_timeout",
     "make_redis_memory",
     "make_default_deps",
+    "make_langgraph_config",
     "build_checkpointer",
 ]

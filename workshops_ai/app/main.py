@@ -34,23 +34,22 @@ except Exception:
 
 from pydantic import BaseModel, Field, ConfigDict
 
-# Load .env early if present (non-fatal) — BaseSettings will also load it.
+# Load .env early if present (non-fatal)
 try:
     from dotenv import load_dotenv
     load_dotenv(override=False)
 except Exception:
     pass
 
-# Centralized settings (single source of truth)
+# Centralized settings
 from workshops_ai.settings import get_settings
 settings = get_settings()
 
-# Optional auth dependency (API-key/JWT); if module not present we no-op auth.
+# Optional HTTP auth dependency (used for HTTP routers, NOT for WebSocket)
 try:
-    from workshops_ai.app.security import require_auth as _require_auth  # ✅ jednotná logika z app/security.py
+    from workshops_ai.app.security import require_auth as _require_auth
     _AUTH_DEP = [Depends(_require_auth)]
 except Exception as e:  # pragma: no cover
-    import logging
     logging.getLogger("workshops_ai").warning("auth.disabled: %s", e)
     _AUTH_DEP = []
 
@@ -160,9 +159,14 @@ class SecurityHeadersMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        # >>> Only handle HTTP responses; skip websockets <<<
+        if scope.get("type") != "http":
+           await self.app(scope, receive, send)
+           return
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
                 headers = dict(message.get("headers", []))
+
                 def _set(name: bytes, val: str):
                     headers[name.lower()] = val.encode()
 
@@ -328,7 +332,7 @@ def create_app() -> FastAPI:
     app.include_router(chatui_router, tags=["_demo"])
 
     # --------------------------------------------------------------------------
-    # Canonical routers (fail-fast if missing in prod; dev has explicit fallbacks)
+    # Canonical routers (fail-fast outside dev)
     # --------------------------------------------------------------------------
     def _mount_or_fallback(name: str, mount: Callable[[], None], fallback: Callable[[], None]) -> None:
         try:
@@ -336,40 +340,37 @@ def create_app() -> FastAPI:
             logger.info("%s mounted", name)
         except Exception as e:
             if settings.env != "dev":
-                # In prod we fail hard to surface misconfiguration early
                 raise
             logger.warning("%s not mounted, using dev fallback: %s", name, e)
             fallback()
 
-    # /chat
+    # /api/chat (note: chat_router ALREADY has prefix="/api" + its own auth deps)
     def _mount_chat():
         from workshops_ai.routers.chat_router import router as chat_router
-        app.include_router(chat_router, prefix="/api", tags=["chat"], dependencies=_AUTH_DEP)
+        app.include_router(chat_router)
+        logger.info("chat_router mounted at /api/chat")
 
     def _fallback_chat():
         router = APIRouter()
         @router.post(
-            "/chat",
+            "/api/chat",
             tags=["chat"],
             response_class=_DEFAULT_RESPONSE_CLASS,
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
         async def chat_not_ready(_: Request) -> dict[str, Any]:
             return {
-                "error": {
-                    "type": "not_ready",
-                    "message": "Chat router not mounted. Implement workshops_ai.api.app.router",
-                },
+                "error": {"type": "not_ready", "message": "Chat router not mounted."},
                 "request_id": get_request_id(),
             }
         app.include_router(router)
 
     _mount_or_fallback("chat_router", _mount_chat, _fallback_chat)
 
-    # /ws
+    # /ws (NO HTTP auth dependencies here; ws_router does its own verify_ws_auth)
     def _mount_ws():
-        from workshops_ai.routers.ws_router import router as ws_router  # canonical
-        app.include_router(ws_router, tags=["ws"], dependencies=_AUTH_DEP)
+        from workshops_ai.routers.ws_router import router as ws_router
+        app.include_router(ws_router, tags=["ws"])
 
     def _fallback_ws():
         router = APIRouter()
@@ -377,20 +378,17 @@ def create_app() -> FastAPI:
         async def ws_not_ready(websocket: WebSocket) -> None:
             await websocket.accept()
             await websocket.send_json({
-                "error": {
-                    "type": "not_ready",
-                    "message": "WS router not mounted. Implement workshops_ai.routers.ws_router.router"
-                },
+                "error": {"type": "not_ready", "message": "WS router not mounted."},
                 "request_id": get_request_id(),
             })
             await websocket.close()
         app.include_router(router)
 
-    _mount_or_fallback("ws_router (auth=%s)" % bool(_AUTH_DEP), _mount_ws, _fallback_ws)
+    _mount_or_fallback("ws_router", _mount_ws, _fallback_ws)
 
-    # /assets
+    # /assets (HTTP; safe to apply HTTP auth dependencies here if desired)
     def _mount_assets():
-        from workshops_ai.routers.assets import router as assets_router  # canonical
+        from workshops_ai.routers.assets import router as assets_router
         app.include_router(assets_router, tags=["assets"], dependencies=_AUTH_DEP)
 
     def _fallback_assets():
@@ -403,19 +401,16 @@ def create_app() -> FastAPI:
         )
         async def assets_not_ready() -> dict[str, Any]:
             return {
-                "error": {
-                    "type": "not_ready",
-                    "message": "Assets router not mounted. Implement workshops_ai.routers.assets.router",
-                },
+                "error": {"type": "not_ready", "message": "Assets router not mounted."},
                 "request_id": get_request_id(),
             }
         app.include_router(router)
 
     _mount_or_fallback("assets_router", _mount_assets, _fallback_assets)
 
-    # /graph/threats
+    # /graph/threats (HTTP)
     def _mount_threats():
-        from workshops_ai.routers.threats import router as threats_router  # canonical
+        from workshops_ai.routers.threats import router as threats_router
         app.include_router(threats_router, tags=["threats"], dependencies=_AUTH_DEP)
 
     def _fallback_threats():
@@ -428,10 +423,7 @@ def create_app() -> FastAPI:
         )
         async def threats_not_ready(_: Request) -> dict[str, Any]:
             return {
-                "error": {
-                    "type": "not_ready",
-                    "message": "Threats router not mounted. Implement workshops_ai.routers.threats.router",
-                },
+                "error": {"type": "not_ready", "message": "Threats router not mounted."},
                 "request_id": get_request_id(),
             }
         @router.get("/graph/threats/ping", tags=["threats"])
@@ -441,9 +433,9 @@ def create_app() -> FastAPI:
 
     _mount_or_fallback("threats_router", _mount_threats, _fallback_threats)
 
-    # /graph/impacts
+    # /graph/impacts (HTTP)
     def _mount_impacts():
-        from workshops_ai.routers.impacts import router as impacts_router  # canonical
+        from workshops_ai.routers.impacts import router as impacts_router
         app.include_router(impacts_router, tags=["impacts"], dependencies=_AUTH_DEP)
 
     def _fallback_impacts():
@@ -456,10 +448,7 @@ def create_app() -> FastAPI:
         )
         async def impacts_not_ready(_: Request) -> dict[str, Any]:
             return {
-                "error": {
-                    "type": "not_ready",
-                    "message": "Impacts router not mounted. Implement workshops_ai.routers.impacts.router",
-                },
+                "error": {"type": "not_ready", "message": "Impacts router not mounted."},
                 "request_id": get_request_id(),
             }
         @router.get("/graph/impacts/ping", tags=["impacts"])

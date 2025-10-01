@@ -1,613 +1,613 @@
-Asset type;Threat;Value
-Paper data;Pollution, dust,  corrosion, frost;FALSE
-Information system;Pollution, dust,  corrosion, frost;FALSE
-Information system;Pollution, dust,  corrosion, frost;TRUE
-Server infrastructure;Pollution, dust,  corrosion, frost;FALSE
-Network infrastructure ;Pollution, dust,  corrosion, frost;FALSE
-Data storage;Pollution, dust,  corrosion, frost;FALSE
-Equipment, machines;Pollution, dust,  corrosion, frost;FALSE
-IoT;Pollution, dust,  corrosion, frost;FALSE
-PC;Pollution, dust,  corrosion, frost;FALSE
-Laptop;Pollution, dust,  corrosion, frost;FALSE
-Mobile devices;Pollution, dust,  corrosion, frost;FALSE
-Portable data media;Pollution, dust,  corrosion, frost;FALSE
-Other;Pollution, dust,  corrosion, frost;FALSE
-Paper data;Water, humidity;FALSE
-Information system;Water, humidity;FALSE
-Information system;Water, humidity;TRUE
-Server infrastructure;Water, humidity;FALSE
-Network infrastructure ;Water, humidity;FALSE
-Data storage;Water, humidity;FALSE
-Equipment, machines;Water, humidity;FALSE
-IoT;Water, humidity;FALSE
-PC;Water, humidity;FALSE
-Laptop;Water, humidity;FALSE
-Mobile devices;Water, humidity;FALSE
-Portable data media;Water, humidity;FALSE
-Location;Water, humidity;FALSE
-Other;Water, humidity;FALSE
-Paper data;Heat radiation;FALSE
-Information system;Heat radiation;FALSE
-Information system;Heat radiation;TRUE
-Server infrastructure;Heat radiation;FALSE
-Network infrastructure ;Heat radiation;FALSE
-Data storage;Heat radiation;FALSE
-Equipment, machines;Heat radiation;FALSE
-IoT;Heat radiation;FALSE
-PC;Heat radiation;FALSE
-Laptop;Heat radiation;FALSE
-Mobile devices;Heat radiation;FALSE
-Portable data media;Heat radiation;FALSE
-Location;Heat radiation;FALSE
-Staff;Heat radiation;FALSE
-Other;Heat radiation;FALSE
-Information system;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-Information system;Harmful radiation, radiation, or electromagnetic pulses;TRUE
-Server infrastructure;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-Network infrastructure ;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-Data storage;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-Equipment, machines;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-IoT;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-PC;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-Laptop;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-Mobile devices;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-Portable data media;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-Location;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-Staff;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-Other;Harmful radiation, radiation, or electromagnetic pulses;FALSE
-Information system;Interference of electrical signals;FALSE
-Information system;Interference of electrical signals;TRUE
-Server infrastructure;Interference of electrical signals;FALSE
-Network infrastructure ;Interference of electrical signals;FALSE
-Data storage;Interference of electrical signals;FALSE
-Equipment, machines;Interference of electrical signals;FALSE
-IoT;Interference of electrical signals;FALSE
-PC;Interference of electrical signals;FALSE
-Laptop;Interference of electrical signals;FALSE
-Mobile devices;Interference of electrical signals;FALSE
-Portable data media;Interference of electrical signals;FALSE
-Other;Interference of electrical signals;FALSE
-Paper data;Fire;FALSE
-Information system;Fire;FALSE
-Information system;Fire;TRUE
-Server infrastructure;Fire;FALSE
-Network infrastructure ;Fire;FALSE
-Data storage;Fire;FALSE
-Equipment, machines;Fire;FALSE
-IoT;Fire;FALSE
-PC;Fire;FALSE
-Laptop;Fire;FALSE
-Mobile devices;Fire;FALSE
-Portable data media;Fire;FALSE
-Location;Fire;FALSE
-Staff;Fire;FALSE
-Other;Fire;FALSE
-Paper data;Toxic substances in the area;FALSE
-Information system;Toxic substances in the area;FALSE
-Information system;Toxic substances in the area;TRUE
-Server infrastructure;Toxic substances in the area;FALSE
-Network infrastructure ;Toxic substances in the area;FALSE
-Data storage;Toxic substances in the area;FALSE
-Equipment, machines;Toxic substances in the area;FALSE
-IoT;Toxic substances in the area;FALSE
-PC;Toxic substances in the area;FALSE
-Laptop;Toxic substances in the area;FALSE
-Mobile devices;Toxic substances in the area;FALSE
-Portable data media;Toxic substances in the area;FALSE
-Location;Toxic substances in the area;FALSE
-Staff;Toxic substances in the area;FALSE
-Other;Toxic substances in the area;FALSE
-Paper data;Surrounding events and accidents with negative impact;FALSE
-Information system;Surrounding events and accidents with negative impact;FALSE
-Information system;Surrounding events and accidents with negative impact;TRUE
-Server infrastructure;Surrounding events and accidents with negative impact;FALSE
-Network infrastructure ;Surrounding events and accidents with negative impact;FALSE
-Data storage;Surrounding events and accidents with negative impact;FALSE
-Equipment, machines;Surrounding events and accidents with negative impact;FALSE
-IoT;Surrounding events and accidents with negative impact;FALSE
-PC;Surrounding events and accidents with negative impact;FALSE
-Location;Surrounding events and accidents with negative impact;FALSE
-Staff;Surrounding events and accidents with negative impact;FALSE
-Other;Surrounding events and accidents with negative impact;FALSE
-Paper data;Terrorist attack, sabotage, explosion;FALSE
-Information system;Terrorist attack, sabotage, explosion;FALSE
-Information system;Terrorist attack, sabotage, explosion;TRUE
-Server infrastructure;Terrorist attack, sabotage, explosion;FALSE
-Network infrastructure ;Terrorist attack, sabotage, explosion;FALSE
-Data storage;Terrorist attack, sabotage, explosion;FALSE
-Equipment, machines;Terrorist attack, sabotage, explosion;FALSE
-IoT;Terrorist attack, sabotage, explosion;FALSE
-PC;Terrorist attack, sabotage, explosion;FALSE
-Laptop;Terrorist attack, sabotage, explosion;FALSE
-Mobile devices;Terrorist attack, sabotage, explosion;FALSE
-Portable data media;Terrorist attack, sabotage, explosion;FALSE
-Location;Terrorist attack, sabotage, explosion;FALSE
-Staff;Terrorist attack, sabotage, explosion;FALSE
-Other;Terrorist attack, sabotage, explosion;FALSE
-Paper data;Coercion, extortion, corruption;FALSE
-Information system;Coercion, extortion, corruption;FALSE
-Information system;Coercion, extortion, corruption;TRUE
-Staff;Coercion, extortion, corruption;FALSE
-Other;Coercion, extortion, corruption;FALSE
-Paper data;Unauthorized entry into premises;FALSE
-Information system;Unauthorized entry into premises;FALSE
-Information system;Unauthorized entry into premises;TRUE
-Server infrastructure;Unauthorized entry into premises;FALSE
-Network infrastructure ;Unauthorized entry into premises;FALSE
-Data storage;Unauthorized entry into premises;FALSE
-Equipment, machines;Unauthorized entry into premises;FALSE
-IoT;Unauthorized entry into premises;FALSE
-PC;Unauthorized entry into premises;FALSE
-Laptop;Unauthorized entry into premises;FALSE
-Mobile devices;Unauthorized entry into premises;FALSE
-Portable data media;Unauthorized entry into premises;FALSE
-Location;Unauthorized entry into premises;FALSE
-Other;Unauthorized entry into premises;FALSE
-Paper data;Unauthorized use of devices and unauthorized access to devices;FALSE
-Information system;Unauthorized use of devices and unauthorized access to devices;FALSE
-Information system;Unauthorized use of devices and unauthorized access to devices;TRUE
-Server infrastructure;Unauthorized use of devices and unauthorized access to devices;FALSE
-Network infrastructure ;Unauthorized use of devices and unauthorized access to devices;FALSE
-Data storage;Unauthorized use of devices and unauthorized access to devices;FALSE
-Equipment, machines;Unauthorized use of devices and unauthorized access to devices;FALSE
-IoT;Unauthorized use of devices and unauthorized access to devices;FALSE
-PC;Unauthorized use of devices and unauthorized access to devices;FALSE
-Laptop;Unauthorized use of devices and unauthorized access to devices;FALSE
-Mobile devices;Unauthorized use of devices and unauthorized access to devices;FALSE
-Portable data media;Unauthorized use of devices and unauthorized access to devices;FALSE
-Other;Unauthorized use of devices and unauthorized access to devices;FALSE
-Paper data;Physical theft or physical damage to devices or media;FALSE
-Information system;Physical theft or physical damage to devices or media;FALSE
-Information system;Physical theft or physical damage to devices or media;TRUE
-Server infrastructure;Physical theft or physical damage to devices or media;FALSE
-Network infrastructure ;Physical theft or physical damage to devices or media;FALSE
-Data storage;Physical theft or physical damage to devices or media;FALSE
-Equipment, machines;Physical theft or physical damage to devices or media;FALSE
-IoT;Physical theft or physical damage to devices or media;FALSE
-PC;Physical theft or physical damage to devices or media;FALSE
-Laptop;Physical theft or physical damage to devices or media;FALSE
-Mobile devices;Physical theft or physical damage to devices or media;FALSE
-Portable data media;Physical theft or physical damage to devices or media;FALSE
-Other;Physical theft or physical damage to devices or media;FALSE
-Paper data;Theft, infiltration, or modification of data during physical transfer;FALSE
-Electronic data/Business process;Theft, infiltration, or modification of data during physical transfer;FALSE
-Information system;Theft, infiltration, or modification of data during physical transfer;TRUE
-Laptop;Theft, infiltration, or modification of data during physical transfer;FALSE
-Mobile devices;Theft, infiltration, or modification of data during physical transfer;FALSE
-Portable data media;Theft, infiltration, or modification of data during physical transfer;FALSE
-Other;Theft, infiltration, or modification of data during physical transfer;FALSE
-Paper data;Climatic or meteorological event;FALSE
-Information system;Climatic or meteorological event;FALSE
-Information system;Climatic or meteorological event;TRUE
-Server infrastructure;Climatic or meteorological event;FALSE
-Network infrastructure ;Climatic or meteorological event;FALSE
-Data storage;Climatic or meteorological event;FALSE
-Equipment, machines;Climatic or meteorological event;FALSE
-IoT;Climatic or meteorological event;FALSE
-PC;Climatic or meteorological event;FALSE
-Laptop;Climatic or meteorological event;FALSE
-Mobile devices;Climatic or meteorological event;FALSE
-Portable data media;Climatic or meteorological event;FALSE
-Location;Climatic or meteorological event;FALSE
-Staff;Climatic or meteorological event;FALSE
-Other;Climatic or meteorological event;FALSE
-Paper data;Seismic event;FALSE
-Information system;Seismic event;FALSE
-Information system;Seismic event;TRUE
-Server infrastructure;Seismic event;FALSE
-Network infrastructure ;Seismic event;FALSE
-Data storage;Seismic event;FALSE
-Equipment, machines;Seismic event;FALSE
-IoT;Seismic event;FALSE
-PC;Seismic event;FALSE
-Laptop;Seismic event;FALSE
-Mobile devices;Seismic event;FALSE
-Portable data media;Seismic event;FALSE
-Location;Seismic event;FALSE
-Staff;Seismic event;FALSE
-Other;Seismic event;FALSE
-Paper data;Volcanic event;FALSE
-Information system;Volcanic event;FALSE
-Information system;Volcanic event;TRUE
-Server infrastructure;Volcanic event;FALSE
-Network infrastructure ;Volcanic event;FALSE
-Data storage;Volcanic event;FALSE
-Equipment, machines;Volcanic event;FALSE
-IoT;Volcanic event;FALSE
-PC;Volcanic event;FALSE
-Laptop;Volcanic event;FALSE
-Mobile devices;Volcanic event;FALSE
-Portable data media;Volcanic event;FALSE
-Location;Volcanic event;FALSE
-Staff;Volcanic event;FALSE
-Other;Volcanic event;FALSE
-Information system;Pandemic / epidemic event;TRUE
-Staff;Pandemic / epidemic event;FALSE
-Other;Pandemic / epidemic event;FALSE
-Paper data;Damage caused by animals;FALSE
-Information system;Damage caused by animals;FALSE
-Information system;Damage caused by animals;TRUE
-Server infrastructure;Damage caused by animals;FALSE
-Network infrastructure ;Damage caused by animals;FALSE
-Data storage;Damage caused by animals;FALSE
-Equipment, machines;Damage caused by animals;FALSE
-IoT;Damage caused by animals;FALSE
-PC;Damage caused by animals;FALSE
-Laptop;Damage caused by animals;FALSE
-Mobile devices;Damage caused by animals;FALSE
-Portable data media;Damage caused by animals;FALSE
-Location;Damage caused by animals;FALSE
-Other;Damage caused by animals;FALSE
-Information system;The existence of a known software vulnerability;FALSE
-Information system;The existence of a known software vulnerability;TRUE
-Network infrastructure ;The existence of a known software vulnerability;FALSE
-Virtualization platform;The existence of a known software vulnerability;FALSE
-Operating system ;The existence of a known software vulnerability;FALSE
-Application software;The existence of a known software vulnerability;FALSE
-Data storage;The existence of a known software vulnerability;FALSE
-IoT;The existence of a known software vulnerability;FALSE
-Mobile devices;The existence of a known software vulnerability;FALSE
-Other;The existence of a known software vulnerability;FALSE
-Information system;Unauthorized manipulation of software or a hacker attack;FALSE
-Information system;Unauthorized manipulation of software or a hacker attack;TRUE
-Network infrastructure ;Unauthorized manipulation of software or a hacker attack;FALSE
-Virtualization platform;Unauthorized manipulation of software or a hacker attack;FALSE
-Operating system ;Unauthorized manipulation of software or a hacker attack;FALSE
-Application software;Unauthorized manipulation of software or a hacker attack;FALSE
-Cloud services;Unauthorized manipulation of software or a hacker attack;FALSE
-Data storage;Unauthorized manipulation of software or a hacker attack;FALSE
-Equipment, machines;Unauthorized manipulation of software or a hacker attack;FALSE
-IoT;Unauthorized manipulation of software or a hacker attack;FALSE
-PC;Unauthorized manipulation of software or a hacker attack;FALSE
-Laptop;Unauthorized manipulation of software or a hacker attack;FALSE
-Mobile devices;Unauthorized manipulation of software or a hacker attack;FALSE
-Other;Unauthorized manipulation of software or a hacker attack;FALSE
-Information system;Malware infiltration;FALSE
-Information system;Malware infiltration;TRUE
-Network infrastructure ;Malware infiltration;FALSE
-Virtualization platform;Malware infiltration;FALSE
-Operating system ;Malware infiltration;FALSE
-Application software;Malware infiltration;FALSE
-Cloud services;Malware infiltration;FALSE
-Data storage;Malware infiltration;FALSE
-Equipment, machines;Malware infiltration;FALSE
-IoT;Malware infiltration;FALSE
-PC;Malware infiltration;FALSE
-Laptop;Malware infiltration;FALSE
-Mobile devices;Malware infiltration;FALSE
-Portable data media;Malware infiltration;FALSE
-Other;Malware infiltration;FALSE
-Electronic data/Business process;Infiltration and modification of data – damage or loss of data;FALSE
-Information system;Infiltration and modification of data – damage or loss of data;TRUE
-Cloud services;Infiltration and modification of data – damage or loss of data;FALSE
-Data storage;Infiltration and modification of data – damage or loss of data;FALSE
-Equipment, machines;Infiltration and modification of data – damage or loss of data;FALSE
-IoT;Infiltration and modification of data – damage or loss of data;FALSE
-PC;Infiltration and modification of data – damage or loss of data;FALSE
-Laptop;Infiltration and modification of data – damage or loss of data;FALSE
-Mobile devices;Infiltration and modification of data – damage or loss of data;FALSE
-Portable data media;Infiltration and modification of data – damage or loss of data;FALSE
-Other;Infiltration and modification of data – damage or loss of data;FALSE
-Information system;Communication interception;FALSE
-Information system;Communication interception;TRUE
-Network infrastructure ;Communication interception;FALSE
-Other;Communication interception;FALSE
-Information system;Web communication infiltration;FALSE
-Information system;Web communication infiltration;TRUE
-Network infrastructure ;Web communication infiltration;FALSE
-Other;Web communication infiltration;FALSE
-Information system;Unauthorized or misdirected messages;FALSE
-Information system;Unauthorized or misdirected messages;TRUE
-Network infrastructure ;Unauthorized or misdirected messages;FALSE
-Other;Unauthorized or misdirected messages;FALSE
-Information system;Falsification of identity, rights or permissions and their misuse;FALSE
-Information system;Falsification of identity, rights or permissions and their misuse;TRUE
-Network infrastructure ;Falsification of identity, rights or permissions and their misuse;FALSE
-Virtualization platform;Falsification of identity, rights or permissions and their misuse;FALSE
-Operating system ;Falsification of identity, rights or permissions and their misuse;FALSE
-PC;Falsification of identity, rights or permissions and their misuse;FALSE
-Laptop;Falsification of identity, rights or permissions and their misuse;FALSE
-Mobile devices;Falsification of identity, rights or permissions and their misuse;FALSE
-Other;Falsification of identity, rights or permissions and their misuse;FALSE
-Information system;Theft of digital identity;FALSE
-Information system;Theft of digital identity;TRUE
-Network infrastructure ;Theft of digital identity;FALSE
-Virtualization platform;Theft of digital identity;FALSE
-Operating system ;Theft of digital identity;FALSE
-Cloud services;Theft of digital identity;FALSE
-PC;Theft of digital identity;FALSE
-Laptop;Theft of digital identity;FALSE
-Mobile devices;Theft of digital identity;FALSE
-Other;Theft of digital identity;FALSE
-Information system;Unauthorized location detection;TRUE
-Laptop;Unauthorized location detection;FALSE
-Mobile devices;Unauthorized location detection;FALSE
-Other;Unauthorized location detection;FALSE
-Information system;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);FALSE
-Information system;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);TRUE
-Server infrastructure;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);FALSE
-Network infrastructure ;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);FALSE
-IoT;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);FALSE
-PC;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);FALSE
-Laptop;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);FALSE
-Other;Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST);FALSE
-Paper data;Retrieving data from improperly recycled or discarded media;FALSE
-Electronic data/Business process;Retrieving data from improperly recycled or discarded media;FALSE
-Information system;Retrieving data from improperly recycled or discarded media;TRUE
-Server infrastructure;Retrieving data from improperly recycled or discarded media;FALSE
-PC;Retrieving data from improperly recycled or discarded media;FALSE
-Laptop;Retrieving data from improperly recycled or discarded media;FALSE
-Mobile devices;Retrieving data from improperly recycled or discarded media;FALSE
-Portable data media;Retrieving data from improperly recycled or discarded media;FALSE
-Other;Retrieving data from improperly recycled or discarded media;FALSE
-Electronic data/Business process;Data input from untrusted sources;FALSE
-Information system;Data input from untrusted sources;TRUE
-Other;Data input from untrusted sources;FALSE
-Paper data;Unauthorized intentional activity by users;FALSE
-Information system;Unauthorized intentional activity by users;FALSE
-Information system;Unauthorized intentional activity by users;TRUE
-Network infrastructure ;Unauthorized intentional activity by users;FALSE
-Operating system ;Unauthorized intentional activity by users;FALSE
-Application software;Unauthorized intentional activity by users;FALSE
-Cloud services;Unauthorized intentional activity by users;FALSE
-Data storage;Unauthorized intentional activity by users;FALSE
-Equipment, machines;Unauthorized intentional activity by users;FALSE
-IoT;Unauthorized intentional activity by users;FALSE
-PC;Unauthorized intentional activity by users;FALSE
-Laptop;Unauthorized intentional activity by users;FALSE
-Mobile devices;Unauthorized intentional activity by users;FALSE
-Portable data media;Unauthorized intentional activity by users;FALSE
-Other;Unauthorized intentional activity by users;FALSE
-Paper data;Unauthorized intentional activity by privileged users;FALSE
-Information system;Unauthorized intentional activity by privileged users;FALSE
-Information system;Unauthorized intentional activity by privileged users;TRUE
-Server infrastructure;Unauthorized intentional activity by privileged users;FALSE
-Network infrastructure ;Unauthorized intentional activity by privileged users;FALSE
-Virtualization platform;Unauthorized intentional activity by privileged users;FALSE
-Operating system ;Unauthorized intentional activity by privileged users;FALSE
-Application software;Unauthorized intentional activity by privileged users;FALSE
-Cloud services;Unauthorized intentional activity by privileged users;FALSE
-Data storage;Unauthorized intentional activity by privileged users;FALSE
-Equipment, machines;Unauthorized intentional activity by privileged users;FALSE
-IoT;Unauthorized intentional activity by privileged users;FALSE
-PC;Unauthorized intentional activity by privileged users;FALSE
-Laptop;Unauthorized intentional activity by privileged users;FALSE
-Mobile devices;Unauthorized intentional activity by privileged users;FALSE
-Portable data media;Unauthorized intentional activity by privileged users;FALSE
-Other;Unauthorized intentional activity by privileged users;FALSE
-Paper data;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Information system;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Information system;Unauthorized intentional actions by operators or employees providing support services;TRUE
-Server infrastructure;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Network infrastructure ;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Virtualization platform;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Operating system ;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Application software;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Cloud services;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Data storage;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Equipment, machines;Unauthorized intentional actions by operators or employees providing support services;FALSE
-IoT;Unauthorized intentional actions by operators or employees providing support services;FALSE
-PC;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Laptop;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Mobile devices;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Portable data media;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Other;Unauthorized intentional actions by operators or employees providing support services;FALSE
-Information system;User error;FALSE
-Information system;User error;TRUE
-Network infrastructure ;User error;FALSE
-Operating system ;User error;FALSE
-Application software;User error;FALSE
-Cloud services;User error;FALSE
-Data storage;User error;FALSE
-Equipment, machines;User error;FALSE
-IoT;User error;FALSE
-PC;User error;FALSE
-Laptop;User error;FALSE
-Mobile devices;User error;FALSE
-Portable data media;User error;FALSE
-Other;User error;FALSE
-Information system;Error of a privileged user;FALSE
-Information system;Error of a privileged user;TRUE
-Server infrastructure;Error of a privileged user;FALSE
-Network infrastructure ;Error of a privileged user;FALSE
-Virtualization platform;Error of a privileged user;FALSE
-Operating system ;Error of a privileged user;FALSE
-Application software;Error of a privileged user;FALSE
-Cloud services;Error of a privileged user;FALSE
-Data storage;Error of a privileged user;FALSE
-Equipment, machines;Error of a privileged user;FALSE
-IoT;Error of a privileged user;FALSE
-PC;Error of a privileged user;FALSE
-Laptop;Error of a privileged user;FALSE
-Mobile devices;Error of a privileged user;FALSE
-Portable data media;Error of a privileged user;FALSE
-Other;Error of a privileged user;FALSE
-Information system;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Information system;Error or failure of operations, maintenance, or an employee performing support services;TRUE
-Server infrastructure;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Network infrastructure ;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Virtualization platform;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Operating system ;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Application software;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Cloud services;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Data storage;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Equipment, machines;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-IoT;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-PC;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Laptop;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Mobile devices;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Portable data media;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Other;Error or failure of operations, maintenance, or an employee performing support services;FALSE
-Paper data;Repudiation (Denial of activity);FALSE
-Information system;Repudiation (Denial of activity);FALSE
-Information system;Repudiation (Denial of activity);TRUE
-Other;Repudiation (Denial of activity);FALSE
-Information system;Improper use of equipment;FALSE
-Information system;Improper use of equipment;TRUE
-Network infrastructure ;Improper use of equipment;FALSE
-Equipment, machines;Improper use of equipment;FALSE
-IoT;Improper use of equipment;FALSE
-PC;Improper use of equipment;FALSE
-Laptop;Improper use of equipment;FALSE
-Mobile devices;Improper use of equipment;FALSE
-Other;Improper use of equipment;FALSE
-Paper data;Disclosure of information;FALSE
-Electronic data/Business process;Disclosure of information;FALSE
-Information system;Disclosure of information;TRUE
-Other;Disclosure of information;FALSE
-Paper data;Incorrect disclosure of information;FALSE
-Electronic data/Business process;Incorrect disclosure of information;FALSE
-Information system;Incorrect disclosure of information;TRUE
-Other;Incorrect disclosure of information;FALSE
-Information system;Use of unauthorized software;FALSE
-Information system;Use of unauthorized software;TRUE
-Application software;Use of unauthorized software;FALSE
-IoT;Use of unauthorized software;FALSE
-PC;Use of unauthorized software;FALSE
-Laptop;Use of unauthorized software;FALSE
-Mobile devices;Use of unauthorized software;FALSE
-Other;Use of unauthorized software;FALSE
-Information system;Use of unauthorized hardware;FALSE
-Information system;Use of unauthorized hardware;TRUE
-Server infrastructure;Use of unauthorized hardware;FALSE
-Network infrastructure ;Use of unauthorized hardware;FALSE
-Data storage;Use of unauthorized hardware;FALSE
-IoT;Use of unauthorized hardware;FALSE
-PC;Use of unauthorized hardware;FALSE
-Laptop;Use of unauthorized hardware;FALSE
-Mobile devices;Use of unauthorized hardware;FALSE
-Portable data media;Use of unauthorized hardware;FALSE
-Other;Use of unauthorized hardware;FALSE
-Paper data;Illegal and unauthorized processing of data;FALSE
-Electronic data/Business process;Illegal and unauthorized processing of data;FALSE
-Information system;Illegal and unauthorized processing of data;TRUE
-Other;Illegal and unauthorized processing of data;FALSE
-Paper data;Human communication failure;FALSE
-Electronic data/Business process;Human communication failure;FALSE
-Information system;Human communication failure;TRUE
-Other;Human communication failure;FALSE
-Information system;Denial of service;FALSE
-Information system;Denial of service;TRUE
-Cloud services;Denial of service;FALSE
-Other;Denial of service;FALSE
-Information system;Software or service failure;FALSE
-Information system;Software or service failure;TRUE
-Network infrastructure ;Software or service failure;FALSE
-Virtualization platform;Software or service failure;FALSE
-Operating system ;Software or service failure;FALSE
-Application software;Software or service failure;FALSE
-Cloud services;Software or service failure;FALSE
-Data storage;Software or service failure;FALSE
-Other;Software or service failure;FALSE
-Information system;Device or system failure;FALSE
-Information system;Device or system failure;TRUE
-Server infrastructure;Device or system failure;FALSE
-Network infrastructure ;Device or system failure;FALSE
-Equipment, machines;Device or system failure;FALSE
-IoT;Device or system failure;FALSE
-PC;Device or system failure;FALSE
-Laptop;Device or system failure;FALSE
-Mobile devices;Device or system failure;FALSE
-Other;Device or system failure;FALSE
-Information system;Overloading of the information system;FALSE
-Information system;Overloading of the information system;TRUE
-Network infrastructure ;Overloading of the information system;FALSE
-Cloud services;Overloading of the information system;FALSE
-Other;Overloading of the information system;FALSE
-Information system;Telecommunication network failure;FALSE
-Information system;Telecommunication network failure;TRUE
-Network infrastructure ;Telecommunication network failure;FALSE
-Cloud services;Telecommunication network failure;FALSE
-Other;Telecommunication network failure;FALSE
-Information system;Power system failure, power loss, or fluctuations in performance;FALSE
-Information system;Power system failure, power loss, or fluctuations in performance;TRUE
-Server infrastructure;Power system failure, power loss, or fluctuations in performance;FALSE
-Network infrastructure ;Power system failure, power loss, or fluctuations in performance;FALSE
-Cloud services;Power system failure, power loss, or fluctuations in performance;FALSE
-Data storage;Power system failure, power loss, or fluctuations in performance;FALSE
-Equipment, machines;Power system failure, power loss, or fluctuations in performance;FALSE
-IoT;Power system failure, power loss, or fluctuations in performance;FALSE
-PC;Power system failure, power loss, or fluctuations in performance;FALSE
-Laptop;Power system failure, power loss, or fluctuations in performance;FALSE
-Other;Power system failure, power loss, or fluctuations in performance;FALSE
-Information system;Failure of the cooling or ventilation system;FALSE
-Information system;Failure of the cooling or ventilation system;TRUE
-Server infrastructure;Failure of the cooling or ventilation system;FALSE
-Network infrastructure ;Failure of the cooling or ventilation system;FALSE
-Data storage;Failure of the cooling or ventilation system;FALSE
-Other;Failure of the cooling or ventilation system;FALSE
-Paper data;Office equipment failure;FALSE
-Information system;Office equipment failure;FALSE
-Information system;Office equipment failure;TRUE
-Mobile devices;Office equipment failure;FALSE
-Other;Office equipment failure;FALSE
-Information system;Degradation of equipment or storage media (obsolescence);FALSE
-Information system;Degradation of equipment or storage media (obsolescence);TRUE
-Portable data media;Degradation of equipment or storage media (obsolescence);FALSE
-Other;Degradation of equipment or storage media (obsolescence);FALSE
-Information system;Disruption of availability during an audit or other authorized security assessment;FALSE
-Information system;Disruption of availability during an audit or other authorized security assessment;TRUE
-Network infrastructure ;Disruption of availability during an audit or other authorized security assessment;FALSE
-Cloud services;Disruption of availability during an audit or other authorized security assessment;FALSE
-Other;Disruption of availability during an audit or other authorized security assessment;FALSE
-Information system;Poor planning and adaptation shortcomings;FALSE
-Information system;Poor planning and adaptation shortcomings;TRUE
-Cloud services;Poor planning and adaptation shortcomings;FALSE
-Staff;Poor planning and adaptation shortcomings;FALSE
-Other;Poor planning and adaptation shortcomings;FALSE
-Information system;Lack of staff;TRUE
-Staff;Lack of staff;FALSE
-Other;Lack of staff;FALSE
-Information system;Lack of resources;FALSE
-Information system;Lack of resources;TRUE
-Other;Lack of resources;FALSE
-Information system;Employee strike or refusal to act;TRUE
-Staff;Employee strike or refusal to act;FALSE
-Other;Employee strike or refusal to act;FALSE
-Electronic data/Business process;Social Engineering;FALSE
-Information system;Social Engineering;TRUE
-Staff;Social Engineering;FALSE
-Other;Social Engineering;FALSE
-Electronic data/Business process;Reputation damage;FALSE
-Information system;Reputation damage;TRUE
-Other;Reputation damage;FALSE
-Information system;Service provider failure;FALSE
-Information system;Service provider failure;TRUE
-Cloud services;Service provider failure;FALSE
-Other;Service provider failure;FALSE
-Information system;Software design or development errors;FALSE
-Information system;Software design or development errors;TRUE
-Other;Software design or development errors;FALSE
-Information system;Using software that does not meet security requirements;FALSE
-Information system;Using software that does not meet security requirements;TRUE
-Network infrastructure ;Using software that does not meet security requirements;FALSE
-Virtualization platform;Using software that does not meet security requirements;FALSE
-Operating system ;Using software that does not meet security requirements;FALSE
-Application software;Using software that does not meet security requirements;FALSE
-Data storage;Using software that does not meet security requirements;FALSE
-IoT;Using software that does not meet security requirements;FALSE
-PC;Using software that does not meet security requirements;FALSE
-Laptop;Using software that does not meet security requirements;FALSE
-Mobile devices;Using software that does not meet security requirements;FALSE
-Other;Using software that does not meet security requirements;FALSE
-Electronic data/Business process;Violation of internal policies or standards;FALSE
-Information system;Violation of internal policies or standards;TRUE
-Other;Violation of internal policies or standards;FALSE
-Electronic data/Business process;Violation of laws or regulations;FALSE
-Information system;Violation of laws or regulations;TRUE
-Other;Violation of laws or regulations;FALSE
-Electronic data/Business process;Copyright violation;FALSE
-Information system;Copyright violation;TRUE
-Other;Copyright violation;FALSE
-Electronic data/Business process;Detectability – violation of anonymity or pseudonymity;FALSE
-Information system;Detectability – violation of anonymity or pseudonymity;TRUE
-Other;Detectability – violation of anonymity or pseudonymity;FALSE
-Electronic data/Business process;Identifiability;FALSE
-Information system;Identifiability;TRUE
-Other;Identifiability;FALSE
-Electronic data/Business process;Linkability;FALSE
-Information system;Linkability;TRUE
-Other;Linkability;FALSE
-Electronic data/Business process;Non-compliance with the legal basis - violation of the rights of the data subject;FALSE
-Information system;Non-compliance with the legal basis - violation of the rights of the data subject;TRUE
-Other;Non-compliance with the legal basis - violation of the rights of the data subject;FALSE
+Asset type,Threat,Value
+Paper data,"Pollution, dust,  corrosion, frost",FALSE
+Information system,"Pollution, dust,  corrosion, frost",FALSE
+Information system,"Pollution, dust,  corrosion, frost",TRUE
+Server infrastructure,"Pollution, dust,  corrosion, frost",FALSE
+Network infrastructure,"Pollution, dust,  corrosion, frost",FALSE
+Data storage,"Pollution, dust,  corrosion, frost",FALSE
+"Equipment, machines","Pollution, dust,  corrosion, frost",FALSE
+IoT,"Pollution, dust,  corrosion, frost",FALSE
+PC,"Pollution, dust,  corrosion, frost",FALSE
+Laptop,"Pollution, dust,  corrosion, frost",FALSE
+Mobile devices,"Pollution, dust,  corrosion, frost",FALSE
+Portable data media,"Pollution, dust,  corrosion, frost",FALSE
+Other,"Pollution, dust,  corrosion, frost",FALSE
+Paper data,"Water, humidity",FALSE
+Information system,"Water, humidity",FALSE
+Information system,"Water, humidity",TRUE
+Server infrastructure,"Water, humidity",FALSE
+Network infrastructure,"Water, humidity",FALSE
+Data storage,"Water, humidity",FALSE
+"Equipment, machines","Water, humidity",FALSE
+IoT,"Water, humidity",FALSE
+PC,"Water, humidity",FALSE
+Laptop,"Water, humidity",FALSE
+Mobile devices,"Water, humidity",FALSE
+Portable data media,"Water, humidity",FALSE
+Location,"Water, humidity",FALSE
+Other,"Water, humidity",FALSE
+Paper data,Heat radiation,FALSE
+Information system,Heat radiation,FALSE
+Information system,Heat radiation,TRUE
+Server infrastructure,Heat radiation,FALSE
+Network infrastructure,Heat radiation,FALSE
+Data storage,Heat radiation,FALSE
+"Equipment, machines",Heat radiation,FALSE
+IoT,Heat radiation,FALSE
+PC,Heat radiation,FALSE
+Laptop,Heat radiation,FALSE
+Mobile devices,Heat radiation,FALSE
+Portable data media,Heat radiation,FALSE
+Location,Heat radiation,FALSE
+Staff,Heat radiation,FALSE
+Other,Heat radiation,FALSE
+Information system,"Harmful radiation, radiation, or electromagnetic pulses",FALSE
+Information system,"Harmful radiation, radiation, or electromagnetic pulses",TRUE
+Server infrastructure,"Harmful radiation, radiation, or electromagnetic pulses",FALSE
+Network infrastructure,"Harmful radiation, radiation, or electromagnetic pulses",FALSE
+Data storage,"Harmful radiation, radiation, or electromagnetic pulses",FALSE
+"Equipment, machines","Harmful radiation, radiation, or electromagnetic pulses",FALSE
+IoT,"Harmful radiation, radiation, or electromagnetic pulses",FALSE
+PC,"Harmful radiation, radiation, or electromagnetic pulses",FALSE
+Laptop,"Harmful radiation, radiation, or electromagnetic pulses",FALSE
+Mobile devices,"Harmful radiation, radiation, or electromagnetic pulses",FALSE
+Portable data media,"Harmful radiation, radiation, or electromagnetic pulses",FALSE
+Location,"Harmful radiation, radiation, or electromagnetic pulses",FALSE
+Staff,"Harmful radiation, radiation, or electromagnetic pulses",FALSE
+Other,"Harmful radiation, radiation, or electromagnetic pulses",FALSE
+Information system,Interference of electrical signals,FALSE
+Information system,Interference of electrical signals,TRUE
+Server infrastructure,Interference of electrical signals,FALSE
+Network infrastructure,Interference of electrical signals,FALSE
+Data storage,Interference of electrical signals,FALSE
+"Equipment, machines",Interference of electrical signals,FALSE
+IoT,Interference of electrical signals,FALSE
+PC,Interference of electrical signals,FALSE
+Laptop,Interference of electrical signals,FALSE
+Mobile devices,Interference of electrical signals,FALSE
+Portable data media,Interference of electrical signals,FALSE
+Other,Interference of electrical signals,FALSE
+Paper data,Fire,FALSE
+Information system,Fire,FALSE
+Information system,Fire,TRUE
+Server infrastructure,Fire,FALSE
+Network infrastructure,Fire,FALSE
+Data storage,Fire,FALSE
+"Equipment, machines",Fire,FALSE
+IoT,Fire,FALSE
+PC,Fire,FALSE
+Laptop,Fire,FALSE
+Mobile devices,Fire,FALSE
+Portable data media,Fire,FALSE
+Location,Fire,FALSE
+Staff,Fire,FALSE
+Other,Fire,FALSE
+Paper data,Toxic substances in the area,FALSE
+Information system,Toxic substances in the area,FALSE
+Information system,Toxic substances in the area,TRUE
+Server infrastructure,Toxic substances in the area,FALSE
+Network infrastructure,Toxic substances in the area,FALSE
+Data storage,Toxic substances in the area,FALSE
+"Equipment, machines",Toxic substances in the area,FALSE
+IoT,Toxic substances in the area,FALSE
+PC,Toxic substances in the area,FALSE
+Laptop,Toxic substances in the area,FALSE
+Mobile devices,Toxic substances in the area,FALSE
+Portable data media,Toxic substances in the area,FALSE
+Location,Toxic substances in the area,FALSE
+Staff,Toxic substances in the area,FALSE
+Other,Toxic substances in the area,FALSE
+Paper data,Surrounding events and accidents with negative impact,FALSE
+Information system,Surrounding events and accidents with negative impact,FALSE
+Information system,Surrounding events and accidents with negative impact,TRUE
+Server infrastructure,Surrounding events and accidents with negative impact,FALSE
+Network infrastructure,Surrounding events and accidents with negative impact,FALSE
+Data storage,Surrounding events and accidents with negative impact,FALSE
+"Equipment, machines",Surrounding events and accidents with negative impact,FALSE
+IoT,Surrounding events and accidents with negative impact,FALSE
+PC,Surrounding events and accidents with negative impact,FALSE
+Location,Surrounding events and accidents with negative impact,FALSE
+Staff,Surrounding events and accidents with negative impact,FALSE
+Other,Surrounding events and accidents with negative impact,FALSE
+Paper data,"Terrorist attack, sabotage, explosion",FALSE
+Information system,"Terrorist attack, sabotage, explosion",FALSE
+Information system,"Terrorist attack, sabotage, explosion",TRUE
+Server infrastructure,"Terrorist attack, sabotage, explosion",FALSE
+Network infrastructure,"Terrorist attack, sabotage, explosion",FALSE
+Data storage,"Terrorist attack, sabotage, explosion",FALSE
+"Equipment, machines","Terrorist attack, sabotage, explosion",FALSE
+IoT,"Terrorist attack, sabotage, explosion",FALSE
+PC,"Terrorist attack, sabotage, explosion",FALSE
+Laptop,"Terrorist attack, sabotage, explosion",FALSE
+Mobile devices,"Terrorist attack, sabotage, explosion",FALSE
+Portable data media,"Terrorist attack, sabotage, explosion",FALSE
+Location,"Terrorist attack, sabotage, explosion",FALSE
+Staff,"Terrorist attack, sabotage, explosion",FALSE
+Other,"Terrorist attack, sabotage, explosion",FALSE
+Paper data,"Coercion, extortion, corruption",FALSE
+Information system,"Coercion, extortion, corruption",FALSE
+Information system,"Coercion, extortion, corruption",TRUE
+Staff,"Coercion, extortion, corruption",FALSE
+Other,"Coercion, extortion, corruption",FALSE
+Paper data,Unauthorized entry into premises,FALSE
+Information system,Unauthorized entry into premises,FALSE
+Information system,Unauthorized entry into premises,TRUE
+Server infrastructure,Unauthorized entry into premises,FALSE
+Network infrastructure,Unauthorized entry into premises,FALSE
+Data storage,Unauthorized entry into premises,FALSE
+"Equipment, machines",Unauthorized entry into premises,FALSE
+IoT,Unauthorized entry into premises,FALSE
+PC,Unauthorized entry into premises,FALSE
+Laptop,Unauthorized entry into premises,FALSE
+Mobile devices,Unauthorized entry into premises,FALSE
+Portable data media,Unauthorized entry into premises,FALSE
+Location,Unauthorized entry into premises,FALSE
+Other,Unauthorized entry into premises,FALSE
+Paper data,Unauthorized use of devices and unauthorized access to devices,FALSE
+Information system,Unauthorized use of devices and unauthorized access to devices,FALSE
+Information system,Unauthorized use of devices and unauthorized access to devices,TRUE
+Server infrastructure,Unauthorized use of devices and unauthorized access to devices,FALSE
+Network infrastructure,Unauthorized use of devices and unauthorized access to devices,FALSE
+Data storage,Unauthorized use of devices and unauthorized access to devices,FALSE
+"Equipment, machines",Unauthorized use of devices and unauthorized access to devices,FALSE
+IoT,Unauthorized use of devices and unauthorized access to devices,FALSE
+PC,Unauthorized use of devices and unauthorized access to devices,FALSE
+Laptop,Unauthorized use of devices and unauthorized access to devices,FALSE
+Mobile devices,Unauthorized use of devices and unauthorized access to devices,FALSE
+Portable data media,Unauthorized use of devices and unauthorized access to devices,FALSE
+Other,Unauthorized use of devices and unauthorized access to devices,FALSE
+Paper data,Physical theft or physical damage to devices or media,FALSE
+Information system,Physical theft or physical damage to devices or media,FALSE
+Information system,Physical theft or physical damage to devices or media,TRUE
+Server infrastructure,Physical theft or physical damage to devices or media,FALSE
+Network infrastructure,Physical theft or physical damage to devices or media,FALSE
+Data storage,Physical theft or physical damage to devices or media,FALSE
+"Equipment, machines",Physical theft or physical damage to devices or media,FALSE
+IoT,Physical theft or physical damage to devices or media,FALSE
+PC,Physical theft or physical damage to devices or media,FALSE
+Laptop,Physical theft or physical damage to devices or media,FALSE
+Mobile devices,Physical theft or physical damage to devices or media,FALSE
+Portable data media,Physical theft or physical damage to devices or media,FALSE
+Other,Physical theft or physical damage to devices or media,FALSE
+Paper data,"Theft, infiltration, or modification of data during physical transfer",FALSE
+Electronic data/Business process,"Theft, infiltration, or modification of data during physical transfer",FALSE
+Information system,"Theft, infiltration, or modification of data during physical transfer",TRUE
+Laptop,"Theft, infiltration, or modification of data during physical transfer",FALSE
+Mobile devices,"Theft, infiltration, or modification of data during physical transfer",FALSE
+Portable data media,"Theft, infiltration, or modification of data during physical transfer",FALSE
+Other,"Theft, infiltration, or modification of data during physical transfer",FALSE
+Paper data,Climatic or meteorological event,FALSE
+Information system,Climatic or meteorological event,FALSE
+Information system,Climatic or meteorological event,TRUE
+Server infrastructure,Climatic or meteorological event,FALSE
+Network infrastructure,Climatic or meteorological event,FALSE
+Data storage,Climatic or meteorological event,FALSE
+"Equipment, machines",Climatic or meteorological event,FALSE
+IoT,Climatic or meteorological event,FALSE
+PC,Climatic or meteorological event,FALSE
+Laptop,Climatic or meteorological event,FALSE
+Mobile devices,Climatic or meteorological event,FALSE
+Portable data media,Climatic or meteorological event,FALSE
+Location,Climatic or meteorological event,FALSE
+Staff,Climatic or meteorological event,FALSE
+Other,Climatic or meteorological event,FALSE
+Paper data,Seismic event,FALSE
+Information system,Seismic event,FALSE
+Information system,Seismic event,TRUE
+Server infrastructure,Seismic event,FALSE
+Network infrastructure,Seismic event,FALSE
+Data storage,Seismic event,FALSE
+"Equipment, machines",Seismic event,FALSE
+IoT,Seismic event,FALSE
+PC,Seismic event,FALSE
+Laptop,Seismic event,FALSE
+Mobile devices,Seismic event,FALSE
+Portable data media,Seismic event,FALSE
+Location,Seismic event,FALSE
+Staff,Seismic event,FALSE
+Other,Seismic event,FALSE
+Paper data,Volcanic event,FALSE
+Information system,Volcanic event,FALSE
+Information system,Volcanic event,TRUE
+Server infrastructure,Volcanic event,FALSE
+Network infrastructure,Volcanic event,FALSE
+Data storage,Volcanic event,FALSE
+"Equipment, machines",Volcanic event,FALSE
+IoT,Volcanic event,FALSE
+PC,Volcanic event,FALSE
+Laptop,Volcanic event,FALSE
+Mobile devices,Volcanic event,FALSE
+Portable data media,Volcanic event,FALSE
+Location,Volcanic event,FALSE
+Staff,Volcanic event,FALSE
+Other,Volcanic event,FALSE
+Information system,Pandemic / epidemic event,TRUE
+Staff,Pandemic / epidemic event,FALSE
+Other,Pandemic / epidemic event,FALSE
+Paper data,Damage caused by animals,FALSE
+Information system,Damage caused by animals,FALSE
+Information system,Damage caused by animals,TRUE
+Server infrastructure,Damage caused by animals,FALSE
+Network infrastructure,Damage caused by animals,FALSE
+Data storage,Damage caused by animals,FALSE
+"Equipment, machines",Damage caused by animals,FALSE
+IoT,Damage caused by animals,FALSE
+PC,Damage caused by animals,FALSE
+Laptop,Damage caused by animals,FALSE
+Mobile devices,Damage caused by animals,FALSE
+Portable data media,Damage caused by animals,FALSE
+Location,Damage caused by animals,FALSE
+Other,Damage caused by animals,FALSE
+Information system,The existence of a known software vulnerability,FALSE
+Information system,The existence of a known software vulnerability,TRUE
+Network infrastructure,The existence of a known software vulnerability,FALSE
+Virtualization platform,The existence of a known software vulnerability,FALSE
+Operating system,The existence of a known software vulnerability,FALSE
+Application software,The existence of a known software vulnerability,FALSE
+Data storage,The existence of a known software vulnerability,FALSE
+IoT,The existence of a known software vulnerability,FALSE
+Mobile devices,The existence of a known software vulnerability,FALSE
+Other,The existence of a known software vulnerability,FALSE
+Information system,Unauthorized manipulation of software or a hacker attack,FALSE
+Information system,Unauthorized manipulation of software or a hacker attack,TRUE
+Network infrastructure,Unauthorized manipulation of software or a hacker attack,FALSE
+Virtualization platform,Unauthorized manipulation of software or a hacker attack,FALSE
+Operating system,Unauthorized manipulation of software or a hacker attack,FALSE
+Application software,Unauthorized manipulation of software or a hacker attack,FALSE
+Cloud services,Unauthorized manipulation of software or a hacker attack,FALSE
+Data storage,Unauthorized manipulation of software or a hacker attack,FALSE
+"Equipment, machines",Unauthorized manipulation of software or a hacker attack,FALSE
+IoT,Unauthorized manipulation of software or a hacker attack,FALSE
+PC,Unauthorized manipulation of software or a hacker attack,FALSE
+Laptop,Unauthorized manipulation of software or a hacker attack,FALSE
+Mobile devices,Unauthorized manipulation of software or a hacker attack,FALSE
+Other,Unauthorized manipulation of software or a hacker attack,FALSE
+Information system,Malware infiltration,FALSE
+Information system,Malware infiltration,TRUE
+Network infrastructure,Malware infiltration,FALSE
+Virtualization platform,Malware infiltration,FALSE
+Operating system,Malware infiltration,FALSE
+Application software,Malware infiltration,FALSE
+Cloud services,Malware infiltration,FALSE
+Data storage,Malware infiltration,FALSE
+"Equipment, machines",Malware infiltration,FALSE
+IoT,Malware infiltration,FALSE
+PC,Malware infiltration,FALSE
+Laptop,Malware infiltration,FALSE
+Mobile devices,Malware infiltration,FALSE
+Portable data media,Malware infiltration,FALSE
+Other,Malware infiltration,FALSE
+Electronic data/Business process,Infiltration and modification of data â€“ damage or loss of data,FALSE
+Information system,Infiltration and modification of data â€“ damage or loss of data,TRUE
+Cloud services,Infiltration and modification of data â€“ damage or loss of data,FALSE
+Data storage,Infiltration and modification of data â€“ damage or loss of data,FALSE
+"Equipment, machines",Infiltration and modification of data â€“ damage or loss of data,FALSE
+IoT,Infiltration and modification of data â€“ damage or loss of data,FALSE
+PC,Infiltration and modification of data â€“ damage or loss of data,FALSE
+Laptop,Infiltration and modification of data â€“ damage or loss of data,FALSE
+Mobile devices,Infiltration and modification of data â€“ damage or loss of data,FALSE
+Portable data media,Infiltration and modification of data â€“ damage or loss of data,FALSE
+Other,Infiltration and modification of data â€“ damage or loss of data,FALSE
+Information system,Communication interception,FALSE
+Information system,Communication interception,TRUE
+Network infrastructure,Communication interception,FALSE
+Other,Communication interception,FALSE
+Information system,Web communication infiltration,FALSE
+Information system,Web communication infiltration,TRUE
+Network infrastructure,Web communication infiltration,FALSE
+Other,Web communication infiltration,FALSE
+Information system,Unauthorized or misdirected messages,FALSE
+Information system,Unauthorized or misdirected messages,TRUE
+Network infrastructure,Unauthorized or misdirected messages,FALSE
+Other,Unauthorized or misdirected messages,FALSE
+Information system,"Falsification of identity, rights or permissions and their misuse",FALSE
+Information system,"Falsification of identity, rights or permissions and their misuse",TRUE
+Network infrastructure,"Falsification of identity, rights or permissions and their misuse",FALSE
+Virtualization platform,"Falsification of identity, rights or permissions and their misuse",FALSE
+Operating system,"Falsification of identity, rights or permissions and their misuse",FALSE
+PC,"Falsification of identity, rights or permissions and their misuse",FALSE
+Laptop,"Falsification of identity, rights or permissions and their misuse",FALSE
+Mobile devices,"Falsification of identity, rights or permissions and their misuse",FALSE
+Other,"Falsification of identity, rights or permissions and their misuse",FALSE
+Information system,Theft of digital identity,FALSE
+Information system,Theft of digital identity,TRUE
+Network infrastructure,Theft of digital identity,FALSE
+Virtualization platform,Theft of digital identity,FALSE
+Operating system,Theft of digital identity,FALSE
+Cloud services,Theft of digital identity,FALSE
+PC,Theft of digital identity,FALSE
+Laptop,Theft of digital identity,FALSE
+Mobile devices,Theft of digital identity,FALSE
+Other,Theft of digital identity,FALSE
+Information system,Unauthorized location detection,TRUE
+Laptop,Unauthorized location detection,FALSE
+Mobile devices,Unauthorized location detection,FALSE
+Other,Unauthorized location detection,FALSE
+Information system,"Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST)",FALSE
+Information system,"Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST)",TRUE
+Server infrastructure,"Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST)",FALSE
+Network infrastructure,"Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST)",FALSE
+IoT,"Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST)",FALSE
+PC,"Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST)",FALSE
+Laptop,"Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST)",FALSE
+Other,"Physical eavesdropping and surveillance, possibly through Electronic eavesdropping (EE) or similar methods (TEMPEST)",FALSE
+Paper data,Retrieving data from improperly recycled or discarded media,FALSE
+Electronic data/Business process,Retrieving data from improperly recycled or discarded media,FALSE
+Information system,Retrieving data from improperly recycled or discarded media,TRUE
+Server infrastructure,Retrieving data from improperly recycled or discarded media,FALSE
+PC,Retrieving data from improperly recycled or discarded media,FALSE
+Laptop,Retrieving data from improperly recycled or discarded media,FALSE
+Mobile devices,Retrieving data from improperly recycled or discarded media,FALSE
+Portable data media,Retrieving data from improperly recycled or discarded media,FALSE
+Other,Retrieving data from improperly recycled or discarded media,FALSE
+Electronic data/Business process,Data input from untrusted sources,FALSE
+Information system,Data input from untrusted sources,TRUE
+Other,Data input from untrusted sources,FALSE
+Paper data,Unauthorized intentional activity by users,FALSE
+Information system,Unauthorized intentional activity by users,FALSE
+Information system,Unauthorized intentional activity by users,TRUE
+Network infrastructure,Unauthorized intentional activity by users,FALSE
+Operating system,Unauthorized intentional activity by users,FALSE
+Application software,Unauthorized intentional activity by users,FALSE
+Cloud services,Unauthorized intentional activity by users,FALSE
+Data storage,Unauthorized intentional activity by users,FALSE
+"Equipment, machines",Unauthorized intentional activity by users,FALSE
+IoT,Unauthorized intentional activity by users,FALSE
+PC,Unauthorized intentional activity by users,FALSE
+Laptop,Unauthorized intentional activity by users,FALSE
+Mobile devices,Unauthorized intentional activity by users,FALSE
+Portable data media,Unauthorized intentional activity by users,FALSE
+Other,Unauthorized intentional activity by users,FALSE
+Paper data,Unauthorized intentional activity by privileged users,FALSE
+Information system,Unauthorized intentional activity by privileged users,FALSE
+Information system,Unauthorized intentional activity by privileged users,TRUE
+Server infrastructure,Unauthorized intentional activity by privileged users,FALSE
+Network infrastructure,Unauthorized intentional activity by privileged users,FALSE
+Virtualization platform,Unauthorized intentional activity by privileged users,FALSE
+Operating system,Unauthorized intentional activity by privileged users,FALSE
+Application software,Unauthorized intentional activity by privileged users,FALSE
+Cloud services,Unauthorized intentional activity by privileged users,FALSE
+Data storage,Unauthorized intentional activity by privileged users,FALSE
+"Equipment, machines",Unauthorized intentional activity by privileged users,FALSE
+IoT,Unauthorized intentional activity by privileged users,FALSE
+PC,Unauthorized intentional activity by privileged users,FALSE
+Laptop,Unauthorized intentional activity by privileged users,FALSE
+Mobile devices,Unauthorized intentional activity by privileged users,FALSE
+Portable data media,Unauthorized intentional activity by privileged users,FALSE
+Other,Unauthorized intentional activity by privileged users,FALSE
+Paper data,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Information system,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Information system,Unauthorized intentional actions by operators or employees providing support services,TRUE
+Server infrastructure,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Network infrastructure,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Virtualization platform,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Operating system,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Application software,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Cloud services,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Data storage,Unauthorized intentional actions by operators or employees providing support services,FALSE
+"Equipment, machines",Unauthorized intentional actions by operators or employees providing support services,FALSE
+IoT,Unauthorized intentional actions by operators or employees providing support services,FALSE
+PC,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Laptop,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Mobile devices,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Portable data media,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Other,Unauthorized intentional actions by operators or employees providing support services,FALSE
+Information system,User error,FALSE
+Information system,User error,TRUE
+Network infrastructure,User error,FALSE
+Operating system,User error,FALSE
+Application software,User error,FALSE
+Cloud services,User error,FALSE
+Data storage,User error,FALSE
+"Equipment, machines",User error,FALSE
+IoT,User error,FALSE
+PC,User error,FALSE
+Laptop,User error,FALSE
+Mobile devices,User error,FALSE
+Portable data media,User error,FALSE
+Other,User error,FALSE
+Information system,Error of a privileged user,FALSE
+Information system,Error of a privileged user,TRUE
+Server infrastructure,Error of a privileged user,FALSE
+Network infrastructure,Error of a privileged user,FALSE
+Virtualization platform,Error of a privileged user,FALSE
+Operating system,Error of a privileged user,FALSE
+Application software,Error of a privileged user,FALSE
+Cloud services,Error of a privileged user,FALSE
+Data storage,Error of a privileged user,FALSE
+"Equipment, machines",Error of a privileged user,FALSE
+IoT,Error of a privileged user,FALSE
+PC,Error of a privileged user,FALSE
+Laptop,Error of a privileged user,FALSE
+Mobile devices,Error of a privileged user,FALSE
+Portable data media,Error of a privileged user,FALSE
+Other,Error of a privileged user,FALSE
+Information system,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+Information system,"Error or failure of operations, maintenance, or an employee performing support services",TRUE
+Server infrastructure,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+Network infrastructure,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+Virtualization platform,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+Operating system,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+Application software,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+Cloud services,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+Data storage,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+"Equipment, machines","Error or failure of operations, maintenance, or an employee performing support services",FALSE
+IoT,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+PC,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+Laptop,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+Mobile devices,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+Portable data media,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+Other,"Error or failure of operations, maintenance, or an employee performing support services",FALSE
+Paper data,Repudiation (Denial of activity),FALSE
+Information system,Repudiation (Denial of activity),FALSE
+Information system,Repudiation (Denial of activity),TRUE
+Other,Repudiation (Denial of activity),FALSE
+Information system,Improper use of equipment,FALSE
+Information system,Improper use of equipment,TRUE
+Network infrastructure,Improper use of equipment,FALSE
+"Equipment, machines",Improper use of equipment,FALSE
+IoT,Improper use of equipment,FALSE
+PC,Improper use of equipment,FALSE
+Laptop,Improper use of equipment,FALSE
+Mobile devices,Improper use of equipment,FALSE
+Other,Improper use of equipment,FALSE
+Paper data,Disclosure of information,FALSE
+Electronic data/Business process,Disclosure of information,FALSE
+Information system,Disclosure of information,TRUE
+Other,Disclosure of information,FALSE
+Paper data,Incorrect disclosure of information,FALSE
+Electronic data/Business process,Incorrect disclosure of information,FALSE
+Information system,Incorrect disclosure of information,TRUE
+Other,Incorrect disclosure of information,FALSE
+Information system,Use of unauthorized software,FALSE
+Information system,Use of unauthorized software,TRUE
+Application software,Use of unauthorized software,FALSE
+IoT,Use of unauthorized software,FALSE
+PC,Use of unauthorized software,FALSE
+Laptop,Use of unauthorized software,FALSE
+Mobile devices,Use of unauthorized software,FALSE
+Other,Use of unauthorized software,FALSE
+Information system,Use of unauthorized hardware,FALSE
+Information system,Use of unauthorized hardware,TRUE
+Server infrastructure,Use of unauthorized hardware,FALSE
+Network infrastructure,Use of unauthorized hardware,FALSE
+Data storage,Use of unauthorized hardware,FALSE
+IoT,Use of unauthorized hardware,FALSE
+PC,Use of unauthorized hardware,FALSE
+Laptop,Use of unauthorized hardware,FALSE
+Mobile devices,Use of unauthorized hardware,FALSE
+Portable data media,Use of unauthorized hardware,FALSE
+Other,Use of unauthorized hardware,FALSE
+Paper data,Illegal and unauthorized processing of data,FALSE
+Electronic data/Business process,Illegal and unauthorized processing of data,FALSE
+Information system,Illegal and unauthorized processing of data,TRUE
+Other,Illegal and unauthorized processing of data,FALSE
+Paper data,Human communication failure,FALSE
+Electronic data/Business process,Human communication failure,FALSE
+Information system,Human communication failure,TRUE
+Other,Human communication failure,FALSE
+Information system,Denial of service,FALSE
+Information system,Denial of service,TRUE
+Cloud services,Denial of service,FALSE
+Other,Denial of service,FALSE
+Information system,Software or service failure,FALSE
+Information system,Software or service failure,TRUE
+Network infrastructure,Software or service failure,FALSE
+Virtualization platform,Software or service failure,FALSE
+Operating system,Software or service failure,FALSE
+Application software,Software or service failure,FALSE
+Cloud services,Software or service failure,FALSE
+Data storage,Software or service failure,FALSE
+Other,Software or service failure,FALSE
+Information system,Device or system failure,FALSE
+Information system,Device or system failure,TRUE
+Server infrastructure,Device or system failure,FALSE
+Network infrastructure,Device or system failure,FALSE
+"Equipment, machines",Device or system failure,FALSE
+IoT,Device or system failure,FALSE
+PC,Device or system failure,FALSE
+Laptop,Device or system failure,FALSE
+Mobile devices,Device or system failure,FALSE
+Other,Device or system failure,FALSE
+Information system,Overloading of the information system,FALSE
+Information system,Overloading of the information system,TRUE
+Network infrastructure,Overloading of the information system,FALSE
+Cloud services,Overloading of the information system,FALSE
+Other,Overloading of the information system,FALSE
+Information system,Telecommunication network failure,FALSE
+Information system,Telecommunication network failure,TRUE
+Network infrastructure,Telecommunication network failure,FALSE
+Cloud services,Telecommunication network failure,FALSE
+Other,Telecommunication network failure,FALSE
+Information system,"Power system failure, power loss, or fluctuations in performance",FALSE
+Information system,"Power system failure, power loss, or fluctuations in performance",TRUE
+Server infrastructure,"Power system failure, power loss, or fluctuations in performance",FALSE
+Network infrastructure,"Power system failure, power loss, or fluctuations in performance",FALSE
+Cloud services,"Power system failure, power loss, or fluctuations in performance",FALSE
+Data storage,"Power system failure, power loss, or fluctuations in performance",FALSE
+"Equipment, machines","Power system failure, power loss, or fluctuations in performance",FALSE
+IoT,"Power system failure, power loss, or fluctuations in performance",FALSE
+PC,"Power system failure, power loss, or fluctuations in performance",FALSE
+Laptop,"Power system failure, power loss, or fluctuations in performance",FALSE
+Other,"Power system failure, power loss, or fluctuations in performance",FALSE
+Information system,Failure of the cooling or ventilation system,FALSE
+Information system,Failure of the cooling or ventilation system,TRUE
+Server infrastructure,Failure of the cooling or ventilation system,FALSE
+Network infrastructure,Failure of the cooling or ventilation system,FALSE
+Data storage,Failure of the cooling or ventilation system,FALSE
+Other,Failure of the cooling or ventilation system,FALSE
+Paper data,Office equipment failure,FALSE
+Information system,Office equipment failure,FALSE
+Information system,Office equipment failure,TRUE
+Mobile devices,Office equipment failure,FALSE
+Other,Office equipment failure,FALSE
+Information system,Degradation of equipment or storage media (obsolescence),FALSE
+Information system,Degradation of equipment or storage media (obsolescence),TRUE
+Portable data media,Degradation of equipment or storage media (obsolescence),FALSE
+Other,Degradation of equipment or storage media (obsolescence),FALSE
+Information system,Disruption of availability during an audit or other authorized security assessment,FALSE
+Information system,Disruption of availability during an audit or other authorized security assessment,TRUE
+Network infrastructure,Disruption of availability during an audit or other authorized security assessment,FALSE
+Cloud services,Disruption of availability during an audit or other authorized security assessment,FALSE
+Other,Disruption of availability during an audit or other authorized security assessment,FALSE
+Information system,Poor planning and adaptation shortcomings,FALSE
+Information system,Poor planning and adaptation shortcomings,TRUE
+Cloud services,Poor planning and adaptation shortcomings,FALSE
+Staff,Poor planning and adaptation shortcomings,FALSE
+Other,Poor planning and adaptation shortcomings,FALSE
+Information system,Lack of staff,TRUE
+Staff,Lack of staff,FALSE
+Other,Lack of staff,FALSE
+Information system,Lack of resources,FALSE
+Information system,Lack of resources,TRUE
+Other,Lack of resources,FALSE
+Information system,Employee strike or refusal to act,TRUE
+Staff,Employee strike or refusal to act,FALSE
+Other,Employee strike or refusal to act,FALSE
+Electronic data/Business process,Social Engineering,FALSE
+Information system,Social Engineering,TRUE
+Staff,Social Engineering,FALSE
+Other,Social Engineering,FALSE
+Electronic data/Business process,Reputation damage,FALSE
+Information system,Reputation damage,TRUE
+Other,Reputation damage,FALSE
+Information system,Service provider failure,FALSE
+Information system,Service provider failure,TRUE
+Cloud services,Service provider failure,FALSE
+Other,Service provider failure,FALSE
+Information system,Software design or development errors,FALSE
+Information system,Software design or development errors,TRUE
+Other,Software design or development errors,FALSE
+Information system,Using software that does not meet security requirements,FALSE
+Information system,Using software that does not meet security requirements,TRUE
+Network infrastructure,Using software that does not meet security requirements,FALSE
+Virtualization platform,Using software that does not meet security requirements,FALSE
+Operating system,Using software that does not meet security requirements,FALSE
+Application software,Using software that does not meet security requirements,FALSE
+Data storage,Using software that does not meet security requirements,FALSE
+IoT,Using software that does not meet security requirements,FALSE
+PC,Using software that does not meet security requirements,FALSE
+Laptop,Using software that does not meet security requirements,FALSE
+Mobile devices,Using software that does not meet security requirements,FALSE
+Other,Using software that does not meet security requirements,FALSE
+Electronic data/Business process,Violation of internal policies or standards,FALSE
+Information system,Violation of internal policies or standards,TRUE
+Other,Violation of internal policies or standards,FALSE
+Electronic data/Business process,Violation of laws or regulations,FALSE
+Information system,Violation of laws or regulations,TRUE
+Other,Violation of laws or regulations,FALSE
+Electronic data/Business process,Copyright violation,FALSE
+Information system,Copyright violation,TRUE
+Other,Copyright violation,FALSE
+Electronic data/Business process,Detectability â€“ violation of anonymity or pseudonymity,FALSE
+Information system,Detectability â€“ violation of anonymity or pseudonymity,TRUE
+Other,Detectability â€“ violation of anonymity or pseudonymity,FALSE
+Electronic data/Business process,Identifiability,FALSE
+Information system,Identifiability,TRUE
+Other,Identifiability,FALSE
+Electronic data/Business process,Linkability,FALSE
+Information system,Linkability,TRUE
+Other,Linkability,FALSE
+Electronic data/Business process,Non-compliance with the legal basis - violation of the rights of the data subject,FALSE
+Information system,Non-compliance with the legal basis - violation of the rights of the data subject,TRUE
+Other,Non-compliance with the legal basis - violation of the rights of the data subject,FALSE

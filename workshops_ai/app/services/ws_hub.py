@@ -4,7 +4,7 @@
 # - Minimal, FastAPI-friendly broadcast hub with async registration.
 # - Per-connection metadata (org_id/user_id/tab) for targeted fan-out.
 # - App-level keepalive to prevent idle disconnects.
-# - Schema-aware emitters for impacts and risks.
+# - Schema-aware emitters for impacts and risks (single + batch/list shapes).
 #
 # Public API
 # - register(ws, *, org_id=None, user_id=None, tab=None)
@@ -15,7 +15,9 @@
 # - emit(event: str, payload: dict)              # alias of broadcast
 # - broadcast_json(payload: dict)                # async; expects "event" in payload
 # - aemit_impact_set_level(payload: dict)        # validates WSImpactSetEvent
+# - aemit_impact_set_event(payload: dict)        # validates WSImpactSetListEvent
 # - aemit_risk_set_probability(payload: dict)    # validates WSRiskSetEvent or wraps plain item
+# - aemit_risk_set_event(payload: dict)          # validates WSRiskSetListEvent
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -27,11 +29,25 @@ from typing import Any, Dict, Optional
 
 from fastapi import WebSocket
 
-from workshops_ai.schemas.impact_models import WSImpactSetEvent
-from workshops_ai.schemas.risk_models import WSRiskSetEvent, RiskChangeItem
+# NOTE: These schemas are expected to exist in your codebase.
+# - Single-item events:
+#     * WSImpactSetEvent:  {"event":"impact.set_level", "payload":{...}}
+#     * WSRiskSetEvent:    {"event":"risk.set_probability", "payload":{...}}
+# - Batch/list events:
+#     * WSImpactSetListEvent: {"event":"impact.set_levels", "payload":{assetId,..., impacts:[...]} }
+#     * WSRiskSetListEvent:   {"event":"risk.set_probabilities", "payload":{assetId,..., risks:[...]} }
+from workshops_ai.schemas.impact_models import (
+    WSImpactSetEvent,
+    WSImpactSetListEvent,
+)
+from workshops_ai.schemas.risk_models import (
+    WSRiskSetEvent,
+    WSRiskSetListEvent,
+    RiskChangeItem,
+)
 
 
-# ---- Internal structures ------------------------------------------------------
+# ---- Internal structures -----------------------------------------------------
 
 
 @dataclass
@@ -194,20 +210,40 @@ class WsHub:
     @classmethod
     async def aemit_impact_set_level(cls, payload: dict[str, Any]) -> None:
         """
-        Validate and emit an 'impact.set_level' event to all relevant clients.
+        Validate and emit an 'impact.set_level' event (single-item) to all relevant clients.
 
-        Expected fields (Pydantic-enforced):
+        Expected envelope (Pydantic-enforced by WSImpactSetEvent):
           - event: "impact.set_level"
-          - org_id, asset_id, impact_code, level_index (0..4), level_value (5/20/50/70/100)
-          - note? (str), actor (str), ts (ISO8601)
+          - payload: {
+              org_id, asset_id, asset_name?,
+              impact_code, impact_name?,
+              level_index (0..4), level_value (5|20|50|70|100),
+              note?, actor, ts
+            }
         """
         evt = WSImpactSetEvent.model_validate(payload)
         await cls.broadcast_json(evt.model_dump())
 
     @classmethod
+    async def aemit_impact_set_event(cls, payload: dict[str, Any]) -> None:
+        """
+        Validate and emit an 'impact.set_levels' event (batch/list) to all relevant clients.
+
+        Expected envelope (Pydantic-enforced by WSImpactSetListEvent):
+          - event: "impact.set_levels"
+          - payload: {
+              org_id, asset_id, asset_name?,
+              impacts: [{impact_code, impact_name?, level_index, level_value, note?}, ...],
+              actor, ts
+            }
+        """
+        evt = WSImpactSetListEvent.model_validate(payload)
+        await cls.broadcast_json(evt.model_dump())
+
+    @classmethod
     async def aemit_risk_set_probability(cls, payload: dict[str, Any]) -> None:
         """
-        Validate and emit a 'risk.set_probability' event to all relevant clients.
+        Validate and emit a 'risk.set_probability' event (single-item) to all relevant clients.
 
         Accepted payloads:
           1) Full event envelope:
@@ -226,6 +262,22 @@ class WsHub:
         # Plain item path → normalize and wrap
         item = RiskChangeItem.model_validate(payload)
         evt = WSRiskSetEvent(event="risk.set_probability", payload=item)
+        await cls.broadcast_json(evt.model_dump())
+
+    @classmethod
+    async def aemit_risk_set_event(cls, payload: dict[str, Any]) -> None:
+        """
+        Validate and emit a 'risk.set_probabilities' event (batch/list) to all relevant clients.
+
+        Expected envelope (Pydantic-enforced by WSRiskSetListEvent):
+          - event: "risk.set_probabilities"
+          - payload: {
+              org_id, asset_id, asset_name?,
+              risks: [{threat_code, threat_name?, probability, note?}, ...],
+              actor, ts
+            }
+        """
+        evt = WSRiskSetListEvent.model_validate(payload)
         await cls.broadcast_json(evt.model_dump())
 
     # -- Internals --------------------------------------------------------------

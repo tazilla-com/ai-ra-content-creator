@@ -1,4 +1,4 @@
-# api/v1/schema/control.py
+# api/models/schema/control.py
 from typing import List, Optional, Literal
 from uuid import UUID
 from decimal import Decimal

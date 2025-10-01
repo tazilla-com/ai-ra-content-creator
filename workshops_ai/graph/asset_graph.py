@@ -29,6 +29,8 @@
 #   When BE submit is unavailable, we fall back to writing JSON into outbox.
 # - LLM is used ONLY for NLU (action+slots) and explain (RAG/LLM); write logic is deterministic.
 # - Idempotence and WS optimistic emits are preserved.
+# - IMPORTANT: All asset payloads returned in `state.result` are the canonical
+#   `workshops_ai.api.schema.asset.Asset` DTO dumps.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -44,9 +46,10 @@ import uuid
 from dataclasses import dataclass, asdict, is_dataclass
 from typing import Any, Callable, Literal, Optional, Sequence, cast
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 
 from workshops_ai.graph.factory import GraphDeps
+from workshops_ai.api.schema.asset import Asset  # ← canonical DTO
 
 try:
     from langgraph.graph import StateGraph, END  # type: ignore
@@ -173,7 +176,7 @@ def _schedule_coro(coro: "asyncio.Future[Any]" | "asyncio.coroutines"):  # type:
 
 
 def _to_asset_dict(a: Any) -> dict:
-    """Normalize any asset-like object to dict."""
+    """Normalize any asset-like object to dict (legacy/internal helper)."""
     if a is None:
         return {}
     if isinstance(a, dict):
@@ -209,6 +212,84 @@ def _to_asset_dict(a: Any) -> dict:
     except Exception:
         return {}
 
+# --- Canonical Asset DTO normalization (numbers → ISO labels) -----------------
+
+_CONF_INDEX_TO_LABEL = {1: "PUBLIC", 2: "INTERNAL", 3: "PROTECTED", 4: "STRICTLY_PROTECTED"}
+_IA_INDEX_TO_LABEL = {1: "LOW", 2: "MEDIUM", 3: "HIGH"}
+TA_ASSET = TypeAdapter(Asset)
+
+def _first_nonempty(*vals: Any) -> Any | None:
+    for v in vals:
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip() == "":
+            continue
+        return v
+    return None
+
+def _as_bool(v: Any) -> bool | None:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
+
+def _num_conf_to_label(v: Any) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return _CONF_INDEX_TO_LABEL.get(int(v))
+    if isinstance(v, str):
+        s = v.strip()
+        if not s or s.lower() in {"none", "null"}:
+            return None
+        return s.upper().replace("-", "_")
+    return None
+
+def _num_ia_to_label(v: Any) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return _IA_INDEX_TO_LABEL.get(int(v))
+    if isinstance(v, str):
+        s = v.strip()
+        if not s or s.lower() in {"none", "null"}:
+            return None
+        return s.upper()
+    return None
+
+def _to_asset_dto(item: Any) -> Asset:
+    """
+    Convert a backend item (dict or Pydantic model) into canonical `Asset`.
+    Accepts multiple legacy key variants and numeric CIA scales and normalizes them.
+    """
+    data = item.model_dump() if hasattr(item, "model_dump") else dict(item)
+    payload: dict[str, Any] = {
+        "id": str(_first_nonempty(data.get("id"), data.get("asset_id"), "")),
+        "name": str(_first_nonempty(data.get("name"), data.get("title"), "")),
+        "description": _first_nonempty(data.get("description"), data.get("desc")),
+        "isPrimary": _as_bool(_first_nonempty(data.get("isPrimary"), data.get("primary"), data.get("is_primary"))),
+        "assetType": str(_first_nonempty(data.get("assetType"), data.get("type"), data.get("asset_type"), "")),
+        "org_id": _first_nonempty(data.get("org_id"), data.get("orgId")),
+    }
+    conf = _num_conf_to_label(_first_nonempty(data.get("confidentiality"), data.get("c")))
+    integ = _num_ia_to_label(_first_nonempty(data.get("integrity"), data.get("i")))
+    avail = _num_ia_to_label(_first_nonempty(data.get("availability"), data.get("a")))
+    if conf is not None:
+        payload["confidentiality"] = conf
+    if integ is not None:
+        payload["integrity"] = integ
+    if avail is not None:
+        payload["availability"] = avail
+    return TA_ASSET.validate_python(payload)
 
 # -----------------------------------------------------------------------------
 # ChangeSet submit + outbox fallback
@@ -292,7 +373,7 @@ class NLUResult(BaseModel):
 
     - Keeps the original fields + sanitized() API for minimal diffs.
     - Adds from_shared_dict() to normalize/validate raw LLM JSON
-      přes shared AssetsNLU (workshops_ai.graph.nlu).
+      via shared AssetsNLU (workshops_ai.graph.nlu).
     """
     action: Optional[Intent] = None
     language: Optional[str] = None
@@ -365,7 +446,6 @@ class NLUResult(BaseModel):
             notes=getattr(shared, "notes", None),
         )
         return inst.sanitized()
-
 
 
 CREATE_RX = re.compile(r"\b(create|new|add|vytvor|zaloz|pridej|pridaj)\b")
@@ -518,7 +598,7 @@ def _infer_intent(state: AssetState) -> AssetState:
 
 
 # -----------------------------------------------------------------------------
-# Read-only nodes
+# Read-only nodes (returning canonical Asset DTO dumps)
 # -----------------------------------------------------------------------------
 
 def _assets_list(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
@@ -530,20 +610,31 @@ def _assets_list(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
             return state
 
         items = items or []
-        items_norm = [_to_asset_dict(a) for a in items]
+        # Normalize to canonical DTOs
+        dtos: list[Asset] = []
+        for a in items:
+            try:
+                dtos.append(_to_asset_dto(a))
+            except Exception as ex:
+                logger.debug("Failed to normalize asset item: %s", ex)
 
-        lines = [f"Found {len(items_norm)} assets."]
+        # Human preview
+        lines = [f"Found {len(dtos)} assets."]
         preview = []
-        for a in items_norm[:10]:
-            nid = a.get("id") or a.get("asset_id") or "?"
-            name = a.get("name") or a.get("assetName") or "Unnamed"
-            a_type = a.get("assetType") or a.get("type") or "-"
-            primary = " (primary)" if (a.get("isPrimary") or a.get("is_primary")) else ""
+        for dto in dtos[:10]:
+            d = dto.model_dump()
+            nid = d.get("id") or "?"
+            name = d.get("name") or "Unnamed"
+            a_type = d.get("assetType") or "-"
+            primary = " (primary)" if d.get("isPrimary") else ""
             preview.append(f"- {nid}: {name} [{a_type}]{primary}")
         if preview:
             lines += preview
 
-        state.result = _ui_response("\n".join(lines), extra={"assets": items_norm[:50]})
+        state.result = _ui_response(
+            "\n".join(lines),
+            extra={"assets": [a.model_dump() for a in dtos[:50]]},  # canonical DTO dumps
+        )
         return state
     return _inner
 
@@ -561,21 +652,23 @@ def _asset_get(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
             state.result = _ui_response(f"Failed to load asset '{asset_id}': {e}")
             return state
 
-        asset_d = _to_asset_dict(asset) if asset else {}
-        if not asset_d:
+        if not asset:
             state.result = _ui_response(f"Asset '{asset_id}' not found.")
             return state
 
-        name = asset_d.get("name") or asset_d.get("assetName") or asset_id
-        a_type = asset_d.get("assetType") or "-"
-        cia = {
-            "C": asset_d.get("confidentiality"),
-            "I": asset_d.get("integrity"),
-            "A": asset_d.get("availability"),
-        }
-        is_primary = bool(asset_d.get("isPrimary") or asset_d.get("is_primary"))
+        try:
+            dto = _to_asset_dto(asset)
+        except Exception as ex:
+            state.result = _ui_response(f"Asset normalization failed: {ex}")
+            return state
+
+        d = dto.model_dump()
+        name = d.get("name") or asset_id
+        a_type = d.get("assetType") or "-"
+        cia = {"C": d.get("confidentiality"), "I": d.get("integrity"), "A": d.get("availability")}
+        is_primary = bool(d.get("isPrimary"))
         note = f"Asset {asset_id}: {name} [{a_type}], CIA={cia}, primary={is_primary}"
-        state.result = _ui_response(note, extra={"asset": asset_d})
+        state.result = _ui_response(note, extra={"asset": d})  # canonical DTO dump
         return state
     return _inner
 
@@ -590,13 +683,14 @@ async def _asset_explain(deps: GraphDeps, state: AssetState) -> AssetState:
         or (state.update or {}).get("asset_id") \
         or (await _amemory_get(deps, "assets.last_hint") or {}).get("asset_id")
 
-    asset = None
+    asset_dto_dump: dict | None = None
     if asset_id:
         try:
             asset = deps.backend_port.asset_get(asset_id)
+            if asset:
+                asset_dto_dump = _to_asset_dto(asset).model_dump()
         except Exception:
-            asset = None
-    asset_d = _to_asset_dict(asset) if asset else None
+            asset_dto_dump = None
 
     # Try to get retriever from deps (GraphDeps.make_retriever(org_id, tab))
     retriever = None
@@ -609,7 +703,7 @@ async def _asset_explain(deps: GraphDeps, state: AssetState) -> AssetState:
     context_chunks: list[dict] = []
     if retriever is not None:
         try:
-            query = "Explain the asset" + (f" {asset_d.get('name')}" if asset_d and asset_d.get("name") else "")
+            query = "Explain the asset" + (f" {asset_dto_dump.get('name')}" if asset_dto_dump and asset_dto_dump.get("name") else "")
             if hasattr(retriever, "asearch"):
                 docs = await retriever.asearch(query, k=4)  # type: ignore
             else:
@@ -631,7 +725,7 @@ async def _asset_explain(deps: GraphDeps, state: AssetState) -> AssetState:
             "Keep it concise (5–8 short sentences). Avoid hallucinating unknown fields."
         )
         human_payload = {
-            "asset": asset_d or {},
+            "asset": asset_dto_dump or {},
             "selection": (state.selection or {}),
             "org_id": state.org_id,
             "context": context_chunks or None,
@@ -641,21 +735,21 @@ async def _asset_explain(deps: GraphDeps, state: AssetState) -> AssetState:
             resp = await llm.ainvoke([SystemMessage(content=sys), HumanMessage(content=json.dumps(human_payload))])  # type: ignore
             text = (getattr(resp, "content", None) or "").strip()
             if text:
-                state.result = _ui_response(text, extra={"asset": asset_d, "sources": context_chunks or None})
+                state.result = _ui_response(text, extra={"asset": asset_dto_dump, "sources": context_chunks or None})
                 return state
         except Exception as e:
             logger.debug("Explain LLM failed: %s", e)
 
     # Plain fallback without LLM
-    if asset_d:
-        name = asset_d.get("name") or "Unnamed asset"
-        a_type = asset_d.get("assetType") or "-"
-        c = asset_d.get("confidentiality"); i = asset_d.get("integrity"); a = asset_d.get("availability")
+    if asset_dto_dump:
+        name = asset_dto_dump.get("name") or "Unnamed asset"
+        a_type = asset_dto_dump.get("assetType") or "-"
+        c = asset_dto_dump.get("confidentiality"); i = asset_dto_dump.get("integrity"); a = asset_dto_dump.get("availability")
         cia_txt = ", ".join([f"C={c}", f"I={i}", f"A={a}"])
-        text = f"{name} [{a_type}]. Z pohledu bezpečnosti: {cia_txt}. Detailnější vysvětlení doplníme, jakmile bude k dispozici znalostní báze."
+        text = f"{name} [{a_type}]. From a security perspective: {cia_txt}. A deeper explanation will be added once the knowledge base is available."
     else:
-        text = "Potřebuji vybrat konkrétní aktivum (selection.asset_id), abych ho mohl vysvětlit."
-    state.result = _ui_response(text, extra={"asset": asset_d})
+        text = "I need a specific asset selected (selection.asset_id) to explain it."
+    state.result = _ui_response(text, extra={"asset": asset_dto_dump})
     return state
 
 

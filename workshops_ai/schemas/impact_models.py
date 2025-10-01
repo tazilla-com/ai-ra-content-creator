@@ -5,7 +5,8 @@
 # - ImpactUpdate: validated input (one change for one asset).
 # - ImpactChangeItem: one item inside a ChangeSet sent to BE.
 # - ImpactChangeSet: whole changeset for immediate submission (send-now).
-# - WSImpactSetEvent: WS payload to update UI optimistically.
+# - WSImpactSetEvent: WS payload to update UI optimistically (single item).
+# - WSImpactSetListEvent: WS payload to update UI optimistically (batch/list).
 #
 # Conventions
 # - Canonical impact codes are EN (normalized by the agent/tooling).
@@ -26,7 +27,7 @@ ALLOWED_LEVEL_INDEX = {0, 1, 2, 3, 4}
 ALLOWED_LEVEL_VALUE = set(LEVEL_INDEX_TO_VALUE)
 
 
-# --- Public models --------------------------------------------------------------
+# --- Public models -------------------------------------------------------------
 
 class ImpactUpdate(BaseModel):
     """
@@ -104,7 +105,7 @@ class ImpactChangeSet(BaseModel):
 
 class WSImpactSetEvent(BaseModel):
     """
-    WebSocket payload for optimistic UI update when an impact level is set.
+    WebSocket payload for optimistic UI update when an impact level is set (single item).
     """
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -134,10 +135,111 @@ class WSImpactSetEvent(BaseModel):
         return v
 
 
+# --- Batch/list WS event -------------------------------------------------------
+
+class _ImpactListEntry(BaseModel):
+    """
+    One entry in the batch/list WS payload for impacts.
+
+    NOTE:
+    - Field names follow the requested camelCase for the WS contract:
+      * impactName (str)
+      * impactLevel (int, 0..4)
+    """
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+    )
+
+    impact_name: str = Field(..., alias="impactName")
+    impact_level: int = Field(..., alias="impactLevel", ge=0, le=4)
+
+    @field_validator("impact_name")
+    @classmethod
+    def _trim_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("impactName must not be empty")
+        return v
+
+
+class _ImpactSetListPayload(BaseModel):
+    """
+    Inner 'payload' for the batch/list WS event.
+    """
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,
+    )
+
+    asset_id: str = Field(..., alias="assetId")
+    asset_name: str | None = Field(default=None, alias="assetName")
+    impacts: list[_ImpactListEntry]
+
+    @field_validator("impacts")
+    @classmethod
+    def _non_empty_impacts(cls, v: list[_ImpactListEntry]) -> list[_ImpactListEntry]:
+        if not v:
+            raise ValueError("impacts must contain at least one entry")
+        return v
+
+    @field_validator("asset_id")
+    @classmethod
+    def _trim_asset_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("assetId must not be empty")
+        return v
+
+    @field_validator("asset_name")
+    @classmethod
+    def _trim_asset_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip()
+        return v or None
+
+
+class WSImpactSetListEvent(BaseModel):
+    """
+    WebSocket payload for optimistic UI update when multiple impact levels are set.
+
+    Envelope (top-level) validation:
+      - event  : must be "impact.set_levels"
+      - org_id : organization id
+      - actor  : user id (originator)
+      - ts     : ISO 8601 timestamp
+      - payload: {_ImpactSetListPayload} with camelCase keys as requested
+                 { assetId, assetName?, impacts: [{ impactName, impactLevel }, ...] }
+    """
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        populate_by_name=True,  # keep for potential .model_dump(by_alias=True)
+    )
+
+    event: Literal["impact.set_levels"] = "impact.set_levels"
+    org_id: str
+    actor: str
+    ts: str
+    payload: _ImpactSetListPayload
+
+    @field_validator("org_id", "actor", "ts")
+    @classmethod
+    def _trim_envelope_strs(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("org_id/actor/ts must not be empty")
+        return v
+
+
 __all__ = [
     "LEVEL_INDEX_TO_VALUE",
     "ImpactUpdate",
     "ImpactChangeItem",
     "ImpactChangeSet",
     "WSImpactSetEvent",
+    "WSImpactSetListEvent",
 ]

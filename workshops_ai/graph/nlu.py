@@ -1,23 +1,34 @@
-# workshops_ai/graph/nlu.py
+# File: workshops_ai/graph/nlu.py
 """
 Shared NLU result schemas (Pydantic v2) for all agents/tabs.
 
 Contract-first rules
 - All models are strict with extra='forbid'.
 - `action` MUST be a string (never an array). A before-validator coerces ["list"] -> "list"
-  and rejects any other arrays (fixes the smoke-test failure).
+  and rejects any other arrays (fixes smoke-test failures from LLM JSON).
+- All `action` values are normalized to lowercase.
 - Levels/probabilities are integers in [0, 4].
-- Bulk payloads are strongly typed.
+- Bulk payloads are strongly typed with UUID-verified asset_ids.
 - Use these models to parse/validate LLM NLU JSON before routing to agent logic.
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional, Sequence
+from typing import Any, Literal, Optional, Sequence, Union
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+__all__ = [
+    "Selection",
+    "AssetsAction", "AssetsNLU",
+    "ImpactSetItem", "ImpactsAction", "ImpactsBulkEntry", "ImpactsNLU",
+    "ThreatSetItem", "ThreatsAction", "ThreatsBulkEntry", "ThreatsNLU",
+    "ControlsAction", "ControlsNLU",
+    "Tab",
+    "parse_nlu_for_tab",
+    "ensure_action_is_string",
+]
 
 # ---------- Helpers ----------
 
@@ -28,17 +39,27 @@ def _coerce_uuid(v: Any) -> Optional[UUID]:
         return v
     try:
         return UUID(str(v))
-    except Exception:
-        raise ValueError("asset_id must be a valid UUID")
+    except Exception as e:
+        raise ValueError("asset_id must be a valid UUID") from e
+
 
 def _int_in_range(v: Any, *, lo: int = 0, hi: int = 4, name: str = "value") -> int:
     try:
         iv = int(v)
-    except Exception:
-        raise ValueError(f"{name} must be an integer")
+    except Exception as e:
+        raise ValueError(f"{name} must be an integer") from e
     if iv < lo or iv > hi:
         raise ValueError(f"{name} must be in [{lo}, {hi}]")
     return iv
+
+
+def _to_lower_nonempty(v: Any, name: str) -> str:
+    if v is None:
+        raise ValueError(f"{name} is required")
+    s = str(v).strip()
+    if not s:
+        raise ValueError(f"{name} cannot be empty")
+    return s.lower()
 
 
 # ---------- Base / common ----------
@@ -71,12 +92,12 @@ AssetsAction = Literal["list", "get", "create", "set_meta", "explain"]
 class AssetsNLU(_StrictModel):
     """
     NLU result for the Assets agent.
-    - encode user intent in `action`
-    - optionally include target `asset_id` (for 'get', 'set_meta', etc.)
+    - Encodes user intent in `action`
+    - Optionally includes target `selection.asset_id` (for 'get', 'set_meta', etc.)
+    NOTE: Extend with meta/update fields when needed by asset graph.
     """
     action: AssetsAction
     selection: Optional[Selection] = None
-    # Additional parsed fields can be added here (e.g., meta updates).
 
     @field_validator("action", mode="before")
     @classmethod
@@ -84,12 +105,13 @@ class AssetsNLU(_StrictModel):
         """
         Guard against LLM emitting ["list"] instead of "list".
         Accept single-item list[str] (coerce), reject other arrays.
+        Also normalize to lowercase.
         """
         if isinstance(v, list):
             if len(v) == 1 and isinstance(v[0], str):
-                return v[0]
+                return v[0].strip().lower()
             raise ValueError("action must be a string, not array")
-        return v
+        return str(v).strip().lower()
 
 
 # ---------- Impacts tab ----------
@@ -97,6 +119,12 @@ class AssetsNLU(_StrictModel):
 class ImpactSetItem(_StrictModel):
     impact_code: str = Field(min_length=1)
     level: int
+
+    @field_validator("impact_code", mode="before")
+    @classmethod
+    def _impact_code_norm(cls, v: Any) -> str:
+        # Do not hard-enforce catalog membership here; just normalize.
+        return _to_lower_nonempty(v, "impact_code")
 
     @field_validator("level", mode="before")
     @classmethod
@@ -137,16 +165,17 @@ class ImpactsNLU(_StrictModel):
     # For 'bulk_set'
     entries: Optional[list[ImpactsBulkEntry]] = None
 
-    question: Optional[str] = None  # for 'explain'
+    # For 'explain'
+    question: Optional[str] = None
 
     @field_validator("action", mode="before")
     @classmethod
     def action_must_be_str(cls, v: Any) -> str:
         if isinstance(v, list):
             if len(v) == 1 and isinstance(v[0], str):
-                return v[0]
+                return v[0].strip().lower()
             raise ValueError("action must be a string, not array")
-        return v
+        return str(v).strip().lower()
 
     @field_validator("asset_id", mode="before")
     @classmethod
@@ -163,6 +192,11 @@ class ImpactsNLU(_StrictModel):
 class ThreatSetItem(_StrictModel):
     threat_code: str = Field(min_length=1)
     probability: int
+
+    @field_validator("threat_code", mode="before")
+    @classmethod
+    def _threat_code_norm(cls, v: Any) -> str:
+        return _to_lower_nonempty(v, "threat_code")
 
     @field_validator("probability", mode="before")
     @classmethod
@@ -203,16 +237,17 @@ class ThreatsNLU(_StrictModel):
     # For 'bulk_set'
     entries: Optional[list[ThreatsBulkEntry]] = None
 
-    question: Optional[str] = None  # for 'explain'
+    # For 'explain'
+    question: Optional[str] = None
 
     @field_validator("action", mode="before")
     @classmethod
     def action_must_be_str(cls, v: Any) -> str:
         if isinstance(v, list):
             if len(v) == 1 and isinstance(v[0], str):
-                return v[0]
+                return v[0].strip().lower()
             raise ValueError("action must be a string, not array")
-        return v
+        return str(v).strip().lower()
 
     @field_validator("asset_id", mode="before")
     @classmethod
@@ -242,9 +277,9 @@ class ControlsNLU(_StrictModel):
     def action_must_be_str(cls, v: Any) -> str:
         if isinstance(v, list):
             if len(v) == 1 and isinstance(v[0], str):
-                return v[0]
+                return v[0].strip().lower()
             raise ValueError("action must be a string, not array")
-        return v
+        return str(v).strip().lower()
 
 
 # ---------- Unified parsing helpers ----------
@@ -256,7 +291,10 @@ class Tab(str):
     CONTROLS = "controls"
 
 
-def parse_nlu_for_tab(tab: str, data: dict[str, Any]) -> AssetsNLU | ImpactsNLU | ThreatsNLU | ControlsNLU:
+def parse_nlu_for_tab(
+    tab: str,
+    data: dict[str, Any],
+) -> Union[AssetsNLU, ImpactsNLU, ThreatsNLU, ControlsNLU]:
     """
     Parse an LLM-produced NLU JSON into a strict, tab-specific model.
     Use this right after the LLM call, before downstream agent logic.
@@ -276,12 +314,14 @@ def parse_nlu_for_tab(tab: str, data: dict[str, Any]) -> AssetsNLU | ImpactsNLU 
 def ensure_action_is_string(nlu_dict: dict[str, Any]) -> dict[str, Any]:
     """
     Utility that can be applied pre-parse if needed in legacy flows.
-    It in-place normalizes {"action": ["list"]} -> {"action": "list"}.
+    It in-place normalizes {"action": ["list"]} -> {"action": "list"} and lowercases it.
     """
     v = nlu_dict.get("action", None)
     if isinstance(v, list):
         if len(v) == 1 and isinstance(v[0], str):
-            nlu_dict["action"] = v[0]
+            nlu_dict["action"] = v[0].strip().lower()
         else:
             raise ValueError("action must be a string, not array")
+    elif isinstance(v, str):
+        nlu_dict["action"] = v.strip().lower()
     return nlu_dict

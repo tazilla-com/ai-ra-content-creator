@@ -27,6 +27,12 @@
 #   list_threats(...)  -> alias of search_threats (same params)
 #   explain_threat(code: str) -> dict|None
 #
+#   list_impact_categories() -> list[str]
+#   normalize_impact_code(code_or_alias: str) -> str|None
+#   search_impacts(q: str|None, *, category: str|None = None, limit=200) -> list[dict]
+#   list_impacts(...) -> alias of search_impacts
+#   explain_impact(code: str) -> dict|None
+#
 #   generic_search(file_name: str, q: str|None, *, fields: list[str]|None = None, limit=50) -> list[dict]
 #
 
@@ -83,13 +89,17 @@ def _resolve_catalog_dir() -> Path:
 
 _CAT_DIR = _resolve_catalog_dir()
 
+# Asset/Threat catalogs
 _CAT_ASSET_TYPE_FILE = _CAT_DIR / "Asset type.csv"
 _CAT_AT_X_THREAT_FILE = _CAT_DIR / "Asset type x Threat.csv"
-
-# Threat catalogs
 _CAT_THREAT_FILE = _CAT_DIR / "Threat.csv"
 _CAT_THREAT_CATEGORY_FILE = _CAT_DIR / "Threat category.csv"
 _CAT_THREAT_X_CATEGORY_FILE = _CAT_DIR / "Threat x Threat category.csv"
+
+# Impact catalogs
+_CAT_IMPACT_FILE = _CAT_DIR / "Impact.csv"
+_CAT_IMPACT_CATEGORY_FILE = _CAT_DIR / "Impact category.csv"
+_CAT_IMPACT_X_CATEGORY_FILE = _CAT_DIR / "Impact x Impact category.csv"
 
 
 # --------------------------------------------------------------------------------------
@@ -244,7 +254,7 @@ def _slug(s: str | None) -> str:
 
 
 # --------------------------------------------------------------------------------------
-# Catalog indices
+# Catalog indices (caches)
 # --------------------------------------------------------------------------------------
 
 _asset_types = _CsvCache(_CAT_ASSET_TYPE_FILE)
@@ -253,6 +263,10 @@ _at_x_threat = _CsvCache(_CAT_AT_X_THREAT_FILE)
 _threats = _CsvCache(_CAT_THREAT_FILE)
 _threat_categories = _CsvCache(_CAT_THREAT_CATEGORY_FILE)
 _threat_x_category = _CsvCache(_CAT_THREAT_X_CATEGORY_FILE)
+
+_impacts = _CsvCache(_CAT_IMPACT_FILE)
+_impact_categories = _CsvCache(_CAT_IMPACT_CATEGORY_FILE)
+_impact_x_category = _CsvCache(_CAT_IMPACT_X_CATEGORY_FILE)
 
 
 # --------------------------------------------------------------------------------------
@@ -265,7 +279,7 @@ def list_asset_types() -> list[str]:
     if not rows:
         return []
     col = _first_present_column(
-        rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name")
+        rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name", "Name")
     ) or next(iter(rows[0].keys()))
     seen: set[str] = set()
     out: list[str] = []
@@ -284,7 +298,7 @@ def search_asset_types(q: str | None, *, limit: int = 50) -> list[str]:
         return []
     qn = (q or "").casefold()
     code_col = _first_present_column(
-        rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name")
+        rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name", "Name")
     ) or next(iter(rows[0].keys()))
     name_col = _first_present_column(rows, ("name", "Name", "label", "Label"))
 
@@ -314,7 +328,7 @@ def explain_asset_type(code: str) -> dict[str, str] | None:
     if not rows:
         return None
     col = _first_present_column(
-        rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name")
+        rows, ("code", "asset_type", "type", "Asset type", "EN Name", "name", "Name")
     ) or next(iter(rows[0].keys()))
     needle = code.strip()
     for r in rows:
@@ -335,7 +349,7 @@ def list_threat_categories() -> list[str]:
     col = _first_present_column(
         rows,
         ("category_code", "code", "Category", "Threat category", "threat_category", "EN Name", "Name"),
-    ) or next(iter(rows[0].keys() if rows else []), None)
+    ) or next(iter(rows[0].keys()) if rows else [], None)
     if not col:
         return []
     seen: set[str] = set()
@@ -415,15 +429,16 @@ def _build_threat_index() -> dict[str, dict[str, Any]]:
     Build a minimal, search-friendly index:
       code, name, description?, flags{intentional,unintentional,environmental},
       categories: [code], category: first or None, asset_types: [code]
+    Canonical 'code' = 'EN Name' (fallback 'Name') if 'code' is not present.
     """
     t_rows = _threats.load()
     if not t_rows:
         return {}
 
     # --- columns in Threat.csv ---
-    code_col = _first_present_column(t_rows, ("code", "threat_code", "Code", "Threat", "ID", "EN Name"))
-    name_col = _first_present_column(t_rows, ("name", "Name", "EN Name", "Threat name", "Threat"))
-    desc_col = _first_present_column(t_rows, ("description", "Description", "EN Description", "Notes", "EN Notes", "Note"))
+    code_col = _first_present_column(t_rows, ("code", "threat_code", "EN Name", "Name", "Code", "Threat", "ID"))
+    name_col = _first_present_column(t_rows, ("name", "EN Name", "Name", "Threat name", "Threat"))
+    desc_col = _first_present_column(t_rows, ("description", "EN Notes", "Notes", "Description", "EN Description"))
     intentional_col = _first_present_column(t_rows, ("intentional", "Intentional"))
     unintentional_col = _first_present_column(t_rows, ("unintentional", "Unintentional", "accidental"))
     environmental_col = _first_present_column(t_rows, ("environmental", "Environmental", "env"))
@@ -457,8 +472,8 @@ def _build_threat_index() -> dict[str, dict[str, Any]]:
 
     # --- Threat ↔ category mapping ---
     txc = _threat_x_category.load()
-    txc_threat_col = _first_present_column(txc, ("threat_code", "Threat", "Threat code", "code", "EN Name"))
-    txc_cat_col = _first_present_column(txc, ("category_code", "Category", "Threat category", "threat_category", "code", "EN Name"))
+    txc_threat_col = _first_present_column(txc, ("threat_code", "Threat", "Threat code", "code", "EN Name", "Name"))
+    txc_cat_col = _first_present_column(txc, ("category_code", "Category", "Threat category", "threat_category", "code", "EN Name", "Name"))
     threat_to_categories: dict[str, list[str]] = {}
     if txc and txc_threat_col and txc_cat_col:
         for r in txc:
@@ -474,26 +489,20 @@ def _build_threat_index() -> dict[str, dict[str, Any]]:
                 threat_to_categories[th_code].append(cat)
 
     # --- Asset type ↔ threat mapping (respect "Value" truthiness when present) ---
+    # --- Asset type ↔ Threat mapping (IGNORE Value) ---
     att = _at_x_threat.load()
-    att_asset_col = _first_present_column(att, ("asset_type", "Asset type"))
-    att_threat_col = _first_present_column(att, ("threat_code", "Threat", "threat", "EN Name"))
-    att_value_col = _first_present_column(att, ("Value", "Include", "Included", "Enabled"))
+    att_asset_col  = _first_present_column(att, ("asset_type", "Asset type", "EN Name", "Name"))
+    att_threat_col = _first_present_column(att, ("threat_code", "Threat", "threat", "EN Name", "Name"))
 
     threat_to_asset_types: dict[str, list[str]] = {}
     if att and att_threat_col:
         for r in att:
-            if att_value_col:
-                val = (r.get(att_value_col) or "").strip().lower()
-                if val and val not in {"1", "true", "t", "yes", "y", "ano"}:
-                    continue  # only include truthy mappings
-
             at = (r.get(att_asset_col) or "").strip() if att_asset_col else None
             raw_th = (r.get(att_threat_col) or "").strip()
             if not raw_th:
                 continue
-
             # normalize name/alias → canonical code (fallback to raw if unknown)
-            th_code = normalize_threat_code(raw_th) or raw_th
+            th_code = _resolve_threat_handle(raw_th) or raw_th
 
             threat_to_asset_types.setdefault(th_code, [])
             if at and at not in threat_to_asset_types[th_code]:
@@ -633,20 +642,155 @@ def explain_threat(code: str) -> Optional[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------------------
+# Public API – Impacts
+# --------------------------------------------------------------------------------------
+
+def _build_impact_index() -> dict[str, dict[str, Any]]:
+    """
+    Build a minimal index for impacts:
+      code, name, description?, categories: [code], category: first or None
+    Canonical 'code' = 'EN Name' (fallback 'Name') if 'code' is not present.
+    """
+    i_rows = _impacts.load()
+    if not i_rows:
+        return {}
+
+    code_col = _first_present_column(i_rows, ("code", "impact_code", "EN Name", "Name"))
+    name_col = _first_present_column(i_rows, ("name", "EN Name", "Name"))
+    desc_col = _first_present_column(i_rows, ("description", "EN Notes", "Notes"))
+
+    # Impact ↔ category mapping
+    ixc = _impact_x_category.load()
+    ixc_imp_col = _first_present_column(ixc, ("impact_code", "Impact", "Impact code", "EN Name", "Name", "code"))
+    ixc_cat_col = _first_present_column(ixc, ("category_code", "Category", "Impact category", "impact_category", "EN Name", "Name", "code"))
+
+    impact_to_categories: dict[str, list[str]] = {}
+    if ixc and ixc_imp_col and ixc_cat_col:
+        for r in ixc:
+            im = (r.get(ixc_imp_col) or "").strip()
+            cat = (r.get(ixc_cat_col) or "").strip()
+            if im and cat:
+                impact_to_categories.setdefault(im, [])
+                if cat not in impact_to_categories[im]:
+                    impact_to_categories[im].append(cat)
+
+    idx: dict[str, dict[str, Any]] = {}
+    for r in i_rows:
+        code = ((r.get(code_col) or "") if code_col else "").strip()
+        if not code:
+            continue
+        name = ((r.get(name_col) or "") if name_col else "").strip() or code
+        desc = ((r.get(desc_col) or "") if desc_col else "").strip() or None
+        cats = list(impact_to_categories.get(code, []))
+        idx[code] = {
+            "code": code,
+            "name": name,
+            "description": desc,
+            "categories": cats,
+            "category": cats[0] if cats else None,
+        }
+    return idx
+
+
+def list_impact_categories() -> list[str]:
+    """Return canonical impact category codes."""
+    rows = _impact_categories.load()
+    if not rows:
+        return []
+    col = _first_present_column(
+        rows, ("category_code", "code", "Impact category", "Category", "EN Name", "Name")
+    ) or next(iter(rows[0].keys()), None)
+    if not col:
+        return []
+    seen, out = set(), []
+    for r in rows:
+        v = (r.get(col) or "").strip()
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def normalize_impact_code(code_or_alias: str) -> str | None:
+    """Normalize a code or human label to canonical impact code."""
+    if not code_or_alias:
+        return None
+    idx = _build_impact_index()
+    if not idx:
+        return None
+    raw = code_or_alias.strip()
+    if raw in idx:
+        return raw
+    low = raw.casefold()
+    lowmap = {k.casefold(): k for k in idx.keys()}
+    if low in lowmap:
+        return lowmap[low]
+    # slug by name
+    target = _slug(raw)
+    for row in idx.values():
+        if _slug(row.get("name")) == target:
+            return row["code"]
+    return None
+
+
+def search_impacts(q: str | None, *, category: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    """
+    Search impacts with tolerant filters (q over code/name/description/categories).
+    """
+    idx = _build_impact_index()
+    if not idx:
+        return []
+    items = list(idx.values())
+
+    if category:
+        cat_norm = category.strip().casefold()
+        items = [i for i in items if any(c.casefold() == cat_norm for c in i.get("categories", []))]
+
+    if q:
+        qn = _slug(q)
+        def _hay(i: dict[str, Any]) -> str:
+            return _slug(
+                " ".join(
+                    [
+                        i.get("code") or "",
+                        i.get("name") or "",
+                        i.get("description") or "",
+                        " ".join(i.get("categories") or []),
+                    ]
+                )
+            )
+        items = [i for i in items if qn in _hay(i)]
+
+    items.sort(key=lambda i: (i.get("code") or "").casefold())
+    return items[: max(0, limit)]
+
+
+def list_impacts(q: str | None = None, *, category: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    """Alias to search_impacts."""
+    return search_impacts(q, category=category, limit=limit)
+
+
+def explain_impact(code: str) -> dict[str, Any] | None:
+    """Return indexed impact detail by canonical code."""
+    if not code:
+        return None
+    idx = _build_impact_index()
+    return dict(idx.get(code)) if (idx and code in idx) else None
+
+
+# --------------------------------------------------------------------------------------
 # Public API – Threat mappings (Asset type x Threat)
 # --------------------------------------------------------------------------------------
 
 def mapped_threats_for_asset_type(asset_type_code: str) -> list[str]:
-    """Return sorted threat codes mapped to a given asset type (truthy rows only)."""
     if not asset_type_code:
         return []
     rows = _at_x_threat.load()
     if not rows:
         return []
 
-    asset_col = _first_present_column(rows, ("asset_type", "Asset type"))
-    threat_col = _first_present_column(rows, ("threat_code", "Threat", "threat", "EN Name"))
-    value_col = _first_present_column(rows, ("Value", "Include", "Included", "Enabled"))
+    asset_col = _first_present_column(rows, ("asset_type", "Asset type", "EN Name", "Name"))
+    threat_col = _first_present_column(rows, ("threat_code", "Threat", "threat", "EN Name", "Name"))
 
     if not threat_col:
         return []
@@ -657,10 +801,6 @@ def mapped_threats_for_asset_type(asset_type_code: str) -> list[str]:
         if asset_col:
             a = (r.get(asset_col) or "").strip()
             if a != needle:
-                continue
-        if value_col:
-            val = (r.get(value_col) or "").strip().lower()
-            if val and val not in {"1", "true", "t", "yes", "y", "ano"}:
                 continue
         raw = (r.get(threat_col) or "").strip()
         if not raw:
@@ -732,6 +872,12 @@ __all__ = [
     "search_threats",
     "list_threats",
     "explain_threat",
+    # Impacts
+    "list_impact_categories",
+    "normalize_impact_code",
+    "search_impacts",
+    "list_impacts",
+    "explain_impact",
     # Mappings
     "mapped_threats_for_asset_type",
     # Generic

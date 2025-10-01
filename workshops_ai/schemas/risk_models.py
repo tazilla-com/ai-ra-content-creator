@@ -3,10 +3,11 @@
 # Strict Pydantic v2 models for Threat risk updates (0..4 scale).
 #
 # Provides:
-# - RiskUpdate         → minimal inbound shape (from tools / UI)
-# - RiskChangeItem     → normalized item with idempotency key + timestamp
-# - RiskChangeSet      → envelope for "risk.set_probability" batches
-# - WSRiskSetEvent     → WS payload for optimistic UI updates
+# - RiskUpdate             → minimal inbound shape (from tools / UI)
+# - RiskChangeItem         → normalized item with idempotency key + timestamp
+# - RiskChangeSet          → envelope for "risk.set_probability" batches
+# - WSRiskSetEvent         → WS payload for optimistic UI updates (single item)
+# - WSRiskSetListEvent     → WS payload for optimistic UI updates (batch/list)
 #
 # Notes:
 # - Probability is validated on the canonical 0..4 integer scale.
@@ -35,17 +36,13 @@ _PROB_ALIASES = {
     "none": 0,
     "no": 0,
     "zero": 0,
-
     "1": 1,
     "low": 1,
-
     "2": 2,
     "medium": 2,
     "moderate": 2,
-
     "3": 3,
     "high": 3,
-
     "4": 4,
     "very_high": 4,
     "critical": 4,
@@ -178,12 +175,113 @@ class RiskChangeSet(BaseModel):
 
 class WSRiskSetEvent(BaseModel):
     """
-    WebSocket event for optimistic UI updates.
+    WebSocket event for optimistic UI updates (single item).
     """
     model_config = ConfigDict(extra="forbid")
 
     event: Literal["risk.set_probability"] = "risk.set_probability"
     payload: RiskChangeItem
+
+
+# ------------------- Batch/list WebSocket event (camelCase) -------------------
+
+class _RiskListEntry(BaseModel):
+    """
+    One entry in the batch/list WS payload for risks.
+
+    Field names follow the requested camelCase for the WS contract:
+      * threatName (str)
+      * probability (int, 0..4)
+    """
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+
+    threat_name: str = Field(..., alias="threatName")
+    probability: Probability
+
+    @field_validator("threat_name")
+    @classmethod
+    def _trim_name(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("threatName must not be empty")
+        return s
+
+    @field_validator("probability")
+    @classmethod
+    def _norm_prob(cls, v: Any) -> Probability:
+        return _normalize_probability(v)
+
+
+class _RiskSetListPayload(BaseModel):
+    """
+    Inner 'payload' for the batch/list WS event.
+    """
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+
+    asset_id: str = Field(..., alias="assetId")
+    asset_name: str | None = Field(default=None, alias="assetName")
+    risks: list[_RiskListEntry]
+
+    @field_validator("asset_id")
+    @classmethod
+    def _trim_asset_id(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("assetId must not be empty")
+        return s
+
+    @field_validator("asset_name")
+    @classmethod
+    def _trim_asset_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        s = v.strip()
+        return s or None
+
+    @field_validator("risks")
+    @classmethod
+    def _non_empty_risks(cls, v: list[_RiskListEntry]) -> list[_RiskListEntry]:
+        if not v:
+            raise ValueError("risks must contain at least one entry")
+        return v
+
+
+class WSRiskSetListEvent(BaseModel):
+    """
+    WebSocket payload for optimistic UI update when multiple risk probabilities are set.
+
+    Envelope (top-level) validation:
+      - event  : must be "risk.set_probabilities"
+      - org_id : organization id
+      - actor  : user id (originator)
+      - ts     : ISO 8601 timestamp
+      - payload: {_RiskSetListPayload} with camelCase keys as requested:
+                 { assetId, assetName?, risks: [{ threatName, probability }, ...] }
+    """
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,  # allows .model_dump(by_alias=True) if needed
+    )
+
+    event: Literal["risk.set_probabilities"] = "risk.set_probabilities"
+    org_id: str
+    actor: str
+    ts: str
+    payload: _RiskSetListPayload
+
+    @field_validator("org_id", "actor", "ts")
+    @classmethod
+    def _trim_envelope_strs(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("org_id/actor/ts must not be empty")
+        return s
 
 
 __all__ = [
@@ -192,4 +290,5 @@ __all__ = [
     "RiskChangeItem",
     "RiskChangeSet",
     "WSRiskSetEvent",
+    "WSRiskSetListEvent",
 ]

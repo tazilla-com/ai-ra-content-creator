@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # --- Common aliases ---
 
-ActiveTab = Literal["assets", "impacts", "threats", "controls"]
+ActiveTab = Literal["assets", "impacts", "threats"]
 
 
 class StrictModel(BaseModel):
@@ -70,7 +70,7 @@ class ChatIn(StrictModel):
         return UIRequest(
             org_id=self.org_id,
             active_tab=self.active_tab,
-            selection=selection or {},
+            selection=selection or None,
             message=self.message,
             staging=self.staging,
             user_id=self.user_id,
@@ -185,10 +185,7 @@ class ChatOut(StrictModel):
 # ======================
 # OpenAPI examples
 # ======================
-
-ChatIn.model_rebuild()
-ChatOut.model_rebuild()
-
+# Set OpenAPI examples FIRST…
 ChatIn.model_config["json_schema_extra"] = {  # type: ignore[index]
     "examples": [
         {
@@ -212,3 +209,7 @@ ChatOut.model_config["json_schema_extra"] = {  # type: ignore[index]
         }
     ]
 }
+
+# …then rebuild so FastAPI includes the examples in the generated OpenAPI schema.
+ChatIn.model_rebuild()
+ChatOut.model_rebuild()

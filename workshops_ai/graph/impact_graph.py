@@ -26,8 +26,9 @@
 #
 # Notes
 # - Graph is compiled with an injected checkpointer → per-org/tab history.
-# - WS events use WsHub.aemit_impact_set_level(...) as per hub contract.
-# - ChangeSets use client's submit; fallback writes JSON to /app/workshops_ai/data/outbox.
+# - WS events prefer WsHub.aemit_impact_set_event(...) (list-shape); if unavailable,
+#   we fall back to WsHub.aemit_impact_set_level(...) per-item.
+# - ChangeSets are produced by mappers (DTO → runtime shape) and submitted; fallback is outbox.
 # - Explain node falls back to LLM if retriever is missing/unavailable.
 # - Optional NLU node parses free text into set/bulk_set payloads when possible.
 # -----------------------------------------------------------------------------
@@ -41,11 +42,18 @@ import re
 import uuid
 import json
 import os
-from typing import Any, Literal, Optional, cast, List
+from typing import Any, Literal, Optional, cast, List, Dict
 
 from pydantic import BaseModel, Field
 
 from workshops_ai.graph.factory import GraphDeps
+
+# Unified DTO + mappers (NEW)
+from workshops_ai.api.schema import AssetImpact
+from workshops_ai.agents.utils.mappers import (
+    map_asset_impact_to_ws_event,
+    map_asset_impact_to_changeset,
+)
 
 try:
     from langgraph.graph import StateGraph, END  # type: ignore
@@ -97,6 +105,9 @@ class ImpactState(BaseModel):
     set_payload: Optional[ImpactSetPayload] = None
     bulk_payload: Optional[ImpactBulkPayload] = None
     question: Optional[str] = None  # for explain
+
+    # NEW: generic payload intended for unified DTO validation (AssetImpact)
+    payload: Optional[dict] = None
 
     # Working fields
     intent: Optional[Intent] = None
@@ -447,63 +458,127 @@ def _asset_get_impacts(deps: GraphDeps):
 # Write nodes — SEND-NOW (set / bulk_set)
 # -----------------------------------------------------------------------------
 
-def _mk_ws_payload(*, org_id: str, asset_id: str, it: ImpactItem, actor: Optional[str]) -> dict:
-    lvl_idx = int(it.level)
-    lvl_idx = 0 if lvl_idx < 0 else 4 if lvl_idx > 4 else lvl_idx
-    return {
-        "event": "impact.set_level",
-        "org_id": org_id,
-        "asset_id": asset_id,
-        "impact_code": it.impact_code,
-        "level_index": lvl_idx,
-        "level_value": _LEVEL_VALUE[lvl_idx],
-        "note": it.note,
-        "actor": actor,
-        "ts": _now_iso(),
+_CODE_TO_NAME: Dict[str, str] = {
+    "C": "Confidentiality",
+    "I": "Integrity",
+    "A": "Availability",
+}
+
+def _adapt_set_payload_to_dto(payload: ImpactSetPayload, *, asset_name: Optional[str] = None) -> AssetImpact:
+    """
+    Minimal adapter for backward compatibility when callers still send ImpactSetPayload.
+    Builds an AssetImpact DTO so the rest of the write path stays unified.
+    """
+    impacts = [
+        {"impactName": _CODE_TO_NAME.get(it.impact_code, it.impact_code), "impactLevel": int(it.level)}
+        for it in payload.items
+    ]
+    dto_raw = {
+        "assetId": payload.asset_id,
+        "assetName": asset_name,
+        "impacts": impacts,
     }
+    return AssetImpact.model_validate(dto_raw)
+
+
+async def _emit_ws_from_dto(dto: AssetImpact, deps: GraphDeps, org_id: str, actor: Optional[str]) -> None:
+    """
+    Prefer a single list-shaped event via aemit_impact_set_event(dto-based payload).
+    If not available, fall back to per-item aemit_impact_set_level to preserve UI compatibility.
+    """
+    hub = getattr(deps, "ws_hub", None)
+    if hub is None:
+        return
+
+    # 1) Try the list-shaped emitter expected by new UI/event contracts
+    ws_batch = map_asset_impact_to_ws_event(dto)
+    if hasattr(hub, "aemit_impact_set_event"):
+        try:
+            await hub.aemit_impact_set_event(ws_batch)  # type: ignore[attr-defined]
+            return
+        except Exception as e:  # pragma: no cover
+            logger.warning("WS batch emit failed, falling back to per-item: %s", e)
+
+    # 2) Fallback: emit per item (legacy UI still supported)
+    if hasattr(hub, "aemit_impact_set_level"):
+        try:
+            asset_id = str(getattr(dto, "assetId", None) or "")
+            for it in (dto.impacts or []):
+                level_idx = max(0, min(4, int(it.impactLevel)))
+                event = {
+                    "event": "impact.set_level",
+                    "org_id": org_id,
+                    "asset_id": asset_id,
+                    "impact_code": it.impactName,
+                    "level_index": level_idx,
+                    "level_value": _LEVEL_VALUE[level_idx],
+                    "note": getattr(it, "note", None),
+                    "actor": actor,
+                    "ts": _now_iso(),
+                }
+                await hub.aemit_impact_set_level(event)  # type: ignore[attr-defined]
+        except Exception as e:  # pragma: no cover
+            logger.warning("WS per-item emit failed: %s", e)
 
 
 def _set_impact_level(deps: GraphDeps):
     async def _inner(state: ImpactState) -> ImpactState:
-        payload = state.set_payload
-        if payload is None:
-            # Attempt to assemble from a generic 'update' dict if provided by caller
-            update = getattr(state, "update", None) or {}
+        dto: Optional[AssetImpact] = None
+
+        # 1) Preferred: validate the provided unified DTO payload
+        if state.payload:
             try:
-                payload = ImpactSetPayload(
-                    asset_id=update.get("asset_id") or (state.selection or {}).get("asset_id"),
-                    items=[ImpactItem(**it) for it in (update.get("items") or [])],
-                )
+                dto = AssetImpact.model_validate(state.payload)
             except Exception as e:
-                state.result = _ui_response(f"Invalid set payload: {e}")
+                state.result = _ui_response(f"Invalid AssetImpact payload: {e}")
                 return state
 
-        if not payload or not payload.asset_id or not payload.items:
-            state.result = _ui_response("Missing set payload (asset_id and items[impact_code, level]).")
+        # 2) Back-compat: build DTO from legacy ImpactSetPayload (if present)
+        if dto is None:
+            payload = state.set_payload
+            if payload is None:
+                # Try to assemble from a generic 'update' dict if caller used that
+                update = getattr(state, "update", None) or {}
+                try:
+                    payload = ImpactSetPayload(
+                        asset_id=update.get("asset_id") or (state.selection or {}).get("asset_id"),
+                        items=[ImpactItem(**it) for it in (update.get("items") or [])],
+                    )
+                except Exception as e:
+                    state.result = _ui_response(f"Invalid set payload: {e}")
+                    return state
+
+            if not payload or not payload.asset_id or not payload.items:
+                state.result = _ui_response("Missing set payload (asset_id and items[impact_code, level]).")
+                return state
+
+            # Fetch asset name for nicer DTO (optional)
+            asset_name = None
+            try:
+                asset = deps.backend_port.asset_get(payload.asset_id)
+                asset_name = asset.get("name") if isinstance(asset, dict) else None
+            except Exception:
+                pass
+
+            dto = _adapt_set_payload_to_dto(payload, asset_name=asset_name)
+
+        # Emit WS event(s) using the new mapper shape (with legacy fallback)
+        try:
+            await _emit_ws_from_dto(dto, deps, org_id=state.org_id, actor=state.user_id)
+        except Exception as e:  # pragma: no cover
+            logger.warning("WS emit failed: %s", e)
+
+        # Build changeset via mapper (keeps runtime submit contract)
+        try:
+            changeset = map_asset_impact_to_changeset(dto, org_id=state.org_id)
+        except Exception as e:
+            state.result = _ui_response(f"Failed to build ChangeSet: {e}")
             return state
 
-        # Schema-validated WS emit per item (await hub)
-        for it in payload.items:
-            try:
-                await deps.ws_hub.aemit_impact_set_level(
-                    _mk_ws_payload(
-                        org_id=state.org_id,
-                        asset_id=payload.asset_id,
-                        it=it,
-                        actor=state.user_id,
-                    )
-                )
-            except Exception as e:  # pragma: no cover
-                logger.warning("WS emit failed for %s/%s: %s", payload.asset_id, it.impact_code, e)
-
-        change = _build_changeset(
-            kind="impact.set_levels",
-            org_id=state.org_id,
-            user_id=state.user_id,
-            data={"asset_id": payload.asset_id, "items": [it.model_dump() for it in payload.items]},
-        )
-        state.change = change
-        state.touched_asset_ids = [payload.asset_id]
+        state.change = changeset
+        # remember touched asset for small UX aids
+        aid = getattr(dto, "assetId", None)
+        state.touched_asset_ids = [str(aid)] if aid else None
         return state
     return _inner
 
@@ -532,18 +607,25 @@ def _bulk_set_impact_levels(deps: GraphDeps):
             state.result = _ui_response("Missing bulk payload entries.")
             return state
 
-        # Schema-validated emits for each item in each entry
+        # Emit per item per asset (legacy-compatible) — we keep this path simple
         for entry in bulk.entries:
             for it in entry.items:
                 try:
-                    await deps.ws_hub.aemit_impact_set_level(
-                        _mk_ws_payload(
-                            org_id=state.org_id,
-                            asset_id=entry.asset_id,
-                            it=it,
-                            actor=state.user_id,
-                        )
-                    )
+                    hub = getattr(deps, "ws_hub", None)
+                    if hub and hasattr(hub, "aemit_impact_set_level"):
+                        level_idx = max(0, min(4, int(it.level)))
+                        event = {
+                            "event": "impact.set_level",
+                            "org_id": state.org_id,
+                            "asset_id": entry.asset_id,
+                            "impact_code": it.impact_code,
+                            "level_index": level_idx,
+                            "level_value": _LEVEL_VALUE[level_idx],
+                            "note": it.note,
+                            "actor": state.user_id,
+                            "ts": _now_iso(),
+                        }
+                        await hub.aemit_impact_set_level(event)  # type: ignore[attr-defined]
                 except Exception as e:  # pragma: no cover
                     logger.warning("WS emit failed for %s/%s: %s", entry.asset_id, it.impact_code, e)
 
