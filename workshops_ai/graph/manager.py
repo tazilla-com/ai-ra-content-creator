@@ -7,17 +7,19 @@
 # - Emit-only policy normalization (emit_changes_enabled=True)
 # - Signature-aware DI to avoid kwarg mismatches when factory evolves
 # - Strict I/O validation (Pydantic v2), fail-closed with friendly messages
+# - Telemetry passthrough for tool events (tool.call.*) if agent emits agent_events
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import asyncio
 import inspect
-from typing import Any, Final, Optional, cast
+from typing import Any, Final, Mapping, Optional, cast
 
 from pydantic import ValidationError
 
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
+from workshops_ai.models.agent_event import AgentEvent as WireAgentEvent
 from workshops_ai.tools.telemetry import telemetry_log
 from workshops_ai.settings import get_settings
 
@@ -60,7 +62,7 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
             policy={"emit_changes_enabled": True},
         )
 
-    # 2) Build DI deps (backend, ws hub, retriever, settings)
+    # 2) Build DI deps (backend, ws hub, retriever, settings, submit_changeset, llm if configured)
     deps = _deps(tab)
 
     # 3) Best-effort: remember context for cross-tab flows
@@ -96,7 +98,7 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
         "user_instructions": _maybe(req, "user_instructions"),
         "organization_profile": _maybe(req, "organization_profile"),
         "services": _maybe(req, "services"),
-        "existing_assets": _maybe(req, "existing_assets"),  # <— important for Assets tab
+        "existing_assets": _maybe(req, "existing_assets"),  # important for Assets tab
         "url": _maybe(req, "url"),
         "website_content": _maybe(req, "website_content"),
         "policy": _maybe(req, "policy"),
@@ -116,9 +118,22 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
         telemetry_log("manager.graph_invoke_error", {"tab": tab, "error": repr(e)})
         return _fail("Agent execution failed.", req, details=str(e))
 
-    # 8) Normalize & validate UIResponse
+    # 7a) Telemetry passthrough for tool events (if present in raw_result)
+    _telemetry_from_raw_tool_events(raw_result, tab=tab, org_id=req.org_id, user_id=req.user_id)
+
+    # 8) Normalize & validate UIResponse (incl. agent_events → canonical wrap)
     try:
-        resp = _ensure_uiresponse(raw_result)
+        resp = _ensure_uiresponse(
+            raw_result,
+            tab=tab,
+            org_id=req.org_id,
+            user_id=req.user_id,
+            asset_id=(getattr(req, "selection", None) and getattr(req.selection, "asset_id", None)),
+        )
+
+        # 8a) Telemetry passthrough for tool events (if agent_events carried through UIResponse)
+        _telemetry_from_response_tool_events(resp, tab=tab, org_id=req.org_id, user_id=req.user_id)
+
         # Ensure policy.emit_changes_enabled = True (emit-only mode)
         pol = dict(getattr(resp, "policy", {}) or {})
         pol["emit_changes_enabled"] = True
@@ -153,6 +168,8 @@ def _deps(tab: str) -> GraphDeps:
         "backend_port": backend,
         "ws_hub": ws_hub,
         "make_retriever": make_retriever,
+        # Note: LLM and submit_changeset can be injected here
+        # if you wire them in settings/provider later.
     }
     try:
         sig = inspect.signature(make_default_deps)
@@ -202,36 +219,59 @@ def _resolve_retriever_factory():
 
 
 # -----------------------------------------------------------------------------
-# UIResponse normalization
+# UIResponse normalization (wraps telemetry-like dicts → canonical AgentEvent)
 # -----------------------------------------------------------------------------
-def _ensure_uiresponse(raw: Any) -> UIResponse:
+def _ensure_uiresponse(
+    raw: Any,
+    *,
+    tab: str,
+    org_id: str,
+    user_id: Optional[str],
+    asset_id: Optional[str],
+) -> UIResponse:
     """
     Accepts:
       - UIResponse instance
       - dict compatible with UIResponse
       - state dict containing a nested {"result": dict}
-    Produces a validated UIResponse, or raises ValidationError.
+    Produces a validated UIResponse, wrapping agent_events (if they are 'light'
+    telemetry dicts) into canonical AgentEvent envelopes.
     """
     payload = raw
+
     # Unwrap common pattern: {"result": {...}}
-    if isinstance(payload, dict) and "result" in payload and isinstance(payload["result"], dict):
+    if isinstance(payload, Mapping) and "result" in payload and isinstance(payload["result"], Mapping):
         payload = payload["result"]
 
     if isinstance(payload, UIResponse):
+        # Best-effort ensure canonical agent_events inside an already-typed UIResponse
+        if getattr(payload, "agent_events", None):
+            payload.agent_events = _normalize_agent_events(  # type: ignore[attr-defined]
+                cast(list, payload.agent_events),
+                tab=tab,
+                org_id=org_id,
+                user_id=user_id,
+                asset_id=asset_id,
+            )
         return payload
 
-    # Some graphs may return only messages or partial dicts; coerce carefully
-    if isinstance(payload, dict):
-        # Ensure required top-level fields exist before validation
-        payload = {
+    if isinstance(payload, Mapping):
+        base = {
             "messages": payload.get("messages") or [],
             "proposals": payload.get("proposals"),
             "staging": payload.get("staging") or {"needs_commit": False, "batch_id": None, "diff": None},
             "policy": payload.get("policy") or {"emit_changes_enabled": True},
-            # Optionally pass-through agent_events if present
-            **({"agent_events": payload["agent_events"]} if "agent_events" in payload else {}),
         }
-        return UIResponse.model_validate(payload)
+        # Normalize agent_events if present
+        if "agent_events" in payload and isinstance(payload["agent_events"], list):
+            base["agent_events"] = _normalize_agent_events(
+                cast(list, payload["agent_events"]),
+                tab=tab,
+                org_id=org_id,
+                user_id=user_id,
+                asset_id=asset_id,
+            )
+        return UIResponse.model_validate(base)
 
     # Last resort: wrap into a minimal UIResponse
     return UIResponse(
@@ -240,6 +280,40 @@ def _ensure_uiresponse(raw: Any) -> UIResponse:
         staging={"needs_commit": False, "batch_id": None, "diff": None},
         policy={"emit_changes_enabled": True},
     )
+
+
+def _normalize_agent_events(
+    events: list[Any],
+    *,
+    tab: str,
+    org_id: str,
+    user_id: Optional[str],
+    asset_id: Optional[str],
+) -> list[dict[str, Any]]:
+    """
+    Convert a possibly heterogeneous list of events into canonical AgentEvent dicts:
+      - If an item already looks like a WireAgentEvent (has 'event'), keep it.
+      - If it's a "light" telemetry dict (event_type/tool/ok/...),
+        wrap it into WireAgentEvent(event='agent.tool_event', data=item).
+    """
+    source = {"assets": "AssetAgent", "impacts": "ImpactAgent", "threats": "ThreatAgent"}.get(tab, "Manager")
+    out: list[dict[str, Any]] = []
+    for e in events:
+        if isinstance(e, Mapping) and "event" in e:
+            # Assume it's already canonical or close enough; let Pydantic validate later if needed.
+            out.append(cast(dict[str, Any], dict(e)))
+            continue
+        if isinstance(e, Mapping):
+            ae = WireAgentEvent(
+                event="agent.tool_event",
+                org_id=org_id,
+                user_id=user_id,
+                asset_id=asset_id,
+                data=dict(e),
+                source=source,
+            )
+            out.append(ae.model_dump(mode="json"))
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -303,6 +377,101 @@ def _timeout_for_tab(tab: str) -> int:
         or _get("chat", "timeout_sec")
         or 120
     )
+
+
+# -----------------------------------------------------------------------------
+# Telemetry passthrough for tool.call.* events
+# -----------------------------------------------------------------------------
+def _telemetry_from_raw_tool_events(raw: Any, *, tab: str, org_id: str, user_id: Optional[str]) -> None:
+    """
+    Forward tool.call.* events from a raw graph result/envelope to telemetry.
+    Accepts both:
+      1) "light" telemetry dicts ({"event_type": "...", "tool": "...", ...})
+      2) canonical AgentEvent envelopes ({"event": "agent.tool_event", "data": {...}})
+    Never raises; telemetry must not break the main flow.
+    """
+    try:
+        events: Any = None
+        if isinstance(raw, Mapping):
+            events = raw.get("agent_events")
+            if events is None:
+                result = raw.get("result")
+                if isinstance(result, Mapping):
+                    events = result.get("agent_events")
+
+        if not isinstance(events, list):
+            return
+
+        for ev in events:
+            try:
+                if not isinstance(ev, Mapping):
+                    continue
+
+                # Case A: canonical AgentEvent envelope → unwrap "data"
+                if ev.get("event") == "agent.tool_event" and isinstance(ev.get("data"), Mapping):
+                    _maybe_log_tool_event(ev["data"], tab=tab, org_id=org_id, user_id=user_id)
+                    continue
+
+                # Case B: "light" telemetry dict → use directly
+                _maybe_log_tool_event(ev, tab=tab, org_id=org_id, user_id=user_id)
+
+            except Exception:
+                continue
+    except Exception:
+        return
+
+
+def _telemetry_from_response_tool_events(resp: UIResponse, *, tab: str, org_id: str, user_id: Optional[str]) -> None:
+    """
+    If the normalized UIResponse carries agent_events, forward tool.call.* events.
+    """
+    try:
+        events = getattr(resp, "agent_events", None)
+        if not isinstance(events, list):
+            return
+        for ev in events:
+            try:
+                if isinstance(ev, Mapping) and ev.get("event") == "agent.tool_event" and isinstance(ev.get("data"), Mapping):
+                    _maybe_log_tool_event(ev["data"], tab=tab, org_id=org_id, user_id=user_id)
+                elif isinstance(ev, Mapping):
+                    _maybe_log_tool_event(ev, tab=tab, org_id=org_id, user_id=user_id)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
+def _maybe_log_tool_event(ev: Any, *, tab: str, org_id: str, user_id: Optional[str]) -> None:
+    """
+    Accepts a dict-like event and logs tool.call.* telemetry if event_type matches.
+    Expected minimal schema:
+      {
+        "event_type": "tool.call.start|success|fail",
+        "tool": "list_impacts" | "set_risk_probability" | ...,
+        "duration_ms": 12,     # optional
+        "ok": true/false,      # optional
+        "meta": {...}          # optional
+      }
+    """
+    try:
+        if not isinstance(ev, Mapping):
+            return
+        etype = str(ev.get("event_type") or "")
+        if not etype.startswith("tool.call."):
+            return
+        payload = {
+            "tab": tab,
+            "org_id": org_id,
+            "user_id": (user_id or "anon"),
+            "event_type": etype,
+            "tool": ev.get("tool"),
+            "duration_ms": ev.get("duration_ms"),
+            "ok": ev.get("ok"),
+            "meta": ev.get("meta"),
+        }
+        telemetry_log("agent.tool_event", payload)
+    except Exception:
+        pass
 
 
 # -----------------------------------------------------------------------------

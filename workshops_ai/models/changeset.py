@@ -1,27 +1,34 @@
-# /app/models/changeset.py
+# File: workshops_ai/models/changeset.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Optional, Annotated, Union, Literal
 
-from pydantic import BaseModel, Field, StrictFloat, StrictInt, StrictStr, ConfigDict, model_validator
-
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    ConfigDict,
+    model_validator,
+)
 
 # -----------------------------------------------------------------------------
-# Audit envelope (strict, snake_case "on the wire")
+# Audit envelope (strict, snake_case on the wire)
 # -----------------------------------------------------------------------------
 
 class Audit(BaseModel):
     """
-    Jednotná auditní obálka pro všechny ChangeSety.
-    Snake-case všude (vč. JSON).
+    Unified audit envelope for all ChangeSets.
+    Snake_case everywhere (including JSON field names).
     """
     model_config = ConfigDict(extra="forbid")
 
     user_id: StrictStr
     ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     source: StrictStr = "AI"
-    tags: List[StrictStr] = Field(default_factory=list)
+    tags: list[StrictStr] = Field(default_factory=list)
 
     org_id: Optional[StrictStr] = None
     session_id: Optional[StrictStr] = None
@@ -34,16 +41,18 @@ class Audit(BaseModel):
 # -----------------------------------------------------------------------------
 
 class ImpactItem(BaseModel):
-    """Single impact level entry for a specific impact code."""
+    """Single impact level entry for a specific impact code (level 0..4)."""
     model_config = ConfigDict(extra="forbid")
+
     impact_code: StrictStr
     level: StrictInt = Field(ge=0, le=4)
     note: Optional[str] = None
 
 
 class RiskItem(BaseModel):
-    """Single risk probability entry for a specific threat code."""
+    """Single risk probability entry for a specific threat code (0..4)."""
     model_config = ConfigDict(extra="forbid")
+
     threat_code: StrictStr
     probability: StrictInt = Field(ge=0, le=4)
     note: Optional[str] = None
@@ -52,6 +61,7 @@ class RiskItem(BaseModel):
 class ControlUpsert(BaseModel):
     """Control proposal/upsert with optional expected coverage (0.0..1.0)."""
     model_config = ConfigDict(extra="forbid")
+
     control_code: StrictStr
     rationale: Optional[str] = None
     expected_coverage: Optional[StrictFloat] = Field(default=None, ge=0.0, le=1.0)
@@ -65,10 +75,12 @@ class ThreatUpsert(BaseModel):
     - Flags represent intentional/unintentional/environmental categorization.
     """
     model_config = ConfigDict(extra="forbid")
+
     code: Optional[StrictStr] = None
     name: StrictStr
     category: StrictStr
-    asset_type_codes: List[StrictStr] = Field(default_factory=list)
+    asset_type_codes: list[StrictStr] = Field(default_factory=list)
+
     # flags
     intentional: bool = False
     unintentional: bool = False
@@ -76,8 +88,22 @@ class ThreatUpsert(BaseModel):
     description: Optional[str] = None
 
 
+class ImpactUpsert(BaseModel):
+    """
+    Impact upsert payload; mirrors catalog semantics.
+    - If `code` is provided, update/ensure; otherwise create (server may assign code).
+    - `category` is the canonical EN category for impacts (e.g., Availability).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    code: Optional[StrictStr] = None
+    name: StrictStr
+    category: StrictStr
+    description: Optional[str] = None
+
+
 # -----------------------------------------------------------------------------
-# Action models (strict, fail-closed)
+# Action models (strict, fail-closed) — FIX: op is Literal[...] for discriminator
 # -----------------------------------------------------------------------------
 
 class ActionSetImpacts(BaseModel):
@@ -87,11 +113,12 @@ class ActionSetImpacts(BaseModel):
     - `mode="replace"` replaces all existing items with the provided list.
     """
     model_config = ConfigDict(extra="forbid")
-    op: Literal["set_impacts"]
+
+    op: Literal["set_impacts"] = "set_impacts"
     mode: Literal["merge", "replace"] = "merge"
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None  # e.g. "client:<token>"
-    items: List[ImpactItem]
+    items: list[ImpactItem]
 
     @model_validator(mode="after")
     def _require_asset_selector(self) -> "ActionSetImpacts":
@@ -106,11 +133,12 @@ class ActionSetRisks(BaseModel):
     Probability is strictly 0..4 (already normalized before reaching backend).
     """
     model_config = ConfigDict(extra="forbid")
-    op: Literal["set_risks"]
+
+    op: Literal["set_risks"] = "set_risks"
     mode: Literal["merge", "replace"] = "merge"
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
-    items: List[RiskItem]
+    items: list[RiskItem]
 
     @model_validator(mode="after")
     def _require_asset_selector(self) -> "ActionSetRisks":
@@ -122,10 +150,12 @@ class ActionSetRisks(BaseModel):
 class ActionUpsertControls(BaseModel):
     """Upsert a set of controls (per asset or client-side reference)."""
     model_config = ConfigDict(extra="forbid")
-    op: Literal["upsert_controls"]
+
+    op: Literal["upsert_controls"] = "upsert_controls"
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
-    items: List[ControlUpsert]
+
+    items: list[ControlUpsert]
 
     @model_validator(mode="after")
     def _require_asset_selector(self) -> "ActionUpsertControls":
@@ -137,10 +167,12 @@ class ActionUpsertControls(BaseModel):
 class ActionRemoveControls(BaseModel):
     """Remove listed controls (by code) from the given asset/ref."""
     model_config = ConfigDict(extra="forbid")
-    op: Literal["remove_controls"]
+
+    op: Literal["remove_controls"] = "remove_controls"
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
-    codes: List[StrictStr]
+
+    codes: list[StrictStr]
 
     @model_validator(mode="after")
     def _require_asset_selector(self) -> "ActionRemoveControls":
@@ -155,10 +187,12 @@ class ActionSetAssetMeta(BaseModel):
     Example fields: name, asset_type_uuid/asset_type_code, primary, CIA, ...
     """
     model_config = ConfigDict(extra="forbid")
-    op: Literal["set_asset_meta"]
+
+    op: Literal["set_asset_meta"] = "set_asset_meta"
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
-    fields: Dict[str, Any]
+
+    fields: dict[str, Any]
 
     @model_validator(mode="after")
     def _require_asset_selector(self) -> "ActionSetAssetMeta":
@@ -173,9 +207,10 @@ class ActionCreateAsset(BaseModel):
     Example fields: name, asset_type_uuid/asset_type_code, primary, ...
     """
     model_config = ConfigDict(extra="forbid")
-    op: Literal["create_asset"]
+
+    op: Literal["create_asset"] = "create_asset"
     client_token: StrictStr
-    fields: Dict[str, Any]
+    fields: dict[str, Any]
 
 
 class ActionUpsertThreats(BaseModel):
@@ -184,20 +219,35 @@ class ActionUpsertThreats(BaseModel):
     Each item corresponds to one threat (create/update).
     """
     model_config = ConfigDict(extra="forbid")
-    op: Literal["upsert_threats"]
-    items: List[ThreatUpsert]
+
+    op: Literal["upsert_threats"] = "upsert_threats"
+    items: list[ThreatUpsert]
 
 
-# Discriminated union of all action types (by "op")
-Action = (
-    ActionCreateAsset
-    | ActionSetAssetMeta
-    | ActionSetImpacts
-    | ActionSetRisks
-    | ActionUpsertControls
-    | ActionRemoveControls
-    | ActionUpsertThreats
-)
+class ActionUpsertImpacts(BaseModel):
+    """
+    Upsert impacts in org scope (not tied to a single asset).
+    Each item corresponds to one impact (create/update).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["upsert_impacts"] = "upsert_impacts"
+    items: list[ImpactUpsert]
+
+
+Action = Annotated[
+    Union[
+        ActionCreateAsset,
+        ActionSetAssetMeta,
+        ActionSetImpacts,
+        ActionSetRisks,
+        ActionUpsertControls,
+        ActionRemoveControls,
+        ActionUpsertThreats,
+        ActionUpsertImpacts,
+    ],
+    Field(discriminator="op"),
+]
 
 
 # -----------------------------------------------------------------------------
@@ -209,7 +259,7 @@ class ChangeSet(BaseModel):
     Canonical batch envelope for mutating operations.
     - `schema_version` pins the contract version.
     - `idempotency_key` is required; server should reject/ignore duplicates.
-    - `audit` je jednotný snake_case model s klíči:
+    - `audit` is a unified snake_case model with keys:
       user_id, ts, source, tags, org_id, session_id, request_id, batch_id
     """
     model_config = ConfigDict(extra="forbid")
@@ -218,8 +268,10 @@ class ChangeSet(BaseModel):
     idempotency_key: StrictStr
     org_id: StrictStr
     intent: Literal["preview", "apply"] = "apply"
+
+    actions: list[Action]
+
     audit: Audit
-    actions: List[Action] = Field(..., discriminator="op")
 
 
 __all__ = [
@@ -228,6 +280,7 @@ __all__ = [
     "RiskItem",
     "ControlUpsert",
     "ThreatUpsert",
+    "ImpactUpsert",
     "ActionSetImpacts",
     "ActionSetRisks",
     "ActionUpsertControls",
@@ -235,6 +288,7 @@ __all__ = [
     "ActionSetAssetMeta",
     "ActionCreateAsset",
     "ActionUpsertThreats",
+    "ActionUpsertImpacts",
     "Action",
     "ChangeSet",
 ]

@@ -238,7 +238,18 @@ async def demo_page() -> str:
     });
 
     wsBtn.addEventListener('click', connectWs);
-    window.addEventListener('load', connectWs);
+    window.addEventListener('load', () => {
+      const url = new URL(location.href);
+      const apiKeyEl = document.getElementById('apiKey');
+      const initialKey = url.searchParams.get('api_key') || '';
+      if (initialKey && apiKeyEl) apiKeyEl.value = initialKey; // předvyplň input
+      // Připoj se jen pokud máme klíč
+      if (initialKey || (apiKeyEl && apiKeyEl.value.trim())) {
+        connectWs();
+      } else {
+        log('WS', 'API key missing: add ?api_key=… to URL or fill the box and click Connect.');
+      }
+    });
     window.addEventListener('beforeunload', () => { if (ws) try { ws.close(1000, 'leaving'); } catch {} });
   </script>
 </body>

@@ -41,3 +41,6 @@ PyJWT[crypto]
 # Infra / storage
 redis
 aiosqlite
+
+
+typing_extensions

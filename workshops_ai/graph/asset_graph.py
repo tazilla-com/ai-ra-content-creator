@@ -1,62 +1,45 @@
 # File: workshops_ai/graph/asset_graph.py
 # -----------------------------------------------------------------------------
-# Purpose
-# LangGraph graph for the ASSETS tab (LLM-first NLU + SEND-NOW semantics).
+# LangGraph: ASSETS tab — tool-choice agent + LLM-first conversational assistant
 #
-# High-level flow
-#   start
-#    └─► nlu                   # extract action/slots from natural language (LLM → JSON)
-#         └─► route            # infer action: list | get | create | set_meta | explain
-#              ├─► assets_list           # read-only
-#              ├─► asset_get             # read-only
-#              ├─► explain               # read-only, RAG→LLM fallback
-#              ├─► create_asset  ──► submit_changeset   # write (multi supported)
-#              └─► set_meta      ──► submit_changeset   # write (multi supported)
+# Flow:
+#   start → agent_decide → agent_route → {assets_list | asset_get | create_asset
+#         | set_meta | explain} → (submit_changeset?) → END
+# Missing selection for get/set/explain triggers suggest-select.
 #
-# Output (UIResponse-like dict)
-# {
-#   "messages": ["assistant text..."],
-#   "proposals": null | {...},
-#   "staging": {"needs_commit": false, "batch_id": null, "diff": null},
-#   "policy": {"emit_changes_enabled": true}
-# }
-#
-# Notes
-# - History/checkpoints are enabled by compiling with the injected checkpointer.
-# - This graph keeps catalogs out of scope; lists/selects assets and performs "safe"
-#   meta updates only (CIA/type/isPrimary).
-# - ChangeSet payloads are built using the shared builder (multi-action).
-#   When BE submit is unavailable, we fall back to writing JSON into outbox.
-# - LLM is used ONLY for NLU (action+slots) and explain (RAG/LLM); write logic is deterministic.
-# - Idempotence and WS optimistic emits are preserved.
-# - IMPORTANT: All asset payloads returned in `state.result` are the canonical
-#   `workshops_ai.api.schema.asset.Asset` DTO dumps.
-# -----------------------------------------------------------------------------
+# External contracts unchanged:
+# - Deterministic use of backend_port + ws_hub
+# - ChangeSet submission with backoff; on failure → JSON outbox
 
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import time
 import json
 import logging
 import os
+import random
 import re
 import unicodedata
 import uuid
 from dataclasses import dataclass, asdict, is_dataclass
 from typing import Any, Callable, Literal, Optional, Sequence, cast
+from typing_extensions import TypedDict
 
 from pydantic import BaseModel, Field, TypeAdapter
 
 from workshops_ai.graph.factory import GraphDeps
-from workshops_ai.api.schema.asset import Asset  # ← canonical DTO
+from workshops_ai.api.schema.asset import Asset
+from workshops_ai.graph.agent_node import agent_decide
 
+# LangGraph
 try:
     from langgraph.graph import StateGraph, END  # type: ignore
 except Exception as e:  # pragma: no cover
     raise RuntimeError("langgraph must be installed to use asset_graph") from e
 
-# Optional LLM (LangChain OpenAI); runtime-safe fallbacks
+# Optional LLM (NLU + explain fallback)
 _HAS_LLM = True
 try:
     from langchain_openai import ChatOpenAI  # type: ignore
@@ -66,62 +49,168 @@ except Exception:  # pragma: no cover
     ChatOpenAI = object  # type: ignore
     SystemMessage = HumanMessage = object  # type: ignore
 
-# ChangeSet builder (shared schema)
+# ChangeSet & write actions (+ guard)
 try:
-    from workshops_ai.models.changeset import ChangeSet  # type: ignore
+    from workshops_ai.models.changeset import (  # type: ignore
+        ChangeSet,
+        ActionCreateAsset,
+        ActionSetAssetMeta,
+    )
     from workshops_ai.agents.utils.changeset_builder import build_changeset  # type: ignore
 except Exception:  # pragma: no cover
     ChangeSet = Any  # type: ignore
 
     def build_changeset(**kwargs):  # type: ignore
-        # Fallback: return a dict that looks like a ChangeSet
         return {
             "id": kwargs.get("id") or str(uuid.uuid4()),
             "org_id": kwargs.get("org_id"),
             "user_id": kwargs.get("user_id"),
             "intent": kwargs.get("intent", "apply"),
             "actions": kwargs.get("actions", []),
-            "audit": {"source": "AI", "timestamp": dt.datetime.now().isoformat()},
+            "audit": {"source": "AI", "timestamp": dt.datetime.utcnow().isoformat()},
         }
+
+try:
+    from workshops_ai.tools.guard import guard_validate_payload as _guard_validate  # type: ignore
+except Exception:  # pragma: no cover
+    def _guard_validate(model_cls, payload):  # type: ignore
+        if hasattr(model_cls, "model_validate"):
+            return model_cls.model_validate(payload).model_dump()
+        return payload
 
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
-# State & helpers
+# Types & State
 # -----------------------------------------------------------------------------
 
-Intent = Literal["list", "get", "create", "set_meta", "explain"]
+Intent = Literal["help", "chitchat", "list", "get", "create", "set_meta", "explain"]
+
+
+class ToolEvent(TypedDict, total=False):
+    event_type: str            # "tool.call.start" | "tool.call.end"
+    tool: str                  # tool/node name
+    ok: bool                   # success flag
+    duration_ms: int           # only for "end"
+    meta: dict                 # arbitrary metadata
 
 
 class AssetState(BaseModel):
-    # Routing context / inputs
+    # Request context
     org_id: str
     active_tab: str = Field(default="assets")
     message: Optional[str] = None
-    selection: Optional[dict] = None  # e.g., {"asset_id": "..."} or {"asset_ids": [...]} from UI selection
+    selection: Optional[dict] = None  # {"asset_id": "..."} | {"asset_ids": [...]} | {"assets": [...]}
     user_id: Optional[str] = None
-    locale: Optional[str] = None
+    locale: Optional[str] = None  # "sk", "cs", "en" (or full locales like "sk-SK")
 
-    # Wizard / structured inputs (may be empty)
+    # Structured inputs (legacy planner; still supported)
     action: Optional[Intent] = None
-    new_asset: Optional[dict] = None   # single create seed when action == "create"
-    update: Optional[dict] = None      # single update seed when action == "set_meta"
+    new_asset: Optional[dict] = None   # when action == "create"
+    update: Optional[dict] = None      # when action == "set_meta"
 
-    # Working fields
+    # Working outputs
     intent: Optional[Intent] = None
-    # Multi-write staging (list of action dicts for the builder)
     actions: Optional[list[dict]] = None
-    # Submission result/metadata
     change: Optional[Any] = None
     result: Optional[dict] = None
 
+    # Telemetry
+    agent_events: list[ToolEvent] = Field(default_factory=list)
+
+    # Scratchpad for agent
+    tmp: dict = Field(default_factory=dict)
 
 # -----------------------------------------------------------------------------
-# UI + utility helpers
+# i18n helpers (short & friendly)
 # -----------------------------------------------------------------------------
+
+def _lang(locale: Optional[str], fallback: str = "en") -> str:
+    if not locale:
+        return fallback
+    l = locale.lower()
+    if l.startswith("sk"):
+        return "sk"
+    if l.startswith("cs") or l.startswith("cz"):
+        return "cs"
+    if l.startswith("en"):
+        return "en"
+    return fallback
+
+
+def _t(loc: str, key: str, **kw) -> str:
+    M = {
+        "greet": {
+            "sk": "Ahoj! Povedz, čo chceš s aktívami: „vytvor“, „zmeň“, „ukáž detail“ alebo „vysvetli“. 😉",
+            "cs": "Ahoj! Řekni, co chceš s aktivy: „vytvoř“, „změň“, „ukaž detail“ nebo „vysvětli“. 😉",
+            "en": "Hi! Tell me what you want to do with assets: “create”, “update”, “show details”, or “explain”. 😉",
+        },
+        "list_fail": {
+            "sk": "Zoznam aktív sa nepodarilo načítať: {err}",
+            "cs": "Nepodařilo se načíst seznam aktiv: {err}",
+            "en": "Failed to list assets: {err}",
+        },
+        "list_found": {
+            "sk": "Našiel som {n} aktív.",
+            "cs": "Našel jsem {n} aktiv.",
+            "en": "Found {n} assets.",
+        },
+        "select_prompt": {
+            "sk": "Vyber prosím aktívum. Tu je pár možností:",
+            "cs": "Vyber prosím aktivum. Tady je pár možností:",
+            "en": "Please select an asset. Here are a few options:",
+        },
+        "asset_not_found": {
+            "sk": "Aktívum „{id}“ som nenašiel.",
+            "cs": "Aktivum „{id}“ jsem nenašel.",
+            "en": "Asset “{id}” not found.",
+        },
+        "asset_load_fail": {
+            "sk": "Načítanie aktíva „{id}“ zlyhalo: {err}",
+            "cs": "Načtení aktiva „{id}“ selhalo: {err}",
+            "en": "Failed to load asset “{id}”: {err}",
+        },
+        "nothing_to_create": {
+            "sk": "Nie je čo vytvoriť. Uveď aspoň názov (name).",
+            "cs": "Není co vytvořit. Uveď alespoň název (name).",
+            "en": "Nothing to create. Provide at least a name.",
+        },
+        "nothing_to_update": {
+            "sk": "Nie je čo zmeniť. Uveď cieľové aktíva a aspoň jedno pole.",
+            "cs": "Není co změnit. Uveď cílová aktiva a alespoň jedno pole.",
+            "en": "Nothing to update. Provide target asset ids and at least one field.",
+        },
+        "validation_error": {
+            "sk": "Chyba validácie: {err}",
+            "cs": "Chyba validace: {err}",
+            "en": "Validation error: {err}",
+        },
+        "submitted_summary": {
+            "sk": "{created} vytvorených, {updated} upravených.",
+            "cs": "{created} vytvořených, {updated} upravených.",
+            "en": "{created} created, {updated} updated.",
+        },
+        "submitted_generic": {
+            "sk": "{count} akcií odoslaných.",
+            "cs": "{count} akcí odesláno.",
+            "en": "{count} actions submitted.",
+        },
+        "submit_failed_queued": {
+            "sk": "Odoslanie zlyhalo, zmeny som uložil do outboxu. Dôvod: {err}",
+            "cs": "Odeslání selhalo, změny jsem uložil do outboxu. Důvod: {err}",
+            "en": "Submission failed; changes were queued locally. Reason: {err}",
+        },
+        "explain_select_first": {
+            "sk": "Vyber najprv konkrétne aktívum (selection.asset_id).",
+            "cs": "Nejprve vyber konkrétní aktivum (selection.asset_id).",
+            "en": "Please select a specific asset (selection.asset_id) first.",
+        },
+    }
+    s = M.get(key, {}).get(loc, M.get(key, {}).get("en", key))
+    return s.format(**kw)
+
 
 def _ui_response(text: str, *, extra: Optional[dict] = None) -> dict:
-    """Build a minimal UIResponse-like payload; emit-only policy enforced."""
     base = {
         "messages": [text],
         "proposals": None,
@@ -132,9 +221,15 @@ def _ui_response(text: str, *, extra: Optional[dict] = None) -> dict:
         base.update(extra)
     return base
 
+# -----------------------------------------------------------------------------
+# Low-level utils
+# -----------------------------------------------------------------------------
+
+def _norm(text: str) -> str:
+    return unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode("ascii").lower()
+
 
 def _safe_emit(ws_hub: Any, event: str, payload: dict) -> None:
-    """Try to broadcast an optimistic WS event; ignore failures."""
     try:
         if hasattr(ws_hub, "emit"):
             ws_hub.emit(event, payload)
@@ -144,76 +239,51 @@ def _safe_emit(ws_hub: Any, event: str, payload: dict) -> None:
         logger.debug("WS emit failed (%s): %s", event, e)
 
 
-async def _amemory_set(deps: GraphDeps, key: str, value: Any) -> None:
-    func = getattr(deps, "memory_set", None)
-    if callable(func):
-        try:
-            res = func(key, value)  # may return coroutine
-            if asyncio.iscoroutine(res):
-                await res  # type: ignore[func-returns-value]
-        except Exception:
-            pass
-
-
-async def _amemory_get(deps: GraphDeps, key: str) -> Any:
-    func = getattr(deps, "memory_get", None)
-    if callable(func):
-        try:
-            res = func(key)  # may return coroutine
-            return await res if asyncio.iscoroutine(res) else res  # type: ignore[return-value]
-        except Exception:
-            return None
-    return None
-
-
-def _schedule_coro(coro: "asyncio.Future[Any]" | "asyncio.coroutines"):  # type: ignore[name-defined]
+def _schedule(coro):
     try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(coro)  # fire-and-forget
+        asyncio.get_running_loop().create_task(coro)
     except RuntimeError:
-        # no running loop (e.g., sync invoke in thread) — ignore
         pass
 
 
+async def _amemory_set(deps: GraphDeps, key: str, value: Any) -> None:
+    fn = getattr(deps, "memory_set", None)
+    if callable(fn):
+        res = fn(key, value)
+        if asyncio.iscoroutine(res):
+            await res
+
+
+async def _amemory_get(deps: GraphDeps, key: str) -> Any:
+    fn = getattr(deps, "memory_get", None)
+    if callable(fn):
+        res = fn(key)
+        return await res if asyncio.iscoroutine(res) else res
+    return None
+
+
 def _to_asset_dict(a: Any) -> dict:
-    """Normalize any asset-like object to dict (legacy/internal helper)."""
     if a is None:
         return {}
     if isinstance(a, dict):
         return a
-    # pydantic BaseModel
     try:
-        from pydantic import BaseModel as _BM  # lazy import safe
-        if isinstance(a, _BM):  # type: ignore[truthy-bool]
+        from pydantic import BaseModel as _BM
+        if isinstance(a, _BM):  # type: ignore
             return a.model_dump()
     except Exception:
         pass
-    # dataclass
     if is_dataclass(a):
         try:
             return asdict(a)
         except Exception:
             pass
-    # generic object with attributes
-    for key in ("id", "asset_id", "name", "assetType", "isPrimary", "confidentiality", "integrity", "availability"):
-        if hasattr(a, key):
-            try:
-                # build dict from known attrs
-                return {
-                    k: getattr(a, k, None)
-                    for k in ("id", "asset_id", "name", "assetType", "isPrimary", "confidentiality", "integrity", "availability")
-                }
-            except Exception:
-                break
-    # treat as simple id-like
     try:
-        s = str(a)
-        return {"id": s}
+        return {"id": getattr(a, "id", None) or getattr(a, "asset_id", None), "name": getattr(a, "name", None)}
     except Exception:
         return {}
 
-# --- Canonical Asset DTO normalization (numbers → ISO labels) -----------------
-
+# CIA normalization for preview
 _CONF_INDEX_TO_LABEL = {1: "PUBLIC", 2: "INTERNAL", 3: "PROTECTED", 4: "STRICTLY_PROTECTED"}
 _IA_INDEX_TO_LABEL = {1: "LOW", 2: "MEDIUM", 3: "HIGH"}
 TA_ASSET = TypeAdapter(Asset)
@@ -226,6 +296,7 @@ def _first_nonempty(*vals: Any) -> Any | None:
             continue
         return v
     return None
+
 
 def _as_bool(v: Any) -> bool | None:
     if v is None:
@@ -242,6 +313,7 @@ def _as_bool(v: Any) -> bool | None:
             return False
     return None
 
+
 def _num_conf_to_label(v: Any) -> str | None:
     if v is None:
         return None
@@ -253,6 +325,7 @@ def _num_conf_to_label(v: Any) -> str | None:
             return None
         return s.upper().replace("-", "_")
     return None
+
 
 def _num_ia_to_label(v: Any) -> str | None:
     if v is None:
@@ -266,122 +339,205 @@ def _num_ia_to_label(v: Any) -> str | None:
         return s.upper()
     return None
 
-def _to_asset_dto(item: Any, *, org_id: str | None = None) -> Asset:
-    """
-    Convert a backend item (dict or Pydantic model) into canonical `Asset`.
-    Accepts multiple legacy key variants and numeric CIA scales and normalizes them.
-    """
-    data = item.model_dump() if hasattr(item, "model_dump") else dict(item)
 
+def _to_asset_dto(item: Any, *, org_id: str | None = None) -> Asset:
+    data = item.model_dump() if hasattr(item, "model_dump") else dict(item)
     payload: dict[str, Any] = {}
     _org = _first_nonempty(org_id, data.get("org_id"))
-    if _org is not None and str(_org).strip():
+    if _org:
         payload["org_id"] = str(_org)
-    # id
     _id = _first_nonempty(data.get("id"), data.get("asset_id"))
-    if _id is not None:
+    if _id:
         payload["id"] = str(_id)
-
-    # name
     _name = _first_nonempty(data.get("name"), data.get("title"))
-    if _name is not None and str(_name).strip():
+    if _name:
         payload["name"] = str(_name)
-
-    # description (optional)
     _desc = _first_nonempty(data.get("description"), data.get("desc"))
     if _desc is not None:
         payload["description"] = _desc
-
-    # isPrimary (optional, coerce)
     _prim = _as_bool(_first_nonempty(data.get("isPrimary"), data.get("primary"), data.get("is_primary")))
     if _prim is not None:
         payload["isPrimary"] = _prim
-
-    # assetType
     _atype = _first_nonempty(data.get("assetType"), data.get("type"), data.get("asset_type"))
-    if _atype is not None and str(_atype).strip():
+    if _atype:
         payload["assetType"] = str(_atype)
-
-    # CIA mappings (optional; numeric → labels)
     conf = _num_conf_to_label(_first_nonempty(data.get("confidentiality"), data.get("c")))
     if conf is not None:
         payload["confidentiality"] = conf
-
     integ = _num_ia_to_label(_first_nonempty(data.get("integrity"), data.get("i")))
     if integ is not None:
         payload["integrity"] = integ
-
     avail = _num_ia_to_label(_first_nonempty(data.get("availability"), data.get("a")))
     if avail is not None:
         payload["availability"] = avail
-
-    # Validate against canonical DTO
     return TA_ASSET.validate_python(payload)
 
 # -----------------------------------------------------------------------------
-# ChangeSet submit + outbox fallback
+# Telemetry helpers
 # -----------------------------------------------------------------------------
 
-async def _asubmit_changeset_or_outbox(deps: GraphDeps, cs: ChangeSet | dict) -> None:
-    """
-    Prefer async submit via app service if present; fallback to writing JSON into outbox.
-    Accepts a ChangeSet model or a plain dict.
-    """
-    payload: dict
-    if hasattr(cs, "model_dump"):  # pydantic model support
-        payload = cs.model_dump()  # type: ignore[attr-defined]
-    else:
-        payload = cast(dict, cs)
+def _event(state: AssetState, *, kind: str, tool: str, ok: bool = True, meta: dict | None = None) -> float:
+    t0 = time.perf_counter()
+    state.agent_events.append({"event_type": kind, "tool": tool, "ok": ok, "meta": meta or {}})
+    return t0
 
-    # Submit via service if available
-    try:
-        from workshops_ai.app.services import tazila_client  # type: ignore
-    except Exception:
-        tazila_client = None  # type: ignore
 
-    try:
-        if tazila_client is not None:
-            if hasattr(tazila_client, "asubmit_changeset"):
-                await tazila_client.asubmit_changeset(payload)  # type: ignore[arg-type]
-                return
-            if hasattr(tazila_client, "submit_changeset"):
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, tazila_client.submit_changeset, payload)  # type: ignore[arg-type]
-                return
-    except Exception as e:  # pragma: no cover
-        logger.warning("Tazila submit failed, falling back to outbox: %s", e)
+def _finish(state: AssetState, t0: float, *, tool: str, ok: bool, meta: dict | None = None) -> None:
+    dur = int((time.perf_counter() - t0) * 1000)
+    state.agent_events.append({"event_type": "tool.call.end", "tool": tool, "ok": ok, "duration_ms": dur, "meta": meta or {}})
 
-    # Fallback: write to outbox directory (settings-aware)
+# -----------------------------------------------------------------------------
+# Submit with backoff + outbox
+# -----------------------------------------------------------------------------
+
+def _outbox_path_from_deps(deps: GraphDeps) -> str:
     settings = getattr(deps, "settings", None)
-    outbox_dir = None
     try:
-        outbox_dir = getattr(getattr(settings, "tazila", None), "outbox_path", None)
+        return getattr(getattr(settings, "tazila", None), "outbox_path", None) or os.getenv("WORKSHOPS_AI_TAZILA__OUTBOX_PATH") or "/app/workshops_ai/data/outbox"
     except Exception:
-        outbox_dir = None
-    outbox_dir = outbox_dir or os.getenv("WORKSHOPS_AI_TAZILA__OUTBOX_PATH") or "/app/workshops_ai/data/outbox"
+        return "/app/workshops_ai/data/outbox"
 
-    try:
-        os.makedirs(outbox_dir, exist_ok=True)
-        cs_id = payload.get("id") or str(uuid.uuid4())
-        path = os.path.join(outbox_dir, f"changeset_{cs_id}.json")
 
-        def _write():
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+async def _write_outbox(payload: dict, deps: GraphDeps) -> None:
+    path_dir = _outbox_path_from_deps(deps)
+    os.makedirs(path_dir, exist_ok=True)
+    cs_id = payload.get("id") or str(uuid.uuid4())
+    path = os.path.join(path_dir, f"changeset_{cs_id}.json")
 
-        await asyncio.to_thread(_write)
-        logger.info("ChangeSet written to outbox: %s", path)
-    except Exception as e:  # pragma: no cover
-        logger.warning("Outbox write failed: %s", e)
+    def _write():
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
 
+    await asyncio.to_thread(_write)
+    logger.info("ChangeSet written to outbox: %s", path)
+
+
+async def _submit_with_backoff(deps: GraphDeps, payload: dict, *, attempts: int = 4, base_s: float = 0.25, jitter_s: float = 0.25) -> None:
+    last_err: Optional[Exception] = None
+
+    async def _try_once():
+        nonlocal last_err
+        submit = getattr(deps, "submit_changeset", None)
+        if callable(submit):
+            try:
+                r = submit(payload)
+                if asyncio.iscoroutine(r):
+                    await r
+                return
+            except Exception as e:
+                last_err = e
+
+        try:
+            from workshops_ai.app.services import tazila_client  # type: ignore
+        except Exception:
+            tazila_client = None  # type: ignore
+
+        if tazila_client is not None:
+            try:
+                ikey = payload.get("idempotency_key") or payload.get("id")
+                if hasattr(tazila_client, "asubmit_changeset"):
+                    await tazila_client.asubmit_changeset(payload, idempotency_key=ikey)  # type: ignore
+                    return
+                if hasattr(tazila_client, "submit_changeset"):
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, tazila_client.submit_changeset, payload)  # type: ignore
+                    return
+            except Exception as e:
+                last_err = e
+        else:
+            raise RuntimeError("No submitter available")
+
+        raise last_err or RuntimeError("Unknown submit failure")
+
+    for i in range(1, attempts + 1):
+        try:
+            await _try_once()
+            return
+        except Exception as e:
+            last_err = e
+            if i == attempts:
+                break
+            delay = base_s * (2 ** (i - 1)) + random.random() * jitter_s
+            await asyncio.sleep(delay)
+
+    await _write_outbox(payload, deps)
+    if last_err:
+        raise last_err
 
 # -----------------------------------------------------------------------------
-# NLU (LLM-first) + regex fallback
+# HARD GUARD: validate write actions
 # -----------------------------------------------------------------------------
 
-def _norm(text: str) -> str:
-    t = unicodedata.normalize("NFKD", text or "").encode("ascii", "ignore").decode("ascii")
-    return t.lower()
+def _validate_write_actions(actions: list[dict]) -> tuple[list[dict], Optional[str]]:
+    validated: list[dict] = []
+    for a in actions:
+        op = (a.get("op") or "").strip()
+        try:
+            if op == "create_asset":
+                payload = {
+                    "op": "create_asset",
+                    "client_token": a.get("client_token"),
+                    "fields": a.get("fields") or {},
+                }
+                if not payload["fields"].get("name"):
+                    return [], "create_asset requires fields.name."
+                validated.append(_guard_validate(ActionCreateAsset, payload))
+            elif op == "set_asset_meta":
+                payload = {
+                    "op": "set_asset_meta",
+                    "asset_id": a.get("asset_id"),
+                    "asset_ref": a.get("asset_ref"),
+                    "fields": a.get("fields") or {},
+                }
+                if not payload["asset_id"]:
+                    return [], "set_asset_meta requires asset_id."
+                if not payload["fields"]:
+                    return [], "set_asset_meta requires at least one field."
+                validated.append(_guard_validate(ActionSetAssetMeta, payload))
+            else:
+                return [], f"Unsupported operation '{op}'."
+        except Exception as e:
+            return [], f"Write action validation failed for op='{op}': {e}"
+    return validated, None
+
+# -----------------------------------------------------------------------------
+# (Legacy) Planner (NLU) — kept for resilience & tests
+# -----------------------------------------------------------------------------
+
+GREET_RX = re.compile(r"^\s*(ahoj|cau|čau|hej|nazdar|dobr(y|ý)\s+de[nň]|hello|hi|hey|good\s+(morning|afternoon|evening))[\s!.]*$", re.I)
+CREATE_RX = re.compile(r"\b(create|new|add|vytvor|zaloz|pridaj|pridej)\b", re.I)
+UPDATE_RX = re.compile(r"\b(update|set|change|zmen|nastav|uprav)\b", re.I)
+GET_RX    = re.compile(r"\b(get|show|detail|ukaz|zobraz|tell me|čo mi povieš|co mi reknes)\b", re.I)
+LIST_RX   = re.compile(r"\b(list|seznam|vypis|zoznam|all assets)\b", re.I)
+EXPLAIN_RX= re.compile(r"\b(explain|vysvetli|popis|povedz viac|tell me more)\b", re.I)
+
+CIA_RX = {
+    "confidentiality": re.compile(r"\b(c|confidentiality)\s*([0-4])\b", re.I),
+    "integrity":       re.compile(r"\b(i|integrity)\s*([0-4])\b", re.I),
+    "availability":    re.compile(r"\b(a|availability)\s*([0-4])\b", re.I),
+}
+PRIMARY_TRUE_RX  = re.compile(r"\b(primarn(y|í)|hlavn(y|í)|primary|make primary|ozna[cč]\s+ako\s+hlavn[ýe])\b", re.I)
+PRIMARY_FALSE_RX = re.compile(r"\b(neprimarn(y|í)|zru[sš]i[ťt]\s+hlavn[ýe]|unprimary|odobra[tť]\s+hlavn[ýe])\b", re.I)
+TYPE_RX = re.compile(r"\b(typ|type)\s*[:=]?\s*([a-z0-9 _\-]+)", re.I)
+NAME_QUOTED_RX = re.compile(r"[\"“”']\s*([^\"“”']+?)\s*[\"“”']")
+_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", re.I)
+
+
+class NLUResult(BaseModel):
+    action: Optional[Intent] = None
+    language: Optional[str] = None
+    new_asset: Optional[dict] = None
+    update: Optional[dict] = None
+
+    def sanitized(self) -> "NLUResult":
+        def _only(d: Optional[dict], allowed: Sequence[str]) -> Optional[dict]:
+            if not d:
+                return None
+            return {k: d.get(k) for k in allowed if k in d}
+
+        na = _only(self.new_asset, ("id", "name", "assetType", "isPrimary", "confidentiality", "integrity", "availability"))
+        up = _only(self.update, ("asset_id", "assetType", "isPrimary", "confidentiality", "integrity", "availability"))
+        return NLUResult(action=self.action, language=self.language, new_asset=na, update=up)
 
 
 def _get_llm_from_deps(deps: GraphDeps):
@@ -390,169 +546,63 @@ def _get_llm_from_deps(deps: GraphDeps):
         return llm
     if not _HAS_LLM:
         return None
-    # Safe default
     return ChatOpenAI(model="gpt-4o-mini", temperature=0.2, timeout=12, max_retries=1)  # type: ignore[call-arg]
 
 
-class NLUResult(BaseModel):
-    """
-    Compatibility shim used inside asset_graph.py.
-
-    - Keeps the original fields + sanitized() API for minimal diffs.
-    - Adds from_shared_dict() to normalize/validate raw LLM JSON
-      via shared AssetsNLU (workshops_ai.graph.nlu).
-    """
-    action: Optional[Intent] = None
-    language: Optional[str] = None
-    confidence: Optional[float] = Field(default=None, ge=0, le=1)
-    new_asset: Optional[dict] = None
-    update: Optional[dict] = None
-    notes: Optional[str] = None
-
-    def sanitized(self) -> "NLUResult":
-        # normalize action that may come as ["list"] etc.
-        action = self.action
-        if isinstance(action, list) and action:
-            action = cast(Intent, str(action[0]).strip())
-
-        def _only(d: Optional[dict], allowed: Sequence[str]) -> Optional[dict]:
-            if not d:
-                return None
-            return {k: d.get(k) for k in allowed if k in d}
-
-        na = _only(
-            self.new_asset,
-            ("id", "name", "assetType", "isPrimary", "confidentiality", "integrity", "availability"),
-        )
-        up = _only(
-            self.update,
-            ("asset_id", "assetType", "isPrimary", "confidentiality", "integrity", "availability"),
-        )
-        return NLUResult(
-            action=cast(Optional[Intent], action),
-            language=self.language,
-            confidence=self.confidence,
-            new_asset=na,
-            update=up,
-            notes=self.notes,
-        )
-
-    @classmethod
-    def from_shared_dict(cls, data: dict, *, selection_asset_id: Optional[str] = None) -> "NLUResult":
-        """
-        Validate/normalize raw LLM JSON via the shared AssetsNLU schema
-        without forcing callers to import it at module top-level.
-        """
-        # Lazy import to avoid hard dependency if graph is imported elsewhere
-        from workshops_ai.graph.nlu import AssetsNLU, ensure_action_is_string  # type: ignore
-
-        # 1) Fix occasional action=["list"] → "list"
-        data = ensure_action_is_string(data)
-
-        # 2) Strict validation against shared schema
-        shared = AssetsNLU.model_validate(data)
-
-        # 3) Extract compatible fields (keep unknowns out)
-        action: Optional[Intent] = cast(Optional[Intent], getattr(shared, "action", None))
-        language = getattr(shared, "language", None)
-
-        # These may/not exist depending on the LLM output; pass-through safely.
-        new_asset = cast(Optional[dict], getattr(shared, "new_asset", None))
-        update = cast(Optional[dict], getattr(shared, "update", None)) or {}
-
-        # If caller passed current UI selection, propagate it into update.asset_id
-        if selection_asset_id and isinstance(update, dict) and not update.get("asset_id"):
-            update["asset_id"] = str(selection_asset_id)
-
-        inst = cls(
-            action=action,
-            language=language,
-            confidence=None,   # shared model does not define confidence
-            new_asset=new_asset,
-            update=update,
-            notes=getattr(shared, "notes", None),
-        )
-        return inst.sanitized()
-
-
-CREATE_RX = re.compile(r"\b(create|new|add|vytvor|zaloz|pridej|pridaj)\b")
-UPDATE_RX = re.compile(r"\b(update|set|change|zmen|nastav|uprav)\b")
-GET_RX    = re.compile(r"\b(get|show|detail|ukaz|zobraz|co mi reknes|co mi povies|povedz|rekni)\b")
-LIST_RX   = re.compile(r"\b(list|seznam|vypis|all assets)\b")
-EXPLAIN_RX= re.compile(r"\b(explain|vysvetli|popis|povedz viac|řekni víc|rekni vic)\b")
-
-CIA_RX = {
-    "confidentiality": re.compile(r"\b(c|confidentiality)\s*([0-4])\b"),
-    "integrity":       re.compile(r"\b(i|integrity)\s*([0-4])\b"),
-    "availability":    re.compile(r"\b(a|availability)\s*([0-4])\b"),
-}
-PRIMARY_TRUE_RX  = re.compile(r"\b(primarni|hlavni|primary|make primary|oznac jako hlavni)\b")
-PRIMARY_FALSE_RX = re.compile(r"\b(neprimarni|zrusit hlavni|unprimary|odebrat hlavni)\b")
-TYPE_RX = re.compile(r"\b(typ|type)\s*[:=]?\s*([a-z0-9 _\-]+)")
-NAME_QUOTED_RX = re.compile(r"[\"“”']\s*([^\"“”']+?)\s*[\"“”']")
-
-_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", re.I)
-
-
 async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
-    """LLM-first NLU → fills state.action/new_asset/update from natural language."""
-    raw = (state.message or "").strip()
-    if not raw:
+    text = (state.message or "").strip()
+    if not text:
+        state.action = "help"
         return state
 
-    selection_id = (state.selection or {}).get("asset_id")
+    if GREET_RX.match(text):
+        state.action = "chitchat"
+        return state
+
     llm = _get_llm_from_deps(deps)
+    selection_id = (state.selection or {}).get("asset_id")
 
     if llm is not None:
         system = (
-            "You are a strict NLU for an enterprise 'assets' assistant. "
-            "Extract intent and slots from user text in ANY language (CS/SK/EN; tolerate typos). "
-            "Return ONLY a JSON object with fields: action (list|get|create|set_meta|explain), "
-            "selection (optional with asset_id), new_asset (optional), update (optional).\n"
+            "You are a strict NLU for an 'assets' assistant.\n"
+            "Primary languages: Slovak (SK), English (EN); Czech (CZ) tolerated.\n"
+            "Return ONLY compact JSON with:\n"
+            "  action: one of [help, chitchat, list, get, create, set_meta, explain]\n"
+            "  new_asset?: {id?, name?, assetType?, isPrimary?, confidentiality?, integrity?, availability?}\n"
+            "  update?: {asset_id?, assetType?, isPrimary?, confidentiality?, integrity?, availability?}\n"
             "Rules:\n"
-            "- NEVER invent IDs.\n"
-            "- If selection.asset_id is provided, you MAY copy it into update.asset_id for set_meta/get/explain.\n"
-            "- new_asset fields: id(optional), name(required for create), assetType, isPrimary (bool), "
-            "  confidentiality, integrity, availability (0..4).\n"
-            "- update fields: asset_id(optional), assetType, isPrimary (bool), confidentiality, integrity, availability (0..4).\n"
-            "- If unsure, leave fields null. Output STRICT JSON, no prose."
+            "- Never invent IDs.\n"
+            "- If a UI selection asset_id exists, you MAY copy it into update.asset_id.\n"
+            "- Detect greetings as chitchat.\n"
+            "- CIA numeric scale is 0..4 if present.\n"
+            "- Output strict JSON only.\n"
         )
         human = {
-            "message": raw,
+            "message": text,
             "selection": {"asset_id": selection_id} if selection_id else None,
-            "hints": {
-                "allowed_actions": ["list", "get", "create", "set_meta", "explain"],
-                "cia_scale": [0, 1, 2, 3, 4],
-                "safe_fields": ["assetType", "isPrimary", "confidentiality", "integrity", "availability"],
-            },
+            "hints": {"allowed_actions": ["help", "chitchat", "list", "get", "create", "set_meta", "explain"]},
+            "locale": state.locale,
         }
         try:
-            resp = await llm.ainvoke([SystemMessage(content=system), HumanMessage(content=json.dumps(human))])  # type: ignore[arg-type]
-            txt = (getattr(resp, "content", None) or "").strip()
-            start = txt.find("{"); end = txt.rfind("}")
-            data = json.loads(txt[start:end + 1]) if start != -1 and end != -1 else json.loads(txt)
-
-            # Normalize & validate against the shared schema via the shim
-            nlu_res = NLUResult.from_shared_dict(data, selection_asset_id=selection_id)
-
-            if nlu_res.action and not state.action:
-                state.action = cast(Intent, nlu_res.action)
-
-            if nlu_res.new_asset and not state.new_asset:
-                state.new_asset = nlu_res.new_asset
-
-            maybe_update = dict(nlu_res.update or {})
-            if selection_id and not maybe_update.get("asset_id"):
-                maybe_update["asset_id"] = selection_id
-            if maybe_update and not state.update:
-                state.update = maybe_update
-
+            resp = await llm.ainvoke([SystemMessage(content=system), HumanMessage(content=json.dumps(human))])  # type: ignore
+            raw = (getattr(resp, "content", None) or "").strip()
+            start, end = raw.find("{"), raw.rfind("}")
+            data = json.loads(raw[start:end + 1] if start != -1 and end != -1 else raw)
+            n = NLUResult(**data).sanitized()
+            if n.action:
+                state.action = n.action
+            if n.new_asset and not state.new_asset:
+                state.new_asset = n.new_asset
+            if n.update:
+                if selection_id and not n.update.get("asset_id"):
+                    n.update["asset_id"] = selection_id
+                if not state.update:
+                    state.update = n.update
         except Exception as e:
-            logger.warning("NLU LLM failed: %s", e)
+            logger.debug("NLU LLM failed, fallback to regex: %s", e)
 
-    # Fallback regex — keeps things moving if LLM is missing/failing
     if not state.action:
-        t = _norm(raw)
+        t = _norm(text)
         if EXPLAIN_RX.search(t):
             state.action = "explain"
         elif CREATE_RX.search(t):
@@ -563,11 +613,12 @@ async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
             state.action = "get"
         elif LIST_RX.search(t):
             state.action = "list"
+        else:
+            state.action = "help"
 
-        # Minimal slot filling
         if state.action == "create" and not state.new_asset:
             na = {}
-            m_name = NAME_QUOTED_RX.search(raw)
+            m_name = NAME_QUOTED_RX.search(text)
             if m_name:
                 na["name"] = m_name.group(1).strip()
             m_type = TYPE_RX.search(t)
@@ -594,132 +645,145 @@ async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
                     fields["asset_id"] = selection_id
                 state.update = fields
 
-    return state
-
-# -----------------------------------------------------------------------------
-# Intent node
-# -----------------------------------------------------------------------------
-
-def _infer_intent(state: AssetState) -> AssetState:
-    """Infer intent from structured inputs or free-form message (post-NLU)."""
-    if state.action in ("list", "get", "create", "set_meta", "explain"):
+    if state.action in ("help", "chitchat", "list", "get", "create", "set_meta", "explain"):
         state.intent = cast(Intent, state.action)
-        return state
-
-    text = (state.message or "").lower()
-    if (state.selection or {}).get("asset_id") and re.search(r"\b(explain|detail|get|ukaz|zobraz|vysvetli)\b", text):
-        state.intent = "explain" if re.search(r"\b(explain|vysvetli)\b", text) else "get"
-        return state
-
-    if re.search(r"\b(create|new|add)\b", text):
-        state.intent = "create"
-    elif re.search(r"\b(update|set|change|cia|confidentiality|integrity|availability|type)\b", text):
-        state.intent = "set_meta"
-    elif re.search(r"\b(explain|vysvetli|popis)\b", text):
-        state.intent = "explain"
-    elif re.search(r"\b(detail|show|get)\b", text):
-        state.intent = "get"
     else:
         state.intent = "list"
     return state
 
+# -----------------------------------------------------------------------------
+# Suggest-select (if missing selection)
+# -----------------------------------------------------------------------------
+
+def _suggest_select(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
+    def _inner(state: AssetState) -> AssetState:
+        loc = _lang(state.locale)
+        t0 = _event(state, kind="tool.call.start", tool="suggest_select")
+        try:
+            items = deps.backend_port.assets_list(org_id=state.org_id) or []
+            dtos: list[Asset] = []
+            for a in items[:50]:
+                try:
+                    dtos.append(_to_asset_dto(a, org_id=state.org_id))
+                except Exception:
+                    continue
+
+            lines = [_t(loc, "select_prompt")]
+            preview = []
+            for dto in dtos[:8]:
+                d = dto.model_dump()
+                preview.append(f"- {d.get('id')}: {d.get('name', 'Unnamed')} [{d.get('assetType','-')}]")
+            msg = "\n".join(lines + preview) if preview else _t(loc, "list_found", n=0)
+
+            state.result = _ui_response(
+                msg,
+                extra={"assets": [a.model_dump() for a in dtos[:20]], "agent_events": state.agent_events},
+            )
+            _finish(state, t0, tool="suggest_select", ok=True, meta={"count": len(dtos)})
+        except Exception as e:
+            _finish(state, t0, tool="suggest_select", ok=False, meta={"error": str(e)})
+            state.result = _ui_response(_t(loc, "list_fail", err=e), extra={"agent_events": state.agent_events})
+        return state
+    return _inner
 
 # -----------------------------------------------------------------------------
-# Read-only nodes (returning canonical Asset DTO dumps)
+# Read-only nodes
 # -----------------------------------------------------------------------------
 
 def _assets_list(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
     def _inner(state: AssetState) -> AssetState:
+        loc = _lang(state.locale)
+        t0 = _event(state, kind="tool.call.start", tool="assets_list")
         try:
-            items = deps.backend_port.assets_list(org_id=state.org_id)
+            items = deps.backend_port.assets_list(org_id=state.org_id) or []
+            dtos: list[Asset] = []
+            for a in items:
+                try:
+                    dtos.append(_to_asset_dto(a, org_id=state.org_id))
+                except Exception:
+                    continue
+
+            header = _t(loc, "list_found", n=len(dtos))
+            preview = []
+            for dto in dtos[:10]:
+                d = dto.model_dump()
+                preview.append(
+                    f"- {d.get('id')}: {d.get('name','Unnamed')} [{d.get('assetType','-')}]"
+                    f"{' (primary)' if d.get('isPrimary') else ''}"
+                )
+            msg = "\n".join([header] + preview) if preview else header
+
+            state.result = _ui_response(
+                msg,
+                extra={"assets": [a.model_dump() for a in dtos[:50]], "agent_events": state.agent_events},
+            )
+            _finish(state, t0, tool="assets_list", ok=True, meta={"count": len(dtos)})
         except Exception as e:
-            state.result = _ui_response(f"Failed to list assets: {e}")
-            return state
-
-        items = items or []
-        # Normalize to canonical DTOs
-        dtos: list[Asset] = []
-        for a in items:
-            try:
-                dtos.append(_to_asset_dto(a, org_id=state.org_id))
-            except Exception as ex:
-                logger.debug("Failed to normalize asset item: %s", ex)
-
-        # Human preview
-        lines = [f"Found {len(dtos)} assets."]
-        preview = []
-        for dto in dtos[:10]:
-            d = dto.model_dump()
-            nid = d.get("id") or "?"
-            name = d.get("name") or "Unnamed"
-            a_type = d.get("assetType") or "-"
-            primary = " (primary)" if d.get("isPrimary") else ""
-            preview.append(f"- {nid}: {name} [{a_type}]{primary}")
-        if preview:
-            lines += preview
-
-        state.result = _ui_response(
-            "\n".join(lines),
-            extra={"assets": [a.model_dump() for a in dtos[:50]]},  # canonical DTO dumps
-        )
+            _finish(state, t0, tool="assets_list", ok=False, meta={"error": str(e)})
+            state.result = _ui_response(_t(loc, "list_fail", err=e), extra={"agent_events": state.agent_events})
         return state
     return _inner
 
 
-def _asset_get(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
+def _asset_get_or_suggest(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
     def _inner(state: AssetState) -> AssetState:
+        loc = _lang(state.locale)
         asset_id = (state.selection or {}).get("asset_id")
         if not asset_id:
-            state.result = _ui_response("No asset selected. Provide selection.asset_id.")
-            return state
+            return _suggest_select(deps)(state)
 
+        t0 = _event(state, kind="tool.call.start", tool="asset_get", meta={"asset_id": asset_id})
         try:
             asset = deps.backend_port.asset_get(asset_id)
-        except Exception as e:
-            state.result = _ui_response(f"Failed to load asset '{asset_id}': {e}")
-            return state
+            if not asset:
+                _finish(state, t0, tool="asset_get", ok=False, meta={"error": "not_found"})
+                state.result = _ui_response(_t(loc, "asset_not_found", id=asset_id), extra={"agent_events": state.agent_events})
+                return state
 
-        if not asset:
-            state.result = _ui_response(f"Asset '{asset_id}' not found.")
-            return state
-
-        try:
             dto = _to_asset_dto(asset, org_id=state.org_id)
-        except Exception as ex:
-            state.result = _ui_response(f"Asset normalization failed: {ex}")
-            return state
-
-        d = dto.model_dump()
-        name = d.get("name") or asset_id
-        a_type = d.get("assetType") or "-"
-        cia = {"C": d.get("confidentiality"), "I": d.get("integrity"), "A": d.get("availability")}
-        is_primary = bool(d.get("isPrimary"))
-        note = f"Asset {asset_id}: {name} [{a_type}], CIA={cia}, primary={is_primary}"
-        state.result = _ui_response(note, extra={"asset": d})  # canonical DTO dump
+            d = dto.model_dump()
+            preview_cia = {"C": d.get("confidentiality"), "I": d.get("integrity"), "A": d.get("availability")}
+            msg = f"{d.get('name') or asset_id} [{d.get('assetType','-')}], CIA={preview_cia}, primary={bool(d.get('isPrimary'))}"
+            state.result = _ui_response(msg, extra={"asset": d, "agent_events": state.agent_events})
+            _finish(state, t0, tool="asset_get", ok=True, meta={"asset_id": asset_id})
+        except Exception as e:
+            _finish(state, t0, tool="asset_get", ok=False, meta={"error": str(e)})
+            state.result = _ui_response(_t(loc, "asset_load_fail", id=asset_id, err=e), extra={"agent_events": state.agent_events})
         return state
     return _inner
 
+# -----------------------------------------------------------------------------
+# Chitchat/help
+# -----------------------------------------------------------------------------
+
+def _help_or_greet() -> Callable[[AssetState], AssetState]:
+    def _inner(state: AssetState) -> AssetState:
+        loc = _lang(state.locale)
+        state.result = _ui_response(_t(loc, "greet"), extra={"agent_events": state.agent_events})
+        return state
+    return _inner
 
 # -----------------------------------------------------------------------------
-# Explain node (RAG → LLM fallback)
+# Explain (RAG → LLM)
 # -----------------------------------------------------------------------------
 
 async def _asset_explain(deps: GraphDeps, state: AssetState) -> AssetState:
-    # Determine target asset id
+    loc = _lang(state.locale)
     asset_id = (state.selection or {}).get("asset_id") \
         or (state.update or {}).get("asset_id") \
         or (await _amemory_get(deps, "assets.last_hint") or {}).get("asset_id")
 
-    asset_dto_dump: dict | None = None
-    if asset_id:
-        try:
-            asset = deps.backend_port.asset_get(asset_id)
-            if asset:
-                asset_dto_dump = _to_asset_dto(asset).model_dump()
-        except Exception:
-            asset_dto_dump = None
+    if not asset_id:
+        return _suggest_select(deps)(state)
 
-    # Try to get retriever from deps (GraphDeps.make_retriever(org_id, tab))
+    asset_dto_dump: dict | None = None
+    try:
+        a = deps.backend_port.asset_get(asset_id)
+        if a:
+            asset_dto_dump = _to_asset_dto(a).model_dump()
+    except Exception:
+        asset_dto_dump = None
+
     retriever = None
     try:
         if hasattr(deps, "make_retriever"):
@@ -729,27 +793,22 @@ async def _asset_explain(deps: GraphDeps, state: AssetState) -> AssetState:
 
     context_chunks: list[dict] = []
     if retriever is not None:
+        t0r = _event(state, kind="tool.call.start", tool="retriever.search", meta={"tab": "assets"})
         try:
-            query = "Explain the asset" + (f" {asset_dto_dump.get('name')}" if asset_dto_dump and asset_dto_dump.get("name") else "")
-            if hasattr(retriever, "asearch"):
-                docs = await retriever.asearch(query, k=4)  # type: ignore
-            else:
-                docs = retriever.search(query, k=4)  # type: ignore
+            query = "Explain the asset " + (asset_dto_dump.get("name") if asset_dto_dump else "")
+            docs = await retriever.asearch(query, k=4) if hasattr(retriever, "asearch") else retriever.search(query, k=4)  # type: ignore
             for d in (docs or [])[:5]:
-                if isinstance(d, dict):
-                    context_chunks.append(d)
-                else:
-                    context_chunks.append({"text": str(d)})
+                context_chunks.append(d if isinstance(d, dict) else {"text": str(d)})
+            _finish(state, t0r, tool="retriever.search", ok=True, meta={"docs": len(context_chunks)})
         except Exception as e:
-            logger.debug("Retriever failed: %s", e)
+            _finish(state, t0r, tool="retriever.search", ok=False, meta={"error": str(e)})
 
-    # Build explanation text
     llm = _get_llm_from_deps(deps) if _HAS_LLM else None
     if llm is not None:
         sys = (
-            "You are a helpful security workshop assistant. Explain the selected asset to a non-expert stakeholder. "
-            "Use the provided context if relevant; otherwise reason from the asset metadata. "
-            "Keep it concise (5–8 short sentences). Avoid hallucinating unknown fields."
+            "You are a helpful security workshop assistant. Explain the selected asset to a non-expert. "
+            "Use provided context if relevant; else reason from the asset metadata. Keep it concise (5–8 short sentences). "
+            "Avoid hallucinating unknown fields. Output plain text."
         )
         human_payload = {
             "asset": asset_dto_dump or {},
@@ -757,58 +816,48 @@ async def _asset_explain(deps: GraphDeps, state: AssetState) -> AssetState:
             "org_id": state.org_id,
             "context": context_chunks or None,
             "question": state.message or "Explain this asset",
+            "locale": loc,
         }
+        t0l = _event(state, kind="tool.call.start", tool="llm.explain")
         try:
             resp = await llm.ainvoke([SystemMessage(content=sys), HumanMessage(content=json.dumps(human_payload))])  # type: ignore
             text = (getattr(resp, "content", None) or "").strip()
             if text:
-                state.result = _ui_response(text, extra={"asset": asset_dto_dump, "sources": context_chunks or None})
+                _finish(state, t0l, tool="llm.explain", ok=True, meta={"used_sources": bool(context_chunks)})
+                state.result = _ui_response(text, extra={"asset": asset_dto_dump, "sources": context_chunks or None, "agent_events": state.agent_events})
                 return state
         except Exception as e:
-            logger.debug("Explain LLM failed: %s", e)
+            _finish(state, t0l, tool="llm.explain", ok=False, meta={"error": str(e)})
 
-    # Plain fallback without LLM
     if asset_dto_dump:
         name = asset_dto_dump.get("name") or "Unnamed asset"
         a_type = asset_dto_dump.get("assetType") or "-"
         c = asset_dto_dump.get("confidentiality"); i = asset_dto_dump.get("integrity"); a = asset_dto_dump.get("availability")
-        cia_txt = ", ".join([f"C={c}", f"I={i}", f"A={a}"])
-        text = f"{name} [{a_type}]. From a security perspective: {cia_txt}. A deeper explanation will be added once the knowledge base is available."
-    else:
-        text = "I need a specific asset selected (selection.asset_id) to explain it."
-    state.result = _ui_response(text, extra={"asset": asset_dto_dump})
+        text = f"{name} [{a_type}]. From a security perspective: C={c}, I={i}, A={a}. More detail will appear as the knowledge base grows."
+        state.result = _ui_response(text, extra={"asset": asset_dto_dump, "agent_events": state.agent_events})
+        return state
+
+    state.result = _ui_response(_t(loc, "explain_select_first"), extra={"agent_events": state.agent_events})
     return state
 
-
 # -----------------------------------------------------------------------------
-# Multi-write helpers
+# Write helpers (derive multi)
 # -----------------------------------------------------------------------------
 
 _ALLOWED_CREATE = {"id", "name", "assetType", "isPrimary", "confidentiality", "integrity", "availability"}
 _ALLOWED_UPDATE = {"asset_id", "assetType", "isPrimary", "confidentiality", "integrity", "availability"}
 
-
-def _slug(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    return s.strip("-") or "item"
-
-
 def _json_array_from_text(s: str) -> list[Any]:
-    """Best-effort: try to parse a JSON array embedded anywhere in text."""
     s = (s or "").strip()
     if not s:
         return []
-    # Fast path: whole text is JSON array
     try:
         data = json.loads(s)
         return data if isinstance(data, list) else []
     except Exception:
         pass
-    # Slow scan: first bracket pair that parses
     try:
-        start = s.find("[")
-        end = s.rfind("]")
+        start, end = s.find("["), s.rfind("]")
         if start != -1 and end != -1 and end > start:
             data = json.loads(s[start:end + 1])
             return data if isinstance(data, list) else []
@@ -818,7 +867,6 @@ def _json_array_from_text(s: str) -> list[Any]:
 
 
 def _collect_selected_ids(selection: Optional[dict], message: Optional[str]) -> list[str]:
-    """Collect asset ids from selection (asset_ids/assets) and message (UUIDs)."""
     ids: list[str] = []
     sel = selection or {}
     if sel.get("asset_id"):
@@ -827,16 +875,12 @@ def _collect_selected_ids(selection: Optional[dict], message: Optional[str]) -> 
         ids += [str(x) for x in sel["asset_ids"] if x]
     if isinstance(sel.get("assets"), (list, tuple)):
         for a in sel["assets"]:
-            try:
-                ad = _to_asset_dict(a)
-                aid = ad.get("id") or ad.get("asset_id")
-                if aid:
-                    ids.append(str(aid))
-            except Exception:
-                continue
+            ad = _to_asset_dict(a)
+            aid = ad.get("id") or ad.get("asset_id")
+            if aid:
+                ids.append(str(aid))
     msg = message or ""
     ids += _UUID_RE.findall(msg)
-    # Deduplicate, keep order
     seen: set[str] = set()
     out: list[str] = []
     for i in ids:
@@ -847,28 +891,30 @@ def _collect_selected_ids(selection: Optional[dict], message: Optional[str]) -> 
 
 
 def _derive_create_items(state: AssetState) -> list[dict]:
-    """
-    Derive a list of create items from:
-    - JSON array in message (objects with name + optional fields),
-    - quoted name list in message + fields from state.new_asset,
-    - single new_asset from wizard.
-    """
+    # 1) Prefer items proposed by the agent (bulk create)
+    agent_items = (state.tmp.get("agent_create_items") or [])
+    out_from_agent = []
+    for it in agent_items:
+        if isinstance(it, dict):
+            obj = {k: it.get(k) for k in _ALLOWED_CREATE if k in it}
+            if (obj.get("name") or "").strip():
+                out_from_agent.append(obj)
+    if out_from_agent:
+        return out_from_agent
+
+    # 2) Parse strict JSON array from message
     items: list[dict] = []
     raw = state.message or ""
-
-    # 1) JSON array in message
     arr = _json_array_from_text(raw)
     for it in arr:
-        if not isinstance(it, dict):
-            continue
-        obj = {k: it.get(k) for k in _ALLOWED_CREATE if k in it}
-        if (obj.get("name") or "").strip():
-            items.append(obj)
-
+        if isinstance(it, dict):
+            obj = {k: it.get(k) for k in _ALLOWED_CREATE if k in it}
+            if (obj.get("name") or "").strip():
+                items.append(obj)
     if items:
         return items
 
-    # 2) Quoted names + shared fields from new_asset
+    # 3) Names in quotes + shared slots
     names = [m.strip() for m in NAME_QUOTED_RX.findall(raw) if m and m.strip()]
     if names:
         shared = {k: v for k, v in (state.new_asset or {}).items() if k in _ALLOWED_CREATE and k != "name"}
@@ -878,78 +924,81 @@ def _derive_create_items(state: AssetState) -> list[dict]:
             items.append(obj)
         return items
 
-    # 3) Single from wizard
+    # 4) Single object from state
     if state.new_asset:
         obj = {k: state.new_asset.get(k) for k in _ALLOWED_CREATE if k in state.new_asset}
         if (obj.get("name") or "").strip():
             items.append(obj)
-
     return items
 
 
 def _derive_update_items(state: AssetState) -> list[dict]:
-    """
-    Derive a list of update items from:
-    - JSON array in message (each item has asset_id + fields),
-    - selection/message ids + shared fields from state.update.
-    """
+    # 1) Prefer items proposed by the agent (bulk update)
+    agent_items = (state.tmp.get("agent_update_items") or [])
+    out_from_agent = []
+    for it in agent_items:
+        if isinstance(it, dict):
+            aid = it.get("asset_id") or it.get("id")
+            if not aid:
+                continue
+            fields = {k: it.get(k) for k in _ALLOWED_UPDATE if k in it and k != "asset_id"}
+            fields = {k: v for k, v in fields.items() if v is not None}
+            if fields:
+                out_from_agent.append({"asset_id": str(aid), **fields})
+    if out_from_agent:
+        return out_from_agent
+
+    # 2) Parse strict JSON array from message
     items: list[dict] = []
     raw = state.message or ""
-
-    # 1) JSON array with per-item payloads
     arr = _json_array_from_text(raw)
     for it in arr:
-        if not isinstance(it, dict):
-            continue
-        aid = it.get("asset_id") or it.get("id")
-        if not aid:
-            continue
-        fields = {k: it.get(k) for k in _ALLOWED_UPDATE if k in it and k != "asset_id"}
-        fields = {k: v for k, v in fields.items() if v is not None}
-        if fields:
-            items.append({"asset_id": str(aid), **fields})
-
+        if isinstance(it, dict):
+            aid = it.get("asset_id") or it.get("id")
+            if not aid:
+                continue
+            fields = {k: it.get(k) for k in _ALLOWED_UPDATE if k in it and k != "asset_id"}
+            fields = {k: v for k, v in fields.items() if v is not None}
+            if fields:
+                items.append({"asset_id": str(aid), **fields})
     if items:
         return items
 
-    # 2) Collect id list from selection/message, apply shared fields from state.update
+    # 3) Use selection + shared fields
     ids = _collect_selected_ids(state.selection, state.message)
-    shared_fields = {
-        k: v for k, v in (state.update or {}).items()
-        if k in _ALLOWED_UPDATE and k != "asset_id" and v is not None
-    }
+    shared = {k: v for k, v in (state.update or {}).items() if k in _ALLOWED_UPDATE and k != "asset_id" and v is not None}
     for aid in ids:
-        if shared_fields:
-            items.append({"asset_id": aid, **shared_fields})
+        if shared:
+            items.append({"asset_id": aid, **shared})
 
-    # 3) Single update seed (if nothing else)
+    # 4) Single object from state
     if not items and state.update and state.update.get("asset_id"):
         fields = {k: v for k, v in state.update.items() if k in _ALLOWED_UPDATE and k != "asset_id" and v is not None}
         if fields:
             items.append({"asset_id": str(state.update["asset_id"]), **fields})
-
     return items
 
-
 # -----------------------------------------------------------------------------
-# Write nodes (create / set_meta) — SEND-NOW, multi supported
+# Write nodes (create / set_meta) — emit-only then submit
 # -----------------------------------------------------------------------------
 
 def _create_asset(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
     def _inner(state: AssetState) -> AssetState:
-        # Derive list of create items
+        loc = _lang(state.locale)
+        t0 = _event(state, kind="tool.call.start", tool="create_asset")
+        draft: list[dict] = []
         create_items = _derive_create_items(state)
         if not create_items:
-            state.result = _ui_response("Nothing to create. Provide at least a name for each asset.")
+            _finish(state, t0, tool="create_asset", ok=False, meta={"error": "no_items"})
+            state.result = _ui_response(_t(loc, "nothing_to_create"), extra={"agent_events": state.agent_events})
             return state
 
-        actions: list[dict] = []
         for it in create_items:
             name = (it.get("name") or "").strip()
             if not name:
                 continue
             fields = {
-                "id": it.get("id") or None,  # server may assign id
+                "id": it.get("id") or None,
                 "name": name,
                 "assetType": it.get("assetType"),
                 "isPrimary": bool(it.get("isPrimary")) if it.get("isPrimary") is not None else None,
@@ -957,122 +1006,110 @@ def _create_asset(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
                 "integrity": it.get("integrity"),
                 "availability": it.get("availability"),
             }
-            # Drop Nones for cleaner payloads
             fields = {k: v for k, v in fields.items() if v is not None}
+            draft.append({"op": "create_asset", "client_token": f"tmp-{uuid.uuid4().hex[:10]}", "fields": fields})
 
-            client_token = f"tmp-{_slug(name)}-{uuid.uuid4().hex[:8]}"
-            action = {
-                "op": "create_asset",
-                "client_token": client_token,
-                "fields": fields,
-            }
-            actions.append(action)
-
-            # Optimistic WS emit per item
-            emit_payload = {"org_id": state.org_id, **fields}
-            _safe_emit(getattr(deps, "ws_hub", None), "asset.created", emit_payload)
-
-        if not actions:
-            state.result = _ui_response("Nothing to create after validation.")
+        validated, err = _validate_write_actions(draft)
+        if err:
+            _finish(state, t0, tool="create_asset", ok=False, meta={"error": err})
+            state.result = _ui_response(_t(loc, "validation_error", err=err), extra={"agent_events": state.agent_events})
             return state
 
-        state.actions = actions
-        # Lightweight hint for last item (for cross-tab follow-ups)
-        last_name = create_items[-1].get("name")
-        last_id = create_items[-1].get("id")
-        _schedule_coro(_amemory_set(deps, "assets.last_hint", {"asset_name": last_name, "asset_id": last_id}))
+        for a in validated:
+            _safe_emit(getattr(deps, "ws_hub", None), "asset.created", {"org_id": state.org_id, **(a.get("fields") or {})})
+
+        state.actions = validated
+        last_fields = (validated[-1] or {}).get("fields", {})
+        _schedule(_amemory_set(deps, "assets.last_hint", {"asset_name": last_fields.get("name"), "asset_id": last_fields.get("id")}))
+
+        _finish(state, t0, tool="create_asset", ok=True, meta={"count": len(validated)})
         return state
     return _inner
 
 
 def _set_meta(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
     def _inner(state: AssetState) -> AssetState:
+        loc = _lang(state.locale)
+        t0 = _event(state, kind="tool.call.start", tool="set_asset_meta")
         update_items = _derive_update_items(state)
         if not update_items:
-            state.result = _ui_response("Nothing to update. Provide target asset ids and at least one field.")
+            if not (state.update and state.update.get("asset_id")) and not (state.selection and state.selection.get("asset_id")):
+                _finish(state, t0, tool="set_asset_meta", ok=False, meta={"error": "missing_selection"})
+                return _suggest_select(deps)(state)
+            _finish(state, t0, tool="set_asset_meta", ok=False, meta={"error": "no_items"})
+            state.result = _ui_response(_t(loc, "nothing_to_update"), extra={"agent_events": state.agent_events})
             return state
 
-        actions: list[dict] = []
+        draft: list[dict] = []
         for it in update_items:
-            asset_id = it.get("asset_id")
-            if not asset_id:
-                continue
+            aid = it.get("asset_id")
             fields = {k: v for k, v in it.items() if k in _ALLOWED_UPDATE and k != "asset_id" and v is not None}
-            if not fields:
-                continue
-            action = {
-                "op": "set_asset_meta",
-                "asset_id": asset_id,
-                "fields": fields,
-            }
-            actions.append(action)
+            if aid and fields:
+                draft.append({"op": "set_asset_meta", "asset_id": aid, "fields": fields})
 
-            # Optimistic WS emit per item
-            emit_payload = {"org_id": state.org_id, "asset_id": asset_id, **fields}
-            _safe_emit(getattr(deps, "ws_hub", None), "asset.updated", emit_payload)
-
-        if not actions:
-            state.result = _ui_response("Nothing to update after validation.")
+        validated, err = _validate_write_actions(draft)
+        if err:
+            _finish(state, t0, tool="set_asset_meta", ok=False, meta={"error": err})
+            state.result = _ui_response(_t(loc, "validation_error", err=err), extra={"agent_events": state.agent_events})
             return state
 
-        state.actions = actions
-        # Update lightweight hint to last affected asset
-        _schedule_coro(_amemory_set(deps, "assets.last_hint", {"asset_id": update_items[-1].get("asset_id")}))
+        for a in validated:
+            _safe_emit(getattr(deps, "ws_hub", None), "asset.updated", {"org_id": state.org_id, "asset_id": a.get("asset_id"), **(a.get("fields") or {})})
+
+        state.actions = validated
+        _schedule(_amemory_set(deps, "assets.last_hint", {"asset_id": validated[-1].get("asset_id")}))
+
+        _finish(state, t0, tool="set_asset_meta", ok=True, meta={"count": len(validated)})
         return state
     return _inner
 
 
 async def _submit_changeset_async(deps: GraphDeps, state: AssetState) -> AssetState:
-    """Async submit node — builds a multi-action ChangeSet and submits it."""
+    loc = _lang(state.locale)
     acts = state.actions or []
     if not acts:
-        state.result = _ui_response("Nothing to submit.")
+        state.result = _ui_response(_t(loc, "submitted_generic", count=0), extra={"agent_events": state.agent_events})
         return state
 
-    # Build multi-action ChangeSet via shared builder
-    cs: ChangeSet | dict = build_changeset(
-        org_id=state.org_id,
-        user_id=state.user_id,
-        actions=acts,
-        intent="apply",
-    )
+    cs: ChangeSet | dict = build_changeset(org_id=state.org_id, user_id=state.user_id, actions=acts, intent="apply")
+    if isinstance(cs, dict) and "idempotency_key" not in cs:
+        cs["idempotency_key"] = cs.get("id")
     state.change = cs
 
-    # Submit (or outbox fallback)
-    await _asubmit_changeset_or_outbox(deps, cs)
+    t0 = _event(state, kind="tool.call.start", tool="submit_changeset", meta={"actions": len(acts)})
+    try:
+        payload = cs.model_dump() if hasattr(cs, "model_dump") else cast(dict, cs)
+        await _submit_with_backoff(deps, payload, attempts=4, base_s=0.25, jitter_s=0.25)
+        _finish(state, t0, tool="submit_changeset", ok=True, meta={"actions": len(acts)})
+    except Exception as e:
+        _finish(state, t0, tool="submit_changeset", ok=False, meta={"error": str(e)})
+        state.result = _ui_response(_t(loc, "submit_failed_queued", err=e), extra={"agent_events": state.agent_events})
+        return state
 
-    # Batch memory hints (for cross-tab orchestration)
+    n_create = sum(1 for a in acts if a.get("op") == "create_asset")
+    n_update = sum(1 for a in acts if a.get("op") == "set_asset_meta")
+    if n_create or n_update:
+        state.result = _ui_response(
+            _t(loc, "submitted_summary", created=n_create, updated=n_update),
+            extra={"changeset_actions": len(acts), "agent_events": state.agent_events},
+        )
+    else:
+        state.result = _ui_response(_t(loc, "submitted_generic", count=len(acts)), extra={"agent_events": state.agent_events})
+
     created_names = [a.get("fields", {}).get("name") for a in acts if a.get("op") == "create_asset"]
     updated_ids = [a.get("asset_id") for a in acts if a.get("op") == "set_asset_meta"]
-    batch_hint = {
+    _schedule(_amemory_set(deps, "assets.last_batch", {
         "created_names": [n for n in created_names if n],
         "updated_ids": [i for i in updated_ids if i],
         "count": len(acts),
-        "timestamp": dt.datetime.utcnow().isoformat(),
-    }
-    _schedule_coro(_amemory_set(deps, "assets.last_batch", batch_hint))
-    # Keep also the last_hint for quick references (prefer last updated id, else last created name)
+        "ts": dt.datetime.utcnow().isoformat()
+    }))
     if updated_ids and updated_ids[-1]:
-        _schedule_coro(_amemory_set(deps, "assets.last_hint", {"asset_id": updated_ids[-1]}))
+        _schedule(_amemory_set(deps, "assets.last_hint", {"asset_id": updated_ids[-1]}))
     elif created_names and created_names[-1]:
-        _schedule_coro(_amemory_set(deps, "assets.last_hint", {"asset_name": created_names[-1]}))
+        _schedule(_amemory_set(deps, "assets.last_hint", {"asset_name": created_names[-1]}))
 
-    # Human summary
-    n_create = sum(1 for a in acts if a.get("op") == "create_asset")
-    n_update = sum(1 for a in acts if a.get("op") == "set_asset_meta")
-    parts = []
-    if n_create:
-        parts.append(f"{n_create} created")
-    if n_update:
-        parts.append(f"{n_update} updated")
-    summary = " and ".join(parts) if parts else f"{len(acts)} actions submitted"
-
-    state.result = _ui_response(
-        f"{summary}.",
-        extra={"changeset_actions": len(acts)}
-    )
     return state
-
 
 # -----------------------------------------------------------------------------
 # Graph assembly
@@ -1080,54 +1117,87 @@ async def _submit_changeset_async(deps: GraphDeps, state: AssetState) -> AssetSt
 
 def create_graph(deps: GraphDeps):
     """
-    Build and compile the Asset graph with an injected checkpointer.
-    Supports: list | get | create | set_meta | explain
-    Natural language → NLU (LLM) → deterministic actions (multi supported).
+    Build & compile the Asset graph.
+    Flow:
+      start → agent_decide → agent_route → {assets_list|asset_get|create_asset|set_meta|explain} → (submit?) → END
     """
     graph = StateGraph(AssetState)
 
-    # Nodes
-    async def _nlu_node(state: AssetState) -> AssetState:
-        return await _nlu(deps, state)
+    # --- Agent nodes ---
+    def _agent_decide_node(state: AssetState) -> AssetState:
+        t0 = _event(state, kind="tool.call.start", tool="agent_decide")
+        try:
+            decision = agent_decide(
+                tab="assets",
+                user_text=(state.message or ""),
+                context=state.model_dump(),
+                deps=deps,
+            )
+            d = decision.model_dump()
+            state.tmp["decision"] = d
 
-    graph.add_node("nlu", _nlu_node)
-    graph.add_node("route", _infer_intent)
-    graph.add_node("assets_list", _assets_list(deps))
-    graph.add_node("asset_get", _asset_get(deps))
+            # Hydrate state for downstream nodes
+            act = (d.get("action") or "").strip()
+            asset_id = (d.get("args") or {}).get("asset_id") or (d.get("selection") or {}).get("asset_id")
 
+            # asset_get
+            if act == "asset_get" and asset_id:
+                state.selection = {"asset_id": asset_id}
+
+            # create_asset
+            items = (d.get("items") or [])
+            if act == "create_asset":
+                if items:
+                    first = {k: v for k, v in items[0].items() if k in {"id","name","assetType","isPrimary","confidentiality","integrity","availability"}}
+                    if first:
+                        state.new_asset = first
+                state.tmp["agent_create_items"] = items
+
+            # set_meta
+            if act == "set_meta":
+                upd = (d.get("update") or {})
+                if not upd.get("asset_id") and asset_id:
+                    upd["asset_id"] = asset_id
+                state.update = {k: v for k, v in upd.items() if k in {"asset_id","assetType","isPrimary","confidentiality","integrity","availability"}}
+                state.tmp["agent_update_items"] = (d.get("items") or [])
+
+            _finish(state, t0, tool="agent_decide", ok=True, meta={"action": d.get("action")})
+            return state
+        except Exception as e:
+            _finish(state, t0, tool="agent_decide", ok=False, meta={"error": str(e)})
+            state.tmp["next_node"] = "explain"
+            return state
+
+    def _agent_route_node(state: AssetState) -> AssetState:
+        action = (state.tmp.get("decision") or {}).get("action")
+        allowed = {"assets_list", "asset_get", "create_asset", "set_meta", "explain"}
+        state.tmp["next_node"] = action if action in allowed else "explain"
+        return state
+
+    graph.add_node("agent_decide", _agent_decide_node)
+    graph.add_node("agent_route", _agent_route_node)
+
+    # --- Business nodes ---
     async def _explain_node(state: AssetState) -> AssetState:
         return await _asset_explain(deps, state)
-    graph.add_node("explain", _explain_node)
-
-    graph.add_node("create_asset", _create_asset(deps))
-    graph.add_node("set_meta", _set_meta(deps))
 
     async def _submit_node(state: AssetState) -> AssetState:
         return await _submit_changeset_async(deps, state)
+
+    graph.add_node("assets_list", _assets_list(deps))
+    graph.add_node("asset_get", _asset_get_or_suggest(deps))
+    graph.add_node("explain", _explain_node)
+    graph.add_node("create_asset", _create_asset(deps))
+    graph.add_node("set_meta", _set_meta(deps))
     graph.add_node("submit_changeset", _submit_node)
+    graph.add_node("help", _help_or_greet())  # only used if you route to it explicitly
 
-    # Entry
-    graph.set_entry_point("nlu")
-    graph.add_edge("nlu", "route")
-
-    # Routing from intent
-    def _route(state: AssetState) -> str:
-        intent = state.intent or "list"
-        if intent == "list":
-            return "assets_list"
-        if intent == "get":
-            return "asset_get"
-        if intent == "create":
-            return "create_asset"
-        if intent == "set_meta":
-            return "set_meta"
-        if intent == "explain":
-            return "explain"
-        return "assets_list"
-
+    # Entry & routing via agent
+    graph.set_entry_point("agent_decide")
+    graph.add_edge("agent_decide", "agent_route")
     graph.add_conditional_edges(
-        "route",
-        _route,
+        "agent_route",
+        lambda s: s.tmp.get("next_node", "explain"),
         {
             "assets_list": "assets_list",
             "asset_get": "asset_get",
@@ -1135,24 +1205,21 @@ def create_graph(deps: GraphDeps):
             "set_meta": "set_meta",
             "explain": "explain",
         },
+        default="explain",
     )
 
-    # Write paths continue to async submit
+    # Write → submit
     graph.add_edge("create_asset", "submit_changeset")
     graph.add_edge("set_meta", "submit_changeset")
 
-    # Read-only nodes end
-    graph.add_edge("assets_list", END)
-    graph.add_edge("asset_get", END)
-    graph.add_edge("explain", END)
-    graph.add_edge("submit_changeset", END)
+    # Terminal nodes
+    for node in ("help", "assets_list", "asset_get", "explain", "submit_changeset"):
+        graph.add_edge(node, END)
 
-    # Compile with injected checkpointer for per-org/tab history
     return graph.compile(checkpointer=deps.checkpointer)
 
-
 # -----------------------------------------------------------------------------
-# (Optional) tiny struct used in list responses (kept local to this module)
+# Local preview struct (unchanged)
 # -----------------------------------------------------------------------------
 
 @dataclass
