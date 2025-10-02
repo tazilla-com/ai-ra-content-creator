@@ -6,7 +6,8 @@ Contract-first rules
 - All models are strict with extra='forbid'.
 - `action` MUST be a string (never an array). A before-validator coerces ["list"] -> "list"
   and rejects any other arrays (fixes smoke-test failures from LLM JSON).
-- All `action` values are normalized to lowercase.
+- All `action` values are normalized to lowercase. Common aliases are mapped:
+    * assets: "update"/"edit" -> "set_meta", "add"/"new" -> "create"
 - Levels/probabilities are integers in [0, 4].
 - Bulk payloads are strongly typed with UUID-verified asset_ids.
 - Use these models to parse/validate LLM NLU JSON before routing to agent logic.
@@ -18,13 +19,15 @@ from typing import Any, Literal, Optional, Sequence, Union
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic.types import StrictStr, StrictBool
 
 __all__ = [
     "Selection",
+    "NewAssetNLU", "UpdateAssetNLU",
     "AssetsAction", "AssetsNLU",
     "ImpactSetItem", "ImpactsAction", "ImpactsBulkEntry", "ImpactsNLU",
     "ThreatSetItem", "ThreatsAction", "ThreatsBulkEntry", "ThreatsNLU",
-    "ControlsAction", "ControlsNLU",
+    # "ControlsAction", "ControlsNLU",
     "Tab",
     "parse_nlu_for_tab",
     "ensure_action_is_string",
@@ -89,15 +92,68 @@ class Selection(_StrictModel):
 AssetsAction = Literal["list", "get", "create", "set_meta", "explain"]
 
 
+class NewAssetNLU(_StrictModel):
+    """Payload for creating a new asset via NLU (fail-closed)."""
+    name: StrictStr
+    assetType: StrictStr
+    description: StrictStr | None = None
+    isPrimary: StrictBool | None = None
+    confidentiality: int | None = Field(default=None, ge=0, le=4)
+    integrity: int | None = Field(default=None, ge=0, le=4)
+    availability: int | None = Field(default=None, ge=0, le=4)
+    org_id: StrictStr | None = None
+
+    @field_validator("confidentiality", "integrity", "availability", mode="before")
+    @classmethod
+    def _cia(cls, v: Any) -> int | None:
+        if v is None or v == "":
+            return None
+        return _int_in_range(v, name="level")
+
+
+class UpdateAssetNLU(_StrictModel):
+    """Partial update payload for an existing asset via NLU (fail-closed)."""
+    asset_id: UUID
+    name: StrictStr | None = None
+    description: StrictStr | None = None
+    isPrimary: StrictBool | None = None
+    confidentiality: int | None = Field(default=None, ge=0, le=4)
+    integrity: int | None = Field(default=None, ge=0, le=4)
+    availability: int | None = Field(default=None, ge=0, le=4)
+    assetType: StrictStr | None = None
+    org_id: StrictStr | None = None
+
+    @field_validator("asset_id", mode="before")
+    @classmethod
+    def _coerce_asset(cls, v: Any) -> UUID:
+        a = _coerce_uuid(v)
+        if a is None:
+            raise ValueError("asset_id is required")
+        return a
+
+    @field_validator("confidentiality", "integrity", "availability", mode="before")
+    @classmethod
+    def _cia(cls, v: Any) -> int | None:
+        if v is None or v == "":
+            return None
+        return _int_in_range(v, name="level")
+
 class AssetsNLU(_StrictModel):
     """
     NLU result for the Assets agent.
-    - Encodes user intent in `action`
-    - Optionally includes target `selection.asset_id` (for 'get', 'set_meta', etc.)
-    NOTE: Extend with meta/update fields when needed by asset graph.
+    - `action`: intent ("list" | "get" | "create" | "set_meta" | "explain")
+        Aliases accepted:
+          - "update", "edit"  -> "set_meta"
+          - "add", "new"      -> "create"
+          - "show", "details" -> "get"
+    - `selection`: target selection (e.g., selection.asset_id)
+    - `new_asset`: data for creation when action=create
+    - `update`:    data for partial update when action=set_meta
     """
     action: AssetsAction
     selection: Optional[Selection] = None
+    new_asset: Optional[NewAssetNLU] = None
+    update: Optional[UpdateAssetNLU] = None
 
     @field_validator("action", mode="before")
     @classmethod
@@ -105,13 +161,24 @@ class AssetsNLU(_StrictModel):
         """
         Guard against LLM emitting ["list"] instead of "list".
         Accept single-item list[str] (coerce), reject other arrays.
-        Also normalize to lowercase.
+        Normalize to lowercase and map common aliases.
         """
+        # coerce from ["list"] shape
         if isinstance(v, list):
             if len(v) == 1 and isinstance(v[0], str):
-                return v[0].strip().lower()
-            raise ValueError("action must be a string, not array")
-        return str(v).strip().lower()
+                v = v[0]
+            else:
+                raise ValueError("action must be a string, not array")
+        s = str(v).strip().lower()
+
+        # alias mapping (assets)
+        if s in {"update", "edit"}:
+            return "set_meta"
+        if s in {"add", "new", "create_asset"}:
+            return "create"
+        if s in {"show", "details"}:
+            return "get"
+        return s
 
 
 # ---------- Impacts tab ----------
@@ -261,25 +328,25 @@ class ThreatsNLU(_StrictModel):
 
 # ---------- Controls tab (placeholder for future) ----------
 
-ControlsAction = Literal["list", "get", "set", "explain"]
+# ControlsAction = Literal["list", "get", "set", "explain"]
 
 
-class ControlsNLU(_StrictModel):
-    """
-    Minimal NLU result for the Controls agent (extend as needed).
-    """
-    action: ControlsAction
-    selection: Optional[Selection] = None
-    question: Optional[str] = None
-
-    @field_validator("action", mode="before")
-    @classmethod
-    def action_must_be_str(cls, v: Any) -> str:
-        if isinstance(v, list):
-            if len(v) == 1 and isinstance(v[0], str):
-                return v[0].strip().lower()
-            raise ValueError("action must be a string, not array")
-        return str(v).strip().lower()
+# class ControlsNLU(_StrictModel):
+#     """
+#     Minimal NLU result for the Controls agent (extend as needed).
+#     """
+#     action: ControlsAction
+#     selection: Optional[Selection] = None
+#     question: Optional[str] = None
+#
+#     @field_validator("action", mode="before")
+#     @classmethod
+#     def action_must_be_str(cls, v: Any) -> str:
+#         if isinstance(v, list):
+#             if len(v) == 1 and isinstance(v[0], str):
+#                 return v[0].strip().lower()
+#             raise ValueError("action must be a string, not array")
+#         return str(v).strip().lower()
 
 
 # ---------- Unified parsing helpers ----------
@@ -288,13 +355,13 @@ class Tab(str):
     ASSETS = "assets"
     IMPACTS = "impacts"
     THREATS = "threats"
-    CONTROLS = "controls"
+    # CONTROLS = "controls"
 
 
 def parse_nlu_for_tab(
     tab: str,
     data: dict[str, Any],
-) -> Union[AssetsNLU, ImpactsNLU, ThreatsNLU, ControlsNLU]:
+) -> Union[AssetsNLU, ImpactsNLU, ThreatsNLU]:  # ControlsNLU
     """
     Parse an LLM-produced NLU JSON into a strict, tab-specific model.
     Use this right after the LLM call, before downstream agent logic.
@@ -306,16 +373,12 @@ def parse_nlu_for_tab(
         return ImpactsNLU.model_validate(data)
     if t == Tab.THREATS:
         return ThreatsNLU.model_validate(data)
-    if t == Tab.CONTROLS:
-        return ControlsNLU.model_validate(data)
+    # if t == Tab.CONTROLS:
+    #     return ControlsNLU.model_validate(data)
     raise ValueError(f"Unsupported tab '{tab}'")
 
 
-def ensure_action_is_string(nlu_dict: dict[str, Any]) -> dict[str, Any]:
-    """
-    Utility that can be applied pre-parse if needed in legacy flows.
-    It in-place normalizes {"action": ["list"]} -> {"action": "list"} and lowercases it.
-    """
+def ensure_action_is_string(nlu_dict: dict[str, Any], tab: str | None = None) -> dict[str, Any]:
     v = nlu_dict.get("action", None)
     if isinstance(v, list):
         if len(v) == 1 and isinstance(v[0], str):
@@ -324,4 +387,35 @@ def ensure_action_is_string(nlu_dict: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("action must be a string, not array")
     elif isinstance(v, str):
         nlu_dict["action"] = v.strip().lower()
+
+    # alias mapping for convenience (mirrors AssetsNLU validator)
+    aliases_assets = {
+        "update": "set_meta",
+        "edit": "set_meta",
+        "add": "create",
+        "new": "create",
+        "create_asset": "create",
+        "show": "get",
+        "details": "get",
+    }
+    if (tab or "").strip().lower() == "assets":
+        act = nlu_dict.get("action")
+        if isinstance(act, str) and act in aliases_assets:
+            nlu_dict["action"] = aliases_assets[act]
+
+    allowed_by_tab = {
+        "assets":   {"list", "get", "create", "set_meta", "explain"},
+        "impacts":  {"list", "get", "set", "bulk_set", "explain"},
+        "threats":  {"list", "get", "set", "bulk_set", "explain"},
+        # "controls": {"list", "get", "set", "explain"},
+    }
+    allowed_all = set().union(*allowed_by_tab.values())
+
+    act = nlu_dict.get("action")
+    t = (tab or "").strip().lower()
+
+    allowed = allowed_by_tab.get(t, allowed_all)
+
+    if act not in allowed:
+        nlu_dict["action"] = "list"
     return nlu_dict

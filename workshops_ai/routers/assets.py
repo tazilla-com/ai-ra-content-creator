@@ -1,16 +1,17 @@
 # File: workshops_ai/routers/assets.py
 # -----------------------------------------------------------------------------
-# REST (read-only) for Assets:
+# REST (read-only) for Assets state:
 #   - GET /api/assets?org_id=&search=&type=&is_primary=
 #   - GET /api/assets/{asset_id}?org_id=
+#   - GET /api/assets/{asset_id}/impacts
+#   - GET /api/assets/{asset_id}/risks
 #
 # Principles
-# - Contract-first: returns the canonical API DTO `workshops_ai.api.schema.asset.Asset`.
-# - No writes here (MVP is read-only).
-# - Non-blocking: sync CSV backend wrapped via asyncio.to_thread.
-# - Stable keys (EN codes) – do not localize catalog codes in responses.
-# - Consistent error model (delegated to global handlers in main app).
-# - Auth: API-key/JWT via centralized settings (same behavior as /chat).
+# - Returns the canonical API DTO `workshops_ai.api.schema.asset.Asset` for assets.
+# - Per-asset impacts/risks return lightweight DTOs defined here (state is source of truth).
+# - Read-only; all writes go via graph routers (impacts/threats).
+# - Non-blocking: sync CSV backend wrapped via asyncio.to_thread where needed.
+# - Auth via centralized `require_auth`.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -18,62 +19,56 @@ from __future__ import annotations
 import asyncio
 import inspect
 import uuid
-from typing import Any, List
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
-from workshops_ai.app.security import require_auth  # unified auth (API-key/JWT)
+from workshops_ai.app.security import require_auth
 from workshops_ai.backend.port import BackendPort
-from workshops_ai.backend.csv_backend import CsvBackend  # MVP backend
+from workshops_ai.backend.csv_backend import CsvBackend
 from workshops_ai.tools.telemetry import telemetry_log
 
-# Canonical public DTO
+# Canonical public DTO for assets
 from workshops_ai.api.schema.asset import Asset
 
 router = APIRouter(prefix="/api/assets", tags=["assets"])
 
-
 # -----------------------------------------------------------------------------
-# Response models (public surface returns canonical Asset DTO)
+# Response models
 # -----------------------------------------------------------------------------
 
 class ListAssetsResponse(BaseModel):
     items: List[Asset]
     count: int
 
+class AssetImpactItem(BaseModel):
+    impact_code: str = Field(..., description="Impact code from state (canonical or tenant-specific)")
+    level: int = Field(..., ge=0, le=4, description="0..4 scale stored in state")
+    note: Optional[str] = Field(None, description="Optional note from state")
+
+class AssetRiskItem(BaseModel):
+    threat_code: str = Field(..., description="Threat code from state (canonical or tenant-specific)")
+    probability: int = Field(..., ge=0, le=4, description="0..4 probability scale stored in state")
+    note: Optional[str] = Field(None, description="Optional note from state")
 
 # -----------------------------------------------------------------------------
-# DI helpers
+# DI helper
 # -----------------------------------------------------------------------------
 
 def get_backend() -> BackendPort:
-    # For MVP we return a new CsvBackend instance; swap to a singleton/factory if needed.
+    # For MVP we instantiate CsvBackend; its internal caches are mtime-aware.
     return CsvBackend()  # type: ignore[return-value]
 
-
 # -----------------------------------------------------------------------------
-# Utilities (robust normalization)
+# Utilities (robust normalization to canonical Asset DTO)
 # -----------------------------------------------------------------------------
 
-# numeric CIA → ISO labels (for legacy backends that still emit numbers)
-# confidentiality: PUBLIC(1), INTERNAL(2), PROTECTED(3), STRICTLY_PROTECTED(4)
-_CONF_INDEX_TO_LABEL = {
-    1: "PUBLIC",
-    2: "INTERNAL",
-    3: "PROTECTED",
-    4: "STRICTLY_PROTECTED",
-}
-# integrity/availability: LOW(1), MEDIUM(2), HIGH(3)
-_IA_INDEX_TO_LABEL = {
-    1: "LOW",
-    2: "MEDIUM",
-    3: "HIGH",
-}
+_CONF_INDEX_TO_LABEL = {1: "PUBLIC", 2: "INTERNAL", 3: "PROTECTED", 4: "STRICTLY_PROTECTED"}
+_IA_INDEX_TO_LABEL = {1: "LOW", 2: "MEDIUM", 3: "HIGH"}
 
 TA_ASSET = TypeAdapter(Asset)
-
 
 def _as_bool(v: Any) -> bool | None:
     if v is None:
@@ -84,13 +79,11 @@ def _as_bool(v: Any) -> bool | None:
         return bool(v)
     if isinstance(v, str):
         s = v.strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
+        if s in {"1", "true", "yes", "y", "on", "ano"}:
             return True
-        if s in {"0", "false", "no", "n", "off"}:
+        if s in {"0", "false", "no", "n", "off", "ne"}:
             return False
-    # unknown/ambiguous → None
     return None
-
 
 def _first_nonempty(*vals: Any) -> Any | None:
     for v in vals:
@@ -101,12 +94,10 @@ def _first_nonempty(*vals: Any) -> Any | None:
         return v
     return None
 
-
 def _as_uuid_str_or_none(v: Any) -> str | None:
     """
-    Try to coerce input to a canonical UUID string.
-    Return None if value is empty/invalid. We never pass non-UUID strings
-    into the client-provided Asset DTO (keeps their contract intact).
+    Try to coerce to UUID string; return None if not a valid UUID.
+    NOTE: The public Asset DTO must tolerate Optional id for non-UUID states.
     """
     if v is None:
         return None
@@ -118,19 +109,11 @@ def _as_uuid_str_or_none(v: Any) -> str | None:
     except Exception:
         return None
 
-
 def _num_conf_to_label(v: Any) -> str | None:
-    """
-    Normalize confidentiality to ISO label:
-      - 1..4 → PUBLIC/INTERNAL/PROTECTED/STRICTLY_PROTECTED
-      - 0/None/"" → None (field omitted)
-      - string label → upper() and pass-through
-    """
     if v is None:
         return None
     if isinstance(v, (int, float)):
-        iv = int(v)
-        return _CONF_INDEX_TO_LABEL.get(iv)
+        return _CONF_INDEX_TO_LABEL.get(int(v))
     if isinstance(v, str):
         s = v.strip()
         if not s or s.lower() in {"none", "null"}:
@@ -138,19 +121,11 @@ def _num_conf_to_label(v: Any) -> str | None:
         return s.upper().replace("-", "_")
     return None
 
-
 def _num_ia_to_label(v: Any) -> str | None:
-    """
-    Normalize integrity/availability to ISO label:
-      - 1..3 → LOW/MEDIUM/HIGH
-      - 0/None/"" → None (field omitted)
-      - string label → upper() pass-through (LOW/MEDIUM/HIGH)
-    """
     if v is None:
         return None
     if isinstance(v, (int, float)):
-        iv = int(v)
-        return _IA_INDEX_TO_LABEL.get(iv)
+        return _IA_INDEX_TO_LABEL.get(int(v))
     if isinstance(v, str):
         s = v.strip()
         if not s or s.lower() in {"none", "null"}:
@@ -158,22 +133,16 @@ def _num_ia_to_label(v: Any) -> str | None:
         return s.upper()
     return None
 
-
 def _to_asset(item: Any) -> Asset:
     """
-    Convert a backend item (dict or Pydantic model) into canonical `Asset`.
-    Accepts multiple legacy key variants and numeric CIA scales and normalizes them.
-
-    IMPORTANT:
-    - We NEVER pass a non-UUID string into the client-provided Asset DTO `id`.
-      If the incoming ID is not a valid UUID → we emit `None` for `id`.
+    Convert backend item (dict or Pydantic model) into canonical Asset DTO.
+    We never inject a non-UUID string into `id`; invalid UUIDs become None.
     """
     data = item.model_dump() if hasattr(item, "model_dump") else dict(item)
 
-    # Base fields
     raw_id = _first_nonempty(data.get("id"), data.get("asset_id"))
     payload = {
-        "id": _as_uuid_str_or_none(raw_id),  # enforce UUID-or-None for client DTO
+        "id": _as_uuid_str_or_none(raw_id),  # keep None for non-UUID ids
         "name": str(_first_nonempty(data.get("name"), data.get("title"), "")),
         "description": _first_nonempty(data.get("description"), data.get("desc")),
         "isPrimary": _as_bool(_first_nonempty(data.get("isPrimary"), data.get("primary"), data.get("is_primary"))),
@@ -181,14 +150,9 @@ def _to_asset(item: Any) -> Asset:
         "org_id": _first_nonempty(data.get("org_id"), data.get("orgId")),
     }
 
-    # CIA (normalize numeric → ISO labels if needed)
-    conf_src = _first_nonempty(data.get("confidentiality"), data.get("c"))
-    integ_src = _first_nonempty(data.get("integrity"), data.get("i"))
-    avail_src = _first_nonempty(data.get("availability"), data.get("a"))
-
-    conf = _num_conf_to_label(conf_src)
-    integ = _num_ia_to_label(integ_src)
-    avail = _num_ia_to_label(avail_src)
+    conf = _num_conf_to_label(_first_nonempty(data.get("confidentiality"), data.get("c")))
+    integ = _num_ia_to_label(_first_nonempty(data.get("integrity"), data.get("i")))
+    avail = _num_ia_to_label(_first_nonempty(data.get("availability"), data.get("a")))
 
     if conf is not None:
         payload["confidentiality"] = conf
@@ -197,18 +161,12 @@ def _to_asset(item: Any) -> Asset:
     if avail is not None:
         payload["availability"] = avail
 
-    # Validate & coerce into canonical Asset DTO
     return TA_ASSET.validate_python(payload)
 
-
 async def _run_async(func, *args, **kwargs):
-    """
-    Await coroutine function directly or run sync work in a thread.
-    """
     if inspect.iscoroutinefunction(func):
         return await func(*args, **kwargs)
     return await asyncio.to_thread(func, *args, **kwargs)
-
 
 # -----------------------------------------------------------------------------
 # Routes
@@ -227,24 +185,12 @@ async def list_assets(
     type: str | None = Query(None, alias="type", description="Asset type (EN code from catalog)"),
     is_primary: bool | None = Query(None, description="Filter primary assets"),
     backend: BackendPort = Depends(get_backend),
-    _auth=Depends(require_auth),  # enforce unified auth
+    _auth=Depends(require_auth),
 ) -> ListAssetsResponse:
-    """
-    Returns a filtered list of assets for the given organization.
-    - Filtering by `search`, `type`, `is_primary` is optional.
-    - Response uses canonical `Asset` DTO (ISO labels for CIA).
-    """
-    # Telemetry (best-effort, non-blocking)
     try:
         telemetry_log(
             "rest.assets.list",
-            {
-                "org_id": org_id,
-                "search": search,
-                "type": type,
-                "is_primary": is_primary,
-                "request_path": str(request.url),
-            },
+            {"org_id": org_id, "search": search, "type": type, "is_primary": is_primary, "request_path": str(request.url)},
         )
     except Exception:
         pass
@@ -252,20 +198,12 @@ async def list_assets(
     try:
         items = await _run_async(backend.assets_list, org_id, search, type, is_primary)
     except ValidationError as ve:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"message": "Invalid filters", "errors": ve.errors()},
-        ) from ve
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail={"message": "Invalid filters", "errors": ve.errors()}) from ve
     except Exception as ex:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"message": "Failed to list assets", "error": str(ex)},
-        ) from ex
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail={"message": "Failed to list assets", "error": str(ex)}) from ex
 
-    # Normalize to canonical Asset DTO
     out_items = [_to_asset(a) for a in items]
     return ListAssetsResponse(items=out_items, count=len(out_items))
-
 
 @router.get(
     "/{asset_id}",
@@ -278,34 +216,82 @@ async def get_asset(
     asset_id: str,
     org_id: str = Query(..., description="Organization identifier"),
     backend: BackendPort = Depends(get_backend),
-    _auth=Depends(require_auth),  # enforce unified auth
+    _auth=Depends(require_auth),
 ) -> Asset:
-    """
-    Returns a single asset by its ID (canonical `Asset` DTO).
-    - org_id is currently unused by CSV backend for direct get, but kept for compatibility
-      with prospective API backends (multi-tenant).
-    """
-    # Telemetry (best-effort, non-blocking)
     try:
-        telemetry_log(
-            "rest.assets.get",
-            {"org_id": org_id, "asset_id": asset_id, "request_path": str(request.url)},
-        )
+        telemetry_log("rest.assets.get", {"org_id": org_id, "asset_id": asset_id, "request_path": str(request.url)})
     except Exception:
         pass
 
     try:
         item = await _run_async(backend.asset_get, asset_id)
     except Exception as ex:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"message": "Failed to retrieve asset", "asset_id": asset_id, "error": str(ex)},
-        ) from ex
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail={"message": "Failed to retrieve asset", "asset_id": asset_id, "error": str(ex)}) from ex
 
     if item is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"message": "Asset not found", "asset_id": asset_id},
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"message": "Asset not found", "asset_id": asset_id})
 
     return _to_asset(item)
+
+@router.get(
+    "/{asset_id}/impacts",
+    response_model=list[AssetImpactItem],
+    response_class=JSONResponse,
+    summary="List impacts for a given asset (state)",
+)
+async def get_asset_impacts(
+    request: Request,
+    asset_id: str,
+    backend: BackendPort = Depends(get_backend),
+    _auth=Depends(require_auth),
+) -> list[AssetImpactItem]:
+    """
+    Reads impacts directly from state/asset_impacts.csv via CsvBackend.
+    No catalog validation here; state is the source of truth.
+    """
+    try:
+        telemetry_log("rest.assets.impacts", {"asset_id": asset_id, "request_path": str(request.url)})
+    except Exception:
+        pass
+
+    if not asset_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"message": "asset_id is required"})
+
+    try:
+        rows = await _run_async(backend.asset_get_impacts, asset_id)
+    except Exception as ex:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail={"message": "Failed to fetch impacts", "asset_id": asset_id, "error": str(ex)}) from ex
+
+    # Backend already normalizes shape; just coerce to response model
+    return [AssetImpactItem(**r) for r in rows]
+
+@router.get(
+    "/{asset_id}/risks",
+    response_model=list[AssetRiskItem],
+    response_class=JSONResponse,
+    summary="List risks for a given asset (state)",
+)
+async def get_asset_risks(
+    request: Request,
+    asset_id: str,
+    backend: BackendPort = Depends(get_backend),
+    _auth=Depends(require_auth),
+) -> list[AssetRiskItem]:
+    """
+    Reads risks directly from state/asset_risks.csv via CsvBackend.
+    No catalog validation here; state is the source of truth.
+    """
+    try:
+        telemetry_log("rest.assets.risks", {"asset_id": asset_id, "request_path": str(request.url)})
+    except Exception:
+        pass
+
+    if not asset_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"message": "asset_id is required"})
+
+    try:
+        rows = await _run_async(backend.asset_get_risks, asset_id)
+    except Exception as ex:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail={"message": "Failed to fetch risks", "asset_id": asset_id, "error": str(ex)}) from ex
+
+    return [AssetRiskItem(**r) for r in rows]

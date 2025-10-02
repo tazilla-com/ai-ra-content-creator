@@ -37,19 +37,19 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import logging
+import os
 import re
 import uuid
-import json
-import os
-from typing import Any, Literal, Optional, cast, List, Dict
+from typing import Any, Dict, List, Literal, Optional, cast
 
 from pydantic import BaseModel, Field
 
 from workshops_ai.graph.factory import GraphDeps
 
 # Unified DTO + mappers (NEW)
-from workshops_ai.api.schema import AssetImpact
+from workshops_ai.api.schema import AssetImpact, ImpactEvaluation
 from workshops_ai.agents.utils.mappers import (
     map_asset_impact_to_ws_event,
     map_asset_impact_to_changeset,
@@ -469,16 +469,18 @@ def _adapt_set_payload_to_dto(payload: ImpactSetPayload, *, asset_name: Optional
     Minimal adapter for backward compatibility when callers still send ImpactSetPayload.
     Builds an AssetImpact DTO so the rest of the write path stays unified.
     """
-    impacts = [
-        {"impactName": _CODE_TO_NAME.get(it.impact_code, it.impact_code), "impactLevel": int(it.level)}
+    impacts: list[ImpactEvaluation] = [
+        ImpactEvaluation(
+            impactName=_CODE_TO_NAME.get(it.impact_code, it.impact_code),
+            impactLevel=int(it.level),
+        )
         for it in payload.items
     ]
-    dto_raw = {
-        "assetId": payload.asset_id,
-        "assetName": asset_name,
-        "impacts": impacts,
-    }
-    return AssetImpact.model_validate(dto_raw)
+    return AssetImpact(
+        assetId=payload.asset_id,
+        assetName=asset_name,
+        impacts=impacts,
+    )
 
 
 async def _emit_ws_from_dto(dto: AssetImpact, deps: GraphDeps, org_id: str, actor: Optional[str]) -> None:
@@ -833,7 +835,7 @@ def create_graph(deps: GraphDeps):
     )
 
     # Write paths → submit; read/explain paths → end
-    graph.add_edge("set_impact_level", "submit_changeset")
+    graph.add_edge("set_impact_level", END if False else "submit_changeset")  # keep structure explicit
     graph.add_edge("bulk_set_impact_levels", "submit_changeset")
 
     graph.add_edge("list_impacts", END)
@@ -843,3 +845,6 @@ def create_graph(deps: GraphDeps):
 
     # Compile with injected checkpointer for per-org/tab history
     return graph.compile(checkpointer=deps.checkpointer)
+
+
+__all__ = ["ImpactState", "create_graph"]

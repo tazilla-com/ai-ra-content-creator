@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
@@ -45,6 +46,7 @@ except Exception:  # pragma: no cover
         return "n/a"
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # Allowed tabs (fail-closed; aligned with available graphs)
 ALLOWED_TABS = {"assets", "impacts", "threats"}
@@ -113,7 +115,14 @@ def _build_ui_request(state: Conn, message: str, *, staging: bool = False) -> UI
 
 
 async def _ws_send(ws: WebSocket, event_type: str, payload: dict[str, Any] | list[Any] | None = None) -> None:
-    await ws.send_json({"type": event_type, "payload": payload or {}})
+    try:
+        await ws.send_json({"type": event_type, "payload": payload or {}})
+    except WebSocketDisconnect:
+        return
+    except RuntimeError as e:
+        if "Unexpected ASGI message" in str(e) or "once a close message has been sent" in str(e):
+            return
+        raise
 
 
 def _cur_request_id(state: Optional[Conn]) -> str:
@@ -180,8 +189,9 @@ async def ws_endpoint(
     active_tab = active_tab if active_tab in ALLOWED_TABS else "assets"
 
     # Security validation BEFORE accept() to reject early if unauthorized
-    await verify_ws_auth(ws)
-
+    auth_ok = await verify_ws_auth(ws)
+    if not auth_ok:   
+        return
     # Accept the connection after passing security
     await ws.accept()
 
@@ -218,7 +228,11 @@ async def ws_endpoint(
             try:
                 raw = await ws.receive_json()
             except Exception as e:
-                await _ws_error(ws, "Invalid JSON frame", conn_id=state.conn_id, details=str(e), state=state)
+                code = getattr(e, "code", None)
+                if code in (1000, 1006):
+                    logger.info("WS client disconnected (%s)", code)
+                    return
+                logger.warning("WS receive error: %s", e)
                 continue
 
             try:

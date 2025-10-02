@@ -489,10 +489,10 @@ def _build_threat_index() -> dict[str, dict[str, Any]]:
                 threat_to_categories[th_code].append(cat)
 
     # --- Asset type ↔ threat mapping (respect "Value" truthiness when present) ---
-    # --- Asset type ↔ Threat mapping (IGNORE Value) ---
     att = _at_x_threat.load()
-    att_asset_col  = _first_present_column(att, ("asset_type", "Asset type", "EN Name", "Name"))
+    att_asset_col = _first_present_column(att, ("asset_type", "Asset type", "EN Name", "Name"))
     att_threat_col = _first_present_column(att, ("threat_code", "Threat", "threat", "EN Name", "Name"))
+    att_val_col   = _first_present_column(att, ("Value", "value", "Enabled", "enabled"))
 
     threat_to_asset_types: dict[str, list[str]] = {}
     if att and att_threat_col:
@@ -501,9 +501,13 @@ def _build_threat_index() -> dict[str, dict[str, Any]]:
             raw_th = (r.get(att_threat_col) or "").strip()
             if not raw_th:
                 continue
-            # normalize name/alias → canonical code (fallback to raw if unknown)
-            th_code = _resolve_threat_handle(raw_th) or raw_th
+            # respektuj Value==TRUE, když je k dispozici
+            if att_val_col:
+                val = (r.get(att_val_col) or "").strip().lower()
+                if val not in {"1", "true", "t", "yes", "y", "ano"}:
+                    continue
 
+            th_code = normalize_threat_code(raw_th) or raw_th
             threat_to_asset_types.setdefault(th_code, [])
             if at and at not in threat_to_asset_types[th_code]:
                 threat_to_asset_types[th_code].append(at)

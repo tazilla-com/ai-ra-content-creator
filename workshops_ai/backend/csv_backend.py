@@ -1,37 +1,38 @@
 # File: workshops_ai/backend/csv_backend.py
-# CSV-based backend implementing BackendPort (read-only for assets/threats/impacts).
-# - Reads state from <settings.paths.state_dir>/assets.csv (+ optional asset_impacts.csv)
-# - Reads catalogs from <settings.paths.catalogs_dir>
-# - Defensive CSV parsing (BOM, ; delimiter, cp1250), mtime-based hot reload
-# - Pydantic v2 domain validation; canonical codes in EN
+# CSV-based backend implementing BackendPort (read-only for assets/impacts/risks).
+# - Reads state from <settings.paths.state_dir>:
+#       assets.csv (required)
+#       asset_impacts.csv (optional)   -> [{asset_id, impact_code, level(0..4), note?}]
+#       asset_risks.csv   (optional)   -> [{asset_id, threat_code, probability(0..4), note?}]
+# - Reads catalogs from <settings.paths.catalogs_dir> with robust fallbacks
+# - Defensive CSV parsing (BOM, ; delimiter, CP1250/CP1252/ISO-8859-2), mtime-based hot reload
+# - Pydantic v2 validation of Asset; STATE is the source of truth (fail-open for assetType)
 #
-# Catalog files (relative to configured paths):
-#   catalogs/Asset type.csv
-#   catalogs/Threat.csv
-#   catalogs/Threat category.csv
-#   catalogs/Threat x Threat category.csv
-#   catalogs/Asset type x Threat.csv
-#   catalogs/Impact.csv
-#   catalogs/Impact category.csv
-#   catalogs/Impact x Impact category.csv
+# Catalog files (relative to resolved catalogs dir) – read-only helpers:
+#   Asset type.csv
+#   Threat.csv
+#   Threat category.csv
+#   Threat x Threat category.csv
+#   Asset type x Threat.csv
+#   Impact.csv
+#   Impact category.csv
+#   Impact x Impact category.csv
 #
-# State files:
-#   state/assets.csv
-#   state/asset_impacts.csv            # optional: {org_id?, asset_id, impact_code, level (0..4), note?}
-#
-# Notes:
-# - Threat.csv has no explicit "code" column; canonical code = EN Name (fallback Name).
-# - Impact.csv same: canonical code = EN Name (fallback Name).
-# - "Asset type x Threat.csv" uses column Value (TRUE/FALSE). Only TRUE rows are mapped.
+# IMPORTANT DOMAIN POLICY:
+#   - STATE is tenant truth. We DO NOT drop assets just because their assetType
+#     is not present in catalogs. We only use catalogs for optional filtering
+#     (when explicitly requested) and for explain/list operations.
 
 from __future__ import annotations
 
 import csv
+import uuid
+from uuid import UUID
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence, Optional
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import ValidationError
 
 from workshops_ai.backend.port import (
     BackendConflict,
@@ -42,33 +43,154 @@ from workshops_ai.backend.port import (
 from workshops_ai.settings import get_settings
 from workshops_ai.api.schema import Asset  # canonical DTO
 
+# Optional telemetry (best-effort, never fail)
+try:  # pragma: no cover
+    from workshops_ai.tools.telemetry import telemetry_log  # type: ignore
+except Exception:  # pragma: no cover
+    def telemetry_log(*args, **kwargs):  # type: ignore
+        return None
+
 __all__ = ["CsvBackend"]
 
 # --------------------------------------------------------------------------------------
-# Paths & config
+# Paths & config (harmonized with tools/search_catalogs.py)
 # --------------------------------------------------------------------------------------
 
 _s = get_settings()
-_STATE_DIR = Path(_s.paths.state_dir).resolve()
-_CAT_DIR = Path(_s.paths.catalogs_dir).resolve()
+
+
+def _resolve_catalog_dir() -> Path:
+    """
+    Choose the first existing catalogs directory from:
+      1) settings.paths.catalogs_dir
+      2) package fallback: workshops_ai/data/catalogs
+      3) runtime mount fallback: /app/data/catalogs
+    """
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path(_s.paths.catalogs_dir).resolve())
+    except Exception:
+        pass
+    pkg_fallback = Path(__file__).resolve().parent.parent / "data" / "catalogs"
+    candidates.append(pkg_fallback)
+    candidates.append(Path("/app/data/catalogs"))
+    for p in candidates:
+        try:
+            if p.exists() and p.is_dir():
+                telemetry_log("catalog.dir_selected", {"dir": str(p)}, level="DEBUG")
+                return p
+        except Exception:
+            continue
+    fallback = candidates[0] if candidates else Path.cwd()
+    telemetry_log("catalog.dir_fallback", {"dir": str(fallback)}, level="WARN")
+    return fallback
+
+
+def _resolve_state_dir() -> Path:
+    """
+    Choose the first existing state directory from:
+      1) settings.paths.state_dir
+      2) package fallback: workshops_ai/data/state
+      3) runtime mount fallback: /app/data/state
+    """
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path(_s.paths.state_dir).resolve())
+    except Exception:
+        pass
+    pkg_fallback = Path(__file__).resolve().parent.parent / "data" / "state"
+    candidates.append(pkg_fallback)
+    candidates.append(Path("/app/data/state"))
+    for p in candidates:
+        try:
+            if p.exists() and p.is_dir():
+                telemetry_log("state.dir_selected", {"dir": str(p)}, level="DEBUG")
+                return p
+        except Exception:
+            continue
+    fallback = candidates[0] if candidates else Path.cwd()
+    telemetry_log("state.dir_fallback", {"dir": str(fallback)}, level="WARN")
+    return fallback
+
+
+_STATE_DIR = _resolve_state_dir()
+_CAT_DIR = _resolve_catalog_dir()
 
 _ASSETS_STATE_FILE = _STATE_DIR / "assets.csv"
-_ASSET_IMPACTS_FILE = _STATE_DIR / "asset_impacts.csv"  # optional
+_ASSET_IMPACTS_FILE = _STATE_DIR / "asset_impacts.csv"   # optional
+_ASSET_RISKS_FILE = _STATE_DIR / "asset_risks.csv"       # optional
 
-# Catalogs
+# Catalogs (read-only helpers)
 _CAT_ASSET_TYPE_FILE = _CAT_DIR / "Asset type.csv"
 _CAT_AT_X_THREAT_FILE = _CAT_DIR / "Asset type x Threat.csv"
-
 _CAT_THREAT_FILE = _CAT_DIR / "Threat.csv"
 _CAT_THREAT_CATEGORY_FILE = _CAT_DIR / "Threat category.csv"
 _CAT_THREAT_X_CATEGORY_FILE = _CAT_DIR / "Threat x Threat category.csv"
-
 _CAT_IMPACT_FILE = _CAT_DIR / "Impact.csv"
 _CAT_IMPACT_CATEGORY_FILE = _CAT_DIR / "Impact category.csv"
 _CAT_IMPACT_X_CATEGORY_FILE = _CAT_DIR / "Impact x Impact category.csv"
 
 # --------------------------------------------------------------------------------------
-# Low-level CSV helpers with mtime-based reload
+# UUID helpers: map any string asset id -> deterministic UUIDv5 (stable across runs)
+# --------------------------------------------------------------------------------------
+
+def _uuid_namespace_from_settings() -> UUID:
+    """
+    Use settings.rag.uuid5_namespace if valid, otherwise a fixed, private fallback.
+    The fallback is constant so IDs remain deterministic across environments.
+    """
+    try:
+        ns = str(get_settings().rag.uuid5_namespace or "").strip()
+        if ns:
+            return UUID(ns)
+    except Exception:
+        pass
+    return UUID("00000000-0000-5000-a000-000000000000")
+
+
+_NS_UUID5 = _uuid_namespace_from_settings()
+
+
+def _uuid5_for_asset_id(raw_id: str) -> UUID:
+    """
+    Deterministically map any arbitrary asset identifier to UUIDv5.
+    If `raw_id` is already a UUID string, return that UUID.
+    """
+    if not raw_id:
+        return uuid.uuid5(_NS_UUID5, "asset:")
+    try:
+        return UUID(raw_id)
+    except Exception:
+        return uuid.uuid5(_NS_UUID5, f"asset:{raw_id}")
+
+
+def _id_matches(row_id: str, query_id: str) -> bool:
+    """
+    True iff:
+      - exact string match, OR
+      - UUIDv5(row_id) equals query_id (parsed as UUID), OR
+      - query_id parses as UUID and equals row_id parsed as UUID (if row_id itself is UUID text)
+    """
+    if not row_id or not query_id:
+        return False
+    if row_id == query_id:
+        return True
+    try:
+        q_uuid = UUID(query_id)
+    except Exception:
+        q_uuid = None
+    try:
+        r_uuid = UUID(row_id)
+    except Exception:
+        r_uuid = None
+    if r_uuid and q_uuid and r_uuid == q_uuid:
+        return True
+    if q_uuid and _uuid5_for_asset_id(row_id) == q_uuid:
+        return True
+    return False
+
+# --------------------------------------------------------------------------------------
+# Low-level CSV helpers with mtime-based reload (encoding & delimiter tolerant)
 # --------------------------------------------------------------------------------------
 
 @dataclass
@@ -78,8 +200,12 @@ class _CsvCache:
     rows: list[dict[str, str]] | None = None
 
     def load(self) -> list[dict[str, str]]:
+        """
+        Load or serve cached rows.
+        - For non-state files: returns [] if missing or on read error.
+        - For assets.csv specifically: missing file is a hard error to surface misconfiguration early.
+        """
         if not self.path.exists():
-            # For state files, non-existence means empty; for assets.csv it's a hard error
             if self.path == _ASSETS_STATE_FILE:
                 raise BackendError(f"State file not found: {self.path}")
             self.mtime, self.rows = 0.0, []
@@ -89,14 +215,23 @@ class _CsvCache:
         if self.rows is not None and self.mtime == mt:
             return self.rows
 
-        self.rows = _read_csv(self.path)
+        try:
+            self.rows = _read_csv(self.path)
+        except Exception as e:
+            telemetry_log("csv.read_error", {"file": str(self.path), "error": str(e)}, level="WARN")
+            self.rows = []
         self.mtime = mt
         return self.rows
 
 
+_DELIMS = [",", ";", "\t", "|"]
+_ENCODINGS = ["utf-8-sig", "utf-8", "cp1250", "cp1252", "iso-8859-2"]
+
+
 def _detect_encoding_and_delimiter(path: Path) -> tuple[str, str]:
     """
-    Detect encoding (utf-8-sig → utf-8 → cp1250) and delimiter (csv.Sniffer with ,;|\t).
+    Detect encoding among utf-8-sig → utf-8 → cp1250 → cp1252 → iso-8859-2
+    and delimiter among , ; \t | via csv.Sniffer (fallback to frequency tally).
     """
     sample_bytes = b""
     try:
@@ -105,49 +240,73 @@ def _detect_encoding_and_delimiter(path: Path) -> tuple[str, str]:
     except FileNotFoundError:
         return "utf-8-sig", ","
 
-    for enc in ("utf-8-sig", "utf-8", "cp1250"):
+    for enc in _ENCODINGS:
         try:
             sample_text = sample_bytes.decode(enc, errors="strict")
         except UnicodeDecodeError:
             continue
-        delim = ","
+
         try:
-            dialect = csv.Sniffer().sniff(sample_text, delimiters=",;\t|")
-            delim = dialect.delimiter or delim
+            sniffer = csv.Sniffer()
+            dialect = sniffer.sniff(sample_text, delimiters="".join(_DELIMS))
+            delim = dialect.delimiter or ","
         except Exception:
-            if sample_text.count(";") > sample_text.count(","):
+            counts = {d: sample_text.count(d) for d in _DELIMS}
+            delim = max(counts, key=counts.get) if counts else ","
+            if delim == "," and counts.get(";", 0) >= counts.get(",", 0):
                 delim = ";"
         return enc, delim
+
     return "utf-8-sig", ","
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
-    encoding, delimiter = _detect_encoding_and_delimiter(path)
-    with path.open("r", encoding=encoding, newline="") as f:
-        reader = csv.DictReader(f, delimiter=delimiter)
-        if reader.fieldnames:
-            reader.fieldnames = [h.strip() if isinstance(h, str) else h for h in reader.fieldnames]
-        out: list[dict[str, str]] = []
-        for row in reader:
-            clean = {
-                (k.strip() if isinstance(k, str) else k): (v.strip() if isinstance(v, str) else v)
-                for k, v in row.items()
-            }
-            out.append(clean)
-        return out
+    detected_enc, delim = _detect_encoding_and_delimiter(path)
+    order = [detected_enc] + [e for e in _ENCODINGS if e != detected_enc]
+    last_err: Exception | None = None
+
+    for enc in order:
+        try:
+            with path.open("r", encoding=enc, newline="") as f:
+                reader = csv.DictReader(f, delimiter=delim)
+                if reader.fieldnames:
+                    reader.fieldnames = [
+                        (h or "").replace("\ufeff", "").strip() for h in reader.fieldnames
+                    ]
+                out: list[dict[str, str]] = []
+                for row in reader:
+                    if not row:
+                        continue
+                    clean = {
+                        (k.strip() if isinstance(k, str) else k): (v.strip() if isinstance(v, str) else v)
+                        for k, v in row.items()
+                    }
+                    out.append(clean)
+                return out
+        except UnicodeDecodeError as e:
+            last_err = e
+            continue
+        except Exception as e:
+            last_err = e
+            break
+
+    telemetry_log("csv.read_error", {"file": str(path), "error": str(last_err)}, level="WARN")
+    return []
 
 
-def _first_present_column(rows: list[dict[str, str]], candidates: Iterable[str]) -> str | None:
+def _first_present_column(rows: list[dict[str, str]], candidates: Iterable[str]) -> Optional[str]:
+    """Case-insensitive header match (aligned with tools/search_catalogs.py)."""
     if not rows:
         return None
-    cols = set(rows[0].keys())
+    cols_lc = {(c or "").strip().casefold(): c for c in rows[0].keys()}
     for c in candidates:
-        if c in cols:
-            return c
+        key = (c or "").strip().casefold()
+        if key in cols_lc:
+            return cols_lc[key]
     return None
 
 # --------------------------------------------------------------------------------------
-# Catalog parsing (asset types, threats, impacts)
+# Catalog parsing (asset types, threats, impacts) – read-only helpers
 # --------------------------------------------------------------------------------------
 
 def _parse_bool(s: str | None) -> bool | None:
@@ -179,7 +338,7 @@ class _Catalogs:
         self.impact_categories = _CsvCache(_CAT_IMPACT_CATEGORY_FILE)
         self.impact_x_category = _CsvCache(_CAT_IMPACT_X_CATEGORY_FILE)
 
-    # -------- Asset types --------
+    # -------- Asset types (helper) --------
 
     def list_asset_types(self) -> list[str]:
         rows = self.asset_types.load()
@@ -188,9 +347,7 @@ class _Catalogs:
         col = _first_present_column(
             rows,
             ("code", "asset_type", "type", "Asset type", "EN Name", "EN name", "Name", "name"),
-        )
-        if col is None:
-            col = next(iter(rows[0].keys()))
+        ) or next(iter(rows[0].keys()))
         seen: set[str] = set()
         res: list[str] = []
         for r in rows:
@@ -232,9 +389,9 @@ class _Catalogs:
             return {}
 
         # In our CSV, canonical code is EN Name (fallback Name)
-        code_col = _first_present_column(t_rows, ("code", "threat_code", "EN Name", "Name"))
-        name_col = _first_present_column(t_rows, ("name", "EN Name", "Name"))
-        desc_col = _first_present_column(t_rows, ("description", "EN Notes", "Notes"))
+        code_col = _first_present_column(t_rows, ("code", "threat_code", "EN Name", "Name", "Code", "Threat", "ID"))
+        name_col = _first_present_column(t_rows, ("name", "EN Name", "Name", "Threat name", "Threat"))
+        desc_col = _first_present_column(t_rows, ("description", "EN Notes", "Notes", "Description", "EN Description"))
         intentional_col = _first_present_column(t_rows, ("intentional", "Intentional"))
         unintentional_col = _first_present_column(t_rows, ("unintentional", "Unintentional", "accidental"))
         environmental_col = _first_present_column(t_rows, ("environmental", "Environmental", "env"))
@@ -324,6 +481,7 @@ class _Catalogs:
 
         if q:
             qn = q.casefold()
+
             def _hay(t: dict[str, Any]) -> str:
                 return " ".join(
                     [
@@ -334,12 +492,13 @@ class _Catalogs:
                         " ".join(t.get("asset_types") or []),
                     ]
                 ).casefold()
+
             items = [t for t in items if qn in _hay(t)]
 
         items.sort(key=lambda t: (t.get("code") or "").casefold())
         return items
 
-    # -------- Impacts (catalog) --------
+    # -------- Impacts (catalog helper) --------
 
     def _build_impact_index(self) -> dict[str, dict[str, Any]]:
         """
@@ -398,6 +557,7 @@ class _Catalogs:
 
         if q:
             qn = q.casefold()
+
             def _hay(i: dict[str, Any]) -> str:
                 return " ".join(
                     [
@@ -407,13 +567,14 @@ class _Catalogs:
                         " ".join(i.get("categories") or []),
                     ]
                 ).casefold()
+
             items = [i for i in items if qn in _hay(i)]
 
         items.sort(key=lambda i: (i.get("code") or "").casefold())
         return items
 
 # --------------------------------------------------------------------------------------
-# State (assets.csv) parsing
+# State (assets.csv / asset_impacts.csv / asset_risks.csv)
 # --------------------------------------------------------------------------------------
 
 def _parse_int_0_4(s: str | None) -> int | None:
@@ -441,19 +602,36 @@ def _map_ia_int_to_canonical(i: int | None) -> str | None:
 def _build_asset_with_cia_fallback(payload: dict[str, Any]) -> Asset:
     """
     Build Asset while being robust to CIA representation and ID type.
-    Falls back to local str-ID model if canonical UUID is not available.
+    - If 'id' is not a valid UUID, set it to None (graphs/DTO pak nepadnou).
+    - Map numeric CIA → canonical enums.
+    Always returns `Asset`.
     """
-    last_exc: Exception | None = None
+    import uuid
 
-    # 1) optimistic
+    def _uuid_or_none(v: Any) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s:
+            return None
+        try:
+            return str(uuid.UUID(s))
+        except Exception:
+            return None
+
+    # 0) normalize ID up-front
+    base = dict(payload)
+    base["id"] = _uuid_or_none(base.get("id"))
+
+    # 1) optimistic 
     try:
-        return Asset(**payload)  # type: ignore[arg-type]
-    except Exception as e:
-        last_exc = e
+        return Asset(**base)  # type: ignore[arg-type]
+    except Exception:
+        pass
 
     # 2) map integers -> canonical enums
     try:
-        alt = dict(payload)
+        alt = dict(base)
         for k in ("confidentiality", "integrity", "availability"):
             v = alt.get(k)
             if k == "confidentiality":
@@ -461,59 +639,36 @@ def _build_asset_with_cia_fallback(payload: dict[str, Any]) -> Asset:
             else:
                 alt[k] = _map_ia_int_to_canonical(v) if isinstance(v, int) else v
         return Asset(**alt)  # type: ignore[arg-type]
-    except Exception as e:
-        last_exc = e
+    except Exception:
+        pass
 
-    # 3) fallback mapping attempts
-    def _digits(i: int | None) -> str | None: return None if i is None else str(i)
-    def _level(i: int | None) -> str | None: return None if i is None else f"LEVEL_{i}"
-
-    for mapper in (_digits, _level):
-        try:
-            alt = dict(payload)
-            for k in ("confidentiality", "integrity", "availability"):
-                v = alt.get(k)
-                alt[k] = mapper(v) if isinstance(v, int) else None if v is None else v
-            return Asset(**alt)  # type: ignore[arg-type]
-        except Exception as e:
-            last_exc = e
-            continue
-
-    # 4) local compatibility model (string id)
-    class _CompatAssetStrId(BaseModel):
-        id: str
-        name: str
-        description: str | None = None
-        isPrimary: bool | None = None
-        confidentiality: int | str | None = None
-        integrity: int | str | None = None
-        availability: int | str | None = None
-        assetType: str
-        org_id: str | None = None
-
-        @field_validator("id", "name", "assetType")
-        @classmethod
-        def _non_empty(cls, v: str) -> str:
-            v = (v or "").strip()
-            if not v:
-                raise ValueError("must not be empty")
-            return v
-
+    # 3) last resort: force CIA to strings the DTO 
     try:
-        return _CompatAssetStrId(**payload)  # type: ignore[return-value]
+        alt = dict(base)
+        def _digits(i: int | None) -> str | None: return None if i is None else str(i)
+        for k in ("confidentiality", "integrity", "availability"):
+            v = alt.get(k)
+            if isinstance(v, int):
+                alt[k] = _digits(v)
+        return Asset(**alt)  # type: ignore[arg-type]
     except Exception as e:
-        last_exc = e
+        raise BackendValidationError(f"Invalid Asset row (CIA/ID mapping failed): {e}")
 
-    raise BackendValidationError(f"Invalid Asset row (CIA/ID mapping failed): {last_exc}")
 
 
 class _AssetsState:
-    """Lazy, cached access to assets state CSV with validation against catalogs."""
+    """
+    Lazy, cached access to state CSVs with validation of basic shapes.
+    POLICY: state is source of truth (fail-open for assetType).
+    """
 
     def __init__(self, catalogs: _Catalogs) -> None:
         self.catalogs = catalogs
         self.assets = _CsvCache(_ASSETS_STATE_FILE)
         self.asset_impacts = _CsvCache(_ASSET_IMPACTS_FILE)
+        self.asset_risks = _CsvCache(_ASSET_RISKS_FILE)
+
+    # ---- Assets --------------------------------------------------------------
 
     def list(
         self,
@@ -526,12 +681,6 @@ class _AssetsState:
         if not rows:
             return []
 
-        # Validate provided type filter early
-        if type_code:
-            valid_types = set(self.catalogs.list_asset_types())
-            if valid_types and type_code not in valid_types:
-                return []
-
         out: list[Asset] = []
         for r in rows:
             try:
@@ -539,12 +688,17 @@ class _AssetsState:
             except BackendValidationError:
                 continue
 
-            if org_id and (a.org_id or "") != org_id:
+            # org filter
+            if org_id and (getattr(a, "org_id", None) or "") != org_id:
                 continue
-            if type_code and a.assetType != type_code:
+
+            # explicit type filter (exact string match on the asset's value)
+            if type_code and (a.assetType or "").strip() != type_code.strip():
                 continue
+
             if is_primary is not None and bool(a.isPrimary) != bool(is_primary):
                 continue
+
             if search:
                 needle = search.casefold()
                 if needle not in (a.name or "").casefold() and needle not in (a.description or "").casefold():
@@ -559,23 +713,25 @@ class _AssetsState:
         rows = self.assets.load()
         for r in rows:
             rid = (r.get("id") or r.get("ID") or "").strip()
-            if rid == asset_id:
+            if _id_matches(rid, asset_id):
                 try:
                     return _asset_from_row(r, catalogs=self.catalogs)
                 except BackendValidationError:
                     return None
         return None
 
+    # ---- Impacts (state) -----------------------------------------------------
+
     def get_impacts(self, asset_id: str) -> list[Mapping[str, object]]:
         """
         Return [{impact_code, level, note?}] from optional state/asset_impacts.csv.
         Heuristics for columns: asset_id|Asset ID, impact_code|Impact, level|Level, note|Note.
+        No catalog validation here (state is truth); only shape/level 0..4 is enforced.
         """
         rows = self.asset_impacts.load()
         if not rows:
             return []
 
-        # Column heuristics from header of first row
         aid_col = _first_present_column(rows, ("asset_id", "Asset ID", "assetId", "ID"))
         code_col = _first_present_column(rows, ("impact_code", "Impact", "impact", "EN Name", "Name", "code"))
         lvl_col = _first_present_column(rows, ("level", "Level", "impact_level", "impactLevel"))
@@ -586,13 +742,52 @@ class _AssetsState:
 
         out: list[dict[str, object]] = []
         for r in rows:
-            if (r.get(aid_col) or "").strip() != asset_id:
+            rid = (r.get(aid_col) or "").strip()
+            if not _id_matches(rid, asset_id):
                 continue
             code = (r.get(code_col) or "").strip()
             level = _parse_int_0_4(r.get(lvl_col))
             if not code or level is None:
                 continue
             item: dict[str, object] = {"impact_code": code, "level": level}
+            note = r.get(note_col) if note_col else None
+            if note:
+                note = note.strip()
+                if note:
+                    item["note"] = note
+            out.append(item)
+        return out
+
+    # ---- Risks (state) -------------------------------------------------------
+
+    def get_risks(self, asset_id: str) -> list[Mapping[str, object]]:
+        """
+        Return [{threat_code, probability, note?}] from optional state/asset_risks.csv.
+        Heuristics for columns: asset_id|Asset ID, threat_code|Threat, probability|Probability, note|Note.
+        No catalog validation (state is truth); only probability 0..4 is enforced.
+        """
+        rows = self.asset_risks.load()
+        if not rows:
+            return []
+
+        aid_col = _first_present_column(rows, ("asset_id", "Asset ID", "assetId", "ID"))
+        code_col = _first_present_column(rows, ("threat_code", "Threat", "threat", "EN Name", "Name", "code"))
+        prob_col = _first_present_column(rows, ("probability", "Probability", "level", "Level"))
+        note_col = _first_present_column(rows, ("note", "Note", "notes", "Notes"))
+
+        if not aid_col or not code_col or not prob_col:
+            return []
+
+        out: list[dict[str, object]] = []
+        for r in rows:
+            rid = (r.get(aid_col) or "").strip()
+            if not _id_matches(rid, asset_id):
+                continue
+            code = (r.get(code_col) or "").strip()
+            prob = _parse_int_0_4(r.get(prob_col))
+            if not code or prob is None:
+                continue
+            item: dict[str, object] = {"threat_code": code, "probability": prob}
             note = r.get(note_col) if note_col else None
             if note:
                 note = note.strip()
@@ -631,17 +826,21 @@ def _asset_from_row(row: Mapping[str, str], *, catalogs: _Catalogs) -> Asset:
     if not id_ or not name or not asset_type:
         raise BackendValidationError("Asset row missing mandatory fields (id, name, assetType).")
 
-    # Validate assetType via catalog
+    # FAIL-OPEN POLICY: do NOT drop assets when assetType is unknown in catalogs.
     valid_types = set(catalogs.list_asset_types())
     if valid_types and asset_type not in valid_types:
-        raise BackendValidationError(f"Unknown assetType '{asset_type}' (not in catalog).")
+        telemetry_log(
+            "asset.unknown_asset_type",
+            {"id": id_, "assetType": asset_type, "known_types_count": len(valid_types)},
+            level="WARN",
+        )
 
     # CIA rule for non-primary
     if is_primary is False:
         c = i = a = None
 
     payload: dict[str, Any] = {
-        "id": id_,
+        "id": id_,  # normalized to UUID inside _build_asset_with_cia_fallback
         "name": name,
         "description": description,
         "isPrimary": is_primary,
@@ -654,8 +853,6 @@ def _asset_from_row(row: Mapping[str, str], *, catalogs: _Catalogs) -> Asset:
 
     try:
         return _build_asset_with_cia_fallback(payload)
-    except BackendValidationError:
-        raise
     except ValidationError as ve:
         raise BackendValidationError(f"Invalid Asset row: {ve}") from ve
 
@@ -670,7 +867,7 @@ class CsvBackend(BackendPort):
         self._catalogs = _Catalogs()
         self._assets = _AssetsState(self._catalogs)
 
-    # ---- Catalogs ----
+    # ---- Catalog helpers ----
 
     def list_asset_types(self) -> list[str]:
         return self._catalogs.list_asset_types()
@@ -728,10 +925,13 @@ class CsvBackend(BackendPort):
         return self._assets.get_impacts(asset_id)
 
     def asset_get_risks(self, asset_id: str) -> list[Mapping[str, object]]:
-        # Not tracked in CSV MVP (keep shape for future)
-        return []
+        if not asset_id:
+            raise BackendValidationError("asset_id is required")
+        # optional state file; returns [] if missing/empty
+        return self._assets.get_risks(asset_id)
 
     def asset_get_controls(self, asset_id: str) -> list[Mapping[str, object]]:
+        # Not tracked in CSV MVP
         return []
 
     # ---- Staging lifecycle (unsupported in CSV MVP) ----

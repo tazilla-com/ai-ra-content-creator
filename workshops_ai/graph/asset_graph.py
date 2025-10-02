@@ -266,29 +266,56 @@ def _num_ia_to_label(v: Any) -> str | None:
         return s.upper()
     return None
 
-def _to_asset_dto(item: Any) -> Asset:
+def _to_asset_dto(item: Any, *, org_id: str | None = None) -> Asset:
     """
     Convert a backend item (dict or Pydantic model) into canonical `Asset`.
     Accepts multiple legacy key variants and numeric CIA scales and normalizes them.
     """
     data = item.model_dump() if hasattr(item, "model_dump") else dict(item)
-    payload: dict[str, Any] = {
-        "id": str(_first_nonempty(data.get("id"), data.get("asset_id"), "")),
-        "name": str(_first_nonempty(data.get("name"), data.get("title"), "")),
-        "description": _first_nonempty(data.get("description"), data.get("desc")),
-        "isPrimary": _as_bool(_first_nonempty(data.get("isPrimary"), data.get("primary"), data.get("is_primary"))),
-        "assetType": str(_first_nonempty(data.get("assetType"), data.get("type"), data.get("asset_type"), "")),
-        "org_id": _first_nonempty(data.get("org_id"), data.get("orgId")),
-    }
+
+    payload: dict[str, Any] = {}
+    _org = _first_nonempty(org_id, data.get("org_id"))
+    if _org is not None and str(_org).strip():
+        payload["org_id"] = str(_org)
+    # id
+    _id = _first_nonempty(data.get("id"), data.get("asset_id"))
+    if _id is not None:
+        payload["id"] = str(_id)
+
+    # name
+    _name = _first_nonempty(data.get("name"), data.get("title"))
+    if _name is not None and str(_name).strip():
+        payload["name"] = str(_name)
+
+    # description (optional)
+    _desc = _first_nonempty(data.get("description"), data.get("desc"))
+    if _desc is not None:
+        payload["description"] = _desc
+
+    # isPrimary (optional, coerce)
+    _prim = _as_bool(_first_nonempty(data.get("isPrimary"), data.get("primary"), data.get("is_primary")))
+    if _prim is not None:
+        payload["isPrimary"] = _prim
+
+    # assetType
+    _atype = _first_nonempty(data.get("assetType"), data.get("type"), data.get("asset_type"))
+    if _atype is not None and str(_atype).strip():
+        payload["assetType"] = str(_atype)
+
+    # CIA mappings (optional; numeric → labels)
     conf = _num_conf_to_label(_first_nonempty(data.get("confidentiality"), data.get("c")))
-    integ = _num_ia_to_label(_first_nonempty(data.get("integrity"), data.get("i")))
-    avail = _num_ia_to_label(_first_nonempty(data.get("availability"), data.get("a")))
     if conf is not None:
         payload["confidentiality"] = conf
+
+    integ = _num_ia_to_label(_first_nonempty(data.get("integrity"), data.get("i")))
     if integ is not None:
         payload["integrity"] = integ
+
+    avail = _num_ia_to_label(_first_nonempty(data.get("availability"), data.get("a")))
     if avail is not None:
         payload["availability"] = avail
+
+    # Validate against canonical DTO
     return TA_ASSET.validate_python(payload)
 
 # -----------------------------------------------------------------------------
@@ -614,7 +641,7 @@ def _assets_list(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
         dtos: list[Asset] = []
         for a in items:
             try:
-                dtos.append(_to_asset_dto(a))
+                dtos.append(_to_asset_dto(a, org_id=state.org_id))
             except Exception as ex:
                 logger.debug("Failed to normalize asset item: %s", ex)
 
@@ -657,7 +684,7 @@ def _asset_get(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
             return state
 
         try:
-            dto = _to_asset_dto(asset)
+            dto = _to_asset_dto(asset, org_id=state.org_id)
         except Exception as ex:
             state.result = _ui_response(f"Asset normalization failed: {ex}")
             return state
