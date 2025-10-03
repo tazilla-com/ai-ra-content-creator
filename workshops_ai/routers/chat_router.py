@@ -138,6 +138,8 @@ async def chat_endpoint(
                 "staging": ui_req.staging,
                 "message_preview": _truncate_for_log(ui_req.message, 256),
                 "language": getattr(ui_req, "language", None),
+                "locale": getattr(ui_req, "locale", None),
+                "has_history_token": bool(getattr(ui_req, "history_token", None)),
                 "has_org_profile": bool(getattr(ui_req, "organization_profile", None)),
                 "has_services": bool(getattr(ui_req, "services", None)),
                 "has_existing_assets": bool(getattr(ui_req, "existing_assets", None)),

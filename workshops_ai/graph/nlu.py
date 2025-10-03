@@ -89,7 +89,7 @@ class Selection(_StrictModel):
 
 # ---------- Assets tab ----------
 
-AssetsAction = Literal["list", "get", "create", "set_meta", "explain"]
+AssetsAction = Literal["list", "get", "create", "set_meta", "explain", "list_types"]
 
 
 class NewAssetNLU(_StrictModel):
@@ -141,11 +141,15 @@ class UpdateAssetNLU(_StrictModel):
 class AssetsNLU(_StrictModel):
     """
     NLU result for the Assets agent.
-    - `action`: intent ("list" | "get" | "create" | "set_meta" | "explain")
-        Aliases accepted:
-          - "update", "edit"  -> "set_meta"
-          - "add", "new"      -> "create"
-          - "show", "details" -> "get"
+    - `action`: intent ("list" | "get" | "create" | "set_meta" | "explain" | "list_types")
+        Accepted aliases:
+          - "update", "edit"        -> "set_meta"
+          - "add", "new"            -> "create"
+          - "create_asset"          -> "create"
+          - "show", "details"       -> "get"
+        Notes:
+          - "list_types" is a special action to list available asset types
+            (catalog) — it passes through unchanged.
     - `selection`: target selection (e.g., selection.asset_id)
     - `new_asset`: data for creation when action=create
     - `update`:    data for partial update when action=set_meta
@@ -159,11 +163,11 @@ class AssetsNLU(_StrictModel):
     @classmethod
     def action_must_be_str(cls, v: Any) -> str:
         """
-        Guard against LLM emitting ["list"] instead of "list".
-        Accept single-item list[str] (coerce), reject other arrays.
+        Guard against the LLM emitting ["list"] instead of "list".
+        Accept a single-item list[str] (coerce), reject any other arrays.
         Normalize to lowercase and map common aliases.
         """
-        # coerce from ["list"] shape
+        # Coerce from ["list"] shape
         if isinstance(v, list):
             if len(v) == 1 and isinstance(v[0], str):
                 v = v[0]
@@ -171,26 +175,30 @@ class AssetsNLU(_StrictModel):
                 raise ValueError("action must be a string, not array")
         s = str(v).strip().lower()
 
-        # alias mapping (assets)
+        # Alias mapping (assets)
         if s in {"update", "edit"}:
             return "set_meta"
         if s in {"add", "new", "create_asset"}:
             return "create"
         if s in {"show", "details"}:
             return "get"
+
+        # Allow "list_types" (and other supported literals) to pass unchanged
         return s
+
 
 
 # ---------- Impacts tab ----------
 
 class ImpactSetItem(_StrictModel):
+    """Single impact assignment item for an asset."""
     impact_code: str = Field(min_length=1)
     level: int
 
     @field_validator("impact_code", mode="before")
     @classmethod
     def _impact_code_norm(cls, v: Any) -> str:
-        # Do not hard-enforce catalog membership here; just normalize.
+        # Normalize and ensure non-empty; catalog membership is validated server-side.
         return _to_lower_nonempty(v, "impact_code")
 
     @field_validator("level", mode="before")
@@ -199,10 +207,22 @@ class ImpactSetItem(_StrictModel):
         return _int_in_range(v, name="level")
 
 
-ImpactsAction = Literal["list", "get", "set", "bulk_set", "explain"]
+ImpactsAction = Literal["list", "get", "set", "bulk_set", "explain", "defs_create"]
+
+
+class ImpactDefNLU(_StrictModel):
+    """NLU payload to define (or upsert) an impact in the catalog."""
+    name: StrictStr
+    description: StrictStr
+    weight: float
+    impactCategory: Literal[
+        "Availability", "Clients", "Confidentiality", "Finance",
+        "Integrity", "Legislation", "Reputation", "People", "Other"
+    ]
 
 
 class ImpactsBulkEntry(_StrictModel):
+    """One entry for bulk setting impacts on a single asset."""
     asset_id: UUID
     items: list[ImpactSetItem]
 
@@ -218,12 +238,16 @@ class ImpactsBulkEntry(_StrictModel):
 class ImpactsNLU(_StrictModel):
     """
     NLU result for the Impacts agent.
-    For 'set': provide `asset_id` and `items`.
-    For 'bulk_set': provide `entries`.
-    For 'get': provide `asset_id` (via selection or asset_id field).
+    - For "set":        provide `asset_id` and `items`.
+    - For "bulk_set":   provide `entries`.
+    - For "defs_create":provide `new_def`.
+    - For "get":        provide `asset_id` (directly or via `selection.asset_id`).
     """
     action: ImpactsAction
     selection: Optional[Selection] = None
+
+    # For 'defs_create'
+    new_def: Optional[ImpactDefNLU] = None
 
     # For 'set'
     asset_id: Optional[UUID] = None
@@ -240,9 +264,13 @@ class ImpactsNLU(_StrictModel):
     def action_must_be_str(cls, v: Any) -> str:
         if isinstance(v, list):
             if len(v) == 1 and isinstance(v[0], str):
-                return v[0].strip().lower()
-            raise ValueError("action must be a string, not array")
-        return str(v).strip().lower()
+                v = v[0]
+            else:
+                raise ValueError("action must be a string, not array")
+        s = str(v).strip().lower()
+        if s in {"create", "add", "new"}:
+            return "defs_create"
+        return s
 
     @field_validator("asset_id", mode="before")
     @classmethod
@@ -250,19 +278,21 @@ class ImpactsNLU(_StrictModel):
         return _coerce_uuid(v)
 
     def effective_asset_id(self) -> Optional[UUID]:
-        """Prefer explicit asset_id; fallback to selection.asset_id."""
+        """Prefer explicit `asset_id`; fallback to `selection.asset_id`."""
         return self.asset_id or (self.selection.asset_id if self.selection else None)
 
 
 # ---------- Threats tab ----------
 
 class ThreatSetItem(_StrictModel):
+    """Single threat probability assignment item for an asset."""
     threat_code: str = Field(min_length=1)
     probability: int
 
     @field_validator("threat_code", mode="before")
     @classmethod
     def _threat_code_norm(cls, v: Any) -> str:
+        # Normalize and ensure non-empty; catalog membership is enforced server-side.
         return _to_lower_nonempty(v, "threat_code")
 
     @field_validator("probability", mode="before")
@@ -271,10 +301,11 @@ class ThreatSetItem(_StrictModel):
         return _int_in_range(v, name="probability")
 
 
-ThreatsAction = Literal["list", "get", "set", "bulk_set", "explain"]
+ThreatsAction = Literal["list", "get", "set", "bulk_set", "explain", "defs_create"]
 
 
 class ThreatsBulkEntry(_StrictModel):
+    """One entry for bulk setting threat probabilities on a single asset."""
     asset_id: UUID
     items: list[ThreatSetItem]
 
@@ -287,15 +318,39 @@ class ThreatsBulkEntry(_StrictModel):
         return a
 
 
+class ThreatDefNLU(_StrictModel):
+    """NLU payload to define (or upsert) a threat in the catalog."""
+    name: StrictStr
+    description: StrictStr
+    category: Literal[
+        "Physical threats",
+        "Natural threats",
+        "Compromise of functions or services",
+        "Human actions",
+        "Technical failures and infrastructure disruptions",
+        "Organizational threats",
+        "Legal and regulatory threats",
+        "Violation of privacy",
+        "Other"
+    ]
+    unintentional: StrictBool = False
+    intentional:   StrictBool = False
+    environmental: StrictBool = False
+
+
 class ThreatsNLU(_StrictModel):
     """
     NLU result for the Threats agent.
-    For 'set': provide `asset_id` and `items`.
-    For 'bulk_set': provide `entries`.
-    For 'get': provide `asset_id` (via selection or asset_id field).
+    - For "set":         provide `asset_id` and `items`.
+    - For "bulk_set":    provide `entries`.
+    - For "defs_create": provide `new_def`.
+    - For "get":         provide `asset_id` (directly or via `selection.asset_id`).
     """
     action: ThreatsAction
     selection: Optional[Selection] = None
+
+    # For 'defs_create'
+    new_def: Optional[ThreatDefNLU] = None
 
     # For 'set'
     asset_id: Optional[UUID] = None
@@ -312,9 +367,13 @@ class ThreatsNLU(_StrictModel):
     def action_must_be_str(cls, v: Any) -> str:
         if isinstance(v, list):
             if len(v) == 1 and isinstance(v[0], str):
-                return v[0].strip().lower()
-            raise ValueError("action must be a string, not array")
-        return str(v).strip().lower()
+                v = v[0].strip().lower()
+            else:
+                raise ValueError("action must be a string, not array")
+        s = str(v).strip().lower()
+        if s in {"create", "add", "new"}:
+            return "defs_create"
+        return s
 
     @field_validator("asset_id", mode="before")
     @classmethod
@@ -322,9 +381,8 @@ class ThreatsNLU(_StrictModel):
         return _coerce_uuid(v)
 
     def effective_asset_id(self) -> Optional[UUID]:
-        """Prefer explicit asset_id; fallback to selection.asset_id."""
+        """Prefer explicit `asset_id`; fallback to `selection.asset_id`."""
         return self.asset_id or (self.selection.asset_id if self.selection else None)
-
 
 # ---------- Controls tab (placeholder for future) ----------
 
@@ -404,16 +462,15 @@ def ensure_action_is_string(nlu_dict: dict[str, Any], tab: str | None = None) ->
             nlu_dict["action"] = aliases_assets[act]
 
     allowed_by_tab = {
-        "assets":   {"list", "get", "create", "set_meta", "explain"},
-        "impacts":  {"list", "get", "set", "bulk_set", "explain"},
-        "threats":  {"list", "get", "set", "bulk_set", "explain"},
+        "assets":   {"list", "get", "create", "set_meta", "explain", "list_types"},  # <- added list_types
+        "impacts":  {"list", "get", "set", "bulk_set", "explain", "defs_create"},
+        "threats":  {"list", "get", "set", "bulk_set", "explain", "defs_create"},
         # "controls": {"list", "get", "set", "explain"},
     }
     allowed_all = set().union(*allowed_by_tab.values())
 
     act = nlu_dict.get("action")
     t = (tab or "").strip().lower()
-
     allowed = allowed_by_tab.get(t, allowed_all)
 
     if act not in allowed:

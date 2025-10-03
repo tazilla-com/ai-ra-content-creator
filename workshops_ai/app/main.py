@@ -386,13 +386,17 @@ def create_app() -> FastAPI:
 
     _mount_or_fallback("ws_router", _mount_ws, _fallback_ws)
 
-    # /assets (HTTP; safe to apply HTTP auth dependencies here if desired)
+    # /api/assets (public read-only) + /graph/assets (tool-first)
     def _mount_assets():
-        from workshops_ai.routers.assets import router as assets_router
+        from workshops_ai.routers.assets import router as assets_router, graph_router as assets_graph_router
+        # Public read-only API
         app.include_router(assets_router, tags=["assets"], dependencies=_AUTH_DEP)
+        # Tool-first endpoints
+        app.include_router(assets_graph_router, tags=["graph:assets"], dependencies=_AUTH_DEP)
 
     def _fallback_assets():
         router = APIRouter()
+        # Public list fallback
         @router.get(
             "/api/assets",
             tags=["assets"],
@@ -404,9 +408,37 @@ def create_app() -> FastAPI:
                 "error": {"type": "not_ready", "message": "Assets router not mounted."},
                 "request_id": get_request_id(),
             }
+        # Tool-first fallbacks
+        @router.get(
+            "/graph/assets/list",
+            tags=["graph:assets"],
+            response_class=_DEFAULT_RESPONSE_CLASS,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        async def assets_list_not_ready() -> dict[str, Any]:
+            return {"error": {"type": "not_ready", "message": "Graph assets list not mounted."}, "request_id": get_request_id()}
+
+        @router.post(
+            "/graph/assets/create",
+            tags=["graph:assets"],
+            response_class=_DEFAULT_RESPONSE_CLASS,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        async def assets_create_not_ready() -> dict[str, Any]:
+            return {"error": {"type": "not_ready", "message": "Graph assets create not mounted."}, "request_id": get_request_id()}
+
+        @router.put(
+            "/graph/assets/update",
+            tags=["graph:assets"],
+            response_class=_DEFAULT_RESPONSE_CLASS,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        async def assets_update_not_ready() -> dict[str, Any]:
+            return {"error": {"type": "not_ready", "message": "Graph assets update not mounted."}, "request_id": get_request_id()}
+
         app.include_router(router)
 
-    _mount_or_fallback("assets_router", _mount_assets, _fallback_assets)
+    _mount_or_fallback("assets_router(s)", _mount_assets, _fallback_assets)
 
     # /graph/threats (HTTP)
     def _mount_threats():

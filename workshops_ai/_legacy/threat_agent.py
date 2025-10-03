@@ -493,7 +493,7 @@ def _build_executor() -> AgentExecutor:
 
     llm = ChatOpenAI(
         model=model,
-        temperature=0,
+        temperature=0.2,
         timeout=timeout,
         max_retries=retries,
         api_key=api_key,  # if None, langchain_openai will fall back to env

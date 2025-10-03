@@ -1,6 +1,8 @@
 # File: workshops_ai/models/changeset.py
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Any, Optional, Annotated, Union, Literal
 
@@ -12,18 +14,20 @@ from pydantic import (
     StrictStr,
     ConfigDict,
     model_validator,
+    TypeAdapter,
+    field_serializer,
 )
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Audit envelope (strict, snake_case on the wire)
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 class Audit(BaseModel):
     """
     Unified audit envelope for all ChangeSets.
-    Snake_case everywhere (including JSON field names).
+    Field names are snake_case in both Python and JSON.
     """
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     user_id: StrictStr
     ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -35,14 +39,18 @@ class Audit(BaseModel):
     request_id: Optional[StrictStr] = None
     batch_id: Optional[StrictStr] = None
 
+    # Ensure JSON-safe ISO 8601 serialization (even outside model_dump(mode="json"))
+    @field_serializer("ts")
+    def _ser_ts(self, v: datetime) -> str:
+        return v.isoformat()
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Item models (strict, fail-closed)
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 class ImpactItem(BaseModel):
     """Single impact level entry for a specific impact code (level 0..4)."""
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     impact_code: StrictStr
     level: StrictInt = Field(ge=0, le=4)
@@ -51,7 +59,7 @@ class ImpactItem(BaseModel):
 
 class RiskItem(BaseModel):
     """Single risk probability entry for a specific threat code (0..4)."""
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     threat_code: StrictStr
     probability: StrictInt = Field(ge=0, le=4)
@@ -60,7 +68,7 @@ class RiskItem(BaseModel):
 
 class ControlUpsert(BaseModel):
     """Control proposal/upsert with optional expected coverage (0.0..1.0)."""
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     control_code: StrictStr
     rationale: Optional[str] = None
@@ -74,7 +82,7 @@ class ThreatUpsert(BaseModel):
     - `asset_type_codes` is a list of canonical EN asset-type codes.
     - Flags represent intentional/unintentional/environmental categorization.
     """
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     code: Optional[StrictStr] = None
     name: StrictStr
@@ -94,17 +102,18 @@ class ImpactUpsert(BaseModel):
     - If `code` is provided, update/ensure; otherwise create (server may assign code).
     - `category` is the canonical EN category for impacts (e.g., Availability).
     """
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     code: Optional[StrictStr] = None
     name: StrictStr
     category: StrictStr
     description: Optional[str] = None
+    weight: Optional[StrictFloat] = None
 
 
-# -----------------------------------------------------------------------------
-# Action models (strict, fail-closed) — FIX: op is Literal[...] for discriminator
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Action models (strict, fail-closed) — discriminator is Literal[...] `op`
+# =============================================================================
 
 class ActionSetImpacts(BaseModel):
     """
@@ -112,7 +121,7 @@ class ActionSetImpacts(BaseModel):
     - `mode="merge"` updates/inserts provided items.
     - `mode="replace"` replaces all existing items with the provided list.
     """
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     op: Literal["set_impacts"] = "set_impacts"
     mode: Literal["merge", "replace"] = "merge"
@@ -132,7 +141,7 @@ class ActionSetRisks(BaseModel):
     Set/merge risk probabilities for the given asset (or client-side reference).
     Probability is strictly 0..4 (already normalized before reaching backend).
     """
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     op: Literal["set_risks"] = "set_risks"
     mode: Literal["merge", "replace"] = "merge"
@@ -149,7 +158,7 @@ class ActionSetRisks(BaseModel):
 
 class ActionUpsertControls(BaseModel):
     """Upsert a set of controls (per asset or client-side reference)."""
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     op: Literal["upsert_controls"] = "upsert_controls"
     asset_id: Optional[StrictStr] = None
@@ -165,8 +174,8 @@ class ActionUpsertControls(BaseModel):
 
 
 class ActionRemoveControls(BaseModel):
-    """Remove listed controls (by code) from the given asset/ref."""
-    model_config = ConfigDict(extra="forbid")
+    """Remove listed controls (by code) from the given asset/ref)."""
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     op: Literal["remove_controls"] = "remove_controls"
     asset_id: Optional[StrictStr] = None
@@ -186,7 +195,7 @@ class ActionSetAssetMeta(BaseModel):
     Update arbitrary asset metadata fields (server enforces allowed keys).
     Example fields: name, asset_type_uuid/asset_type_code, primary, CIA, ...
     """
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     op: Literal["set_asset_meta"] = "set_asset_meta"
     asset_id: Optional[StrictStr] = None
@@ -206,7 +215,7 @@ class ActionCreateAsset(BaseModel):
     Create a new asset; `client_token` lets the client correlate response → request.
     Example fields: name, asset_type_uuid/asset_type_code, primary, ...
     """
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     op: Literal["create_asset"] = "create_asset"
     client_token: StrictStr
@@ -218,7 +227,7 @@ class ActionUpsertThreats(BaseModel):
     Upsert threats in org scope (not tied to a single asset).
     Each item corresponds to one threat (create/update).
     """
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     op: Literal["upsert_threats"] = "upsert_threats"
     items: list[ThreatUpsert]
@@ -229,7 +238,7 @@ class ActionUpsertImpacts(BaseModel):
     Upsert impacts in org scope (not tied to a single asset).
     Each item corresponds to one impact (create/update).
     """
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     op: Literal["upsert_impacts"] = "upsert_impacts"
     items: list[ImpactUpsert]
@@ -249,10 +258,9 @@ Action = Annotated[
     Field(discriminator="op"),
 ]
 
-
-# -----------------------------------------------------------------------------
-# ChangeSet envelope (strict)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# ChangeSet envelope (strict) + deterministic builder
+# =============================================================================
 
 class ChangeSet(BaseModel):
     """
@@ -261,8 +269,11 @@ class ChangeSet(BaseModel):
     - `idempotency_key` is required; server should reject/ignore duplicates.
     - `audit` is a unified snake_case model with keys:
       user_id, ts, source, tags, org_id, session_id, request_id, batch_id
+    - `intent` controls semantics:
+        * "preview" → dry-run/validate only (no writes)
+        * "apply"   → perform writes (server-side)
     """
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     schema_version: Literal["1.0"] = "1.0"
     idempotency_key: StrictStr
@@ -270,9 +281,106 @@ class ChangeSet(BaseModel):
     intent: Literal["preview", "apply"] = "apply"
 
     actions: list[Action]
-
     audit: Audit
 
+    @model_validator(mode="after")
+    def _validate_non_empty(self) -> "ChangeSet":
+        if not self.actions:
+            raise ValueError("actions must not be empty")
+        if not self.idempotency_key:
+            raise ValueError("idempotency_key must not be empty")
+        return self
+
+# ---- Deterministic idempotency helpers --------------------------------------
+
+def _canonical_dump(obj: Any) -> str:
+    """
+    Deterministic JSON dump:
+    - sort keys
+    - no whitespace variance
+    - ensure_ascii=False (but content is typically ASCII)
+    - IMPORTANT: use JSON mode for Pydantic models so datetimes etc. are safe
+    """
+    if isinstance(obj, BaseModel):
+        obj = obj.model_dump(mode="json")
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+def _actions_digest(actions: list[Action] ) -> str:
+    """
+    Create a stable digest of the action list that is insensitive to
+    incidental formatting. Assumes items already normalized by the agent.
+    """
+    payload = [_canonical_dump(a) for a in actions]
+    joined = "[" + ",".join(payload) + "]"
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+def _make_idempotency_key(
+    *,
+    org_id: str,
+    user_id: str,
+    intent: Literal["preview", "apply"],
+    actions: list[Action],
+) -> str:
+    """
+    Build a stable idempotency key from (org, user, intent, actionsDigest).
+    Intent is included so that preview/apply for the same actions do not collide.
+    """
+    digest = _actions_digest(actions)
+    base = f"cs:v1:{org_id}:{user_id}:{intent}:{digest}"
+    return base
+
+# ---- Public builder used by agents/graphs -----------------------------------
+
+def build_changeset(
+    *,
+    org_id: str,
+    user_id: str,
+    actions: list[dict] | list[Action],
+    intent: Literal["preview", "apply"] = "apply",
+    idempotency_key: Optional[str] = None,
+    session_id: Optional[StrictStr] = None,
+    request_id: Optional[StrictStr] = None,
+    batch_id: Optional[StrictStr] = None,
+    source: str = "AI",
+    tags: Optional[list[StrictStr]] = None,
+) -> ChangeSet:
+    """
+    Deterministic ChangeSet builder.
+    - Accepts plain dict actions or already-validated Action models.
+    - Produces a stable idempotency_key if not provided.
+    - Adds `preview` tag to audit.tags when intent == "preview" (non-breaking).
+    """
+    # Normalize actions into typed models with Pydantic v2 TypeAdapter
+    action_adapter = TypeAdapter(list[Action])
+    typed_actions: list[Action] = action_adapter.validate_python(actions)
+
+    # Compute deterministic idempotency_key (separate for preview/apply)
+    idem = idempotency_key or _make_idempotency_key(
+        org_id=org_id, user_id=user_id, intent=intent, actions=typed_actions
+    )
+
+    # Prepare audit
+    audit_tags = list(tags or [])
+    if intent == "preview" and "preview" not in audit_tags:
+        audit_tags.append("preview")
+
+    audit = Audit(
+        user_id=user_id,
+        source=source,
+        tags=audit_tags,
+        org_id=org_id,
+        session_id=session_id,
+        request_id=request_id,
+        batch_id=batch_id,
+    )
+
+    return ChangeSet(
+        idempotency_key=idem,
+        org_id=org_id,
+        intent=intent,
+        actions=typed_actions,
+        audit=audit,
+    )
 
 __all__ = [
     "Audit",
@@ -291,4 +399,5 @@ __all__ = [
     "ActionUpsertImpacts",
     "Action",
     "ChangeSet",
+    "build_changeset",
 ]

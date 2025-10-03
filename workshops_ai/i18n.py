@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-DEFAULT_LANG = "en"
+DEFAULT_LANG = "sk"
 SUPPORTED_LANGS = ("en", "sk", "cs")
 
 
@@ -97,6 +97,10 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
             "bulk_capped": "Bulk request capped to {n} items for safety.",
             "ok": "OK.",
             "done": "Done.",
+            # Unified short confirmations / clarifications:
+            "confirm_done": "✅ Done.",
+            "exists_asset": "ℹ️ Asset “{name}” already exists.",
+            "clarify_asset": "Which asset?",
         },
         # --------------------------- AssetAgent --------------------------------
         "assets": {
@@ -156,6 +160,10 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
             "bulk_capped": "Hromadný príkaz bol z bezpečnostných dôvodov skrátený na {n} položiek.",
             "ok": "OK.",
             "done": "Hotovo.",
+            # Unified short confirmations / clarifications:
+            "confirm_done": "✅ Hotovo.",
+            "exists_asset": "ℹ️ Aktívum „{name}“ už existuje.",
+            "clarify_asset": "Pre ktoré aktívum?",
         },
         "assets": {
             "explain_1": "Som tvoj AssetAgent. Povedz mi jednoducho, čo chceš s aktívami urobiť.",
@@ -211,6 +219,10 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
             "bulk_capped": "Hromadná akce byla z bezpečnostních důvodů zkrácena na {n} položek.",
             "ok": "OK.",
             "done": "Hotovo.",
+            # Unified short confirmations / clarifications:
+            "confirm_done": "✅ Hotovo.",
+            "exists_asset": "ℹ️ Aktivum „{name}“ už existuje.",
+            "clarify_asset": "Pro které aktivum?",
         },
         "assets": {
             "explain_1": "Jsem tvůj AssetAgent. Napiš jednoduše, co chceš dělat s assety.",

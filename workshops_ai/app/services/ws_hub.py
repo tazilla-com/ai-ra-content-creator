@@ -16,7 +16,7 @@
 # - broadcast_json(payload: dict)                # async; expects "event" in payload
 # - aemit_impact_set_level(payload: dict)        # validates WSImpactSetEvent
 # - aemit_impact_set_event(payload: dict)        # validates WSImpactSetListEvent
-# - aemit_risk_set_probability(payload: dict)    # validates WSRiskSetEvent or wraps plain item
+# - aemit_risk_set_probability(payload: dict)    # validates WSRiskSetEvent (or wraps item)
 # - aemit_risk_set_event(payload: dict)          # validates WSRiskSetListEvent
 # -----------------------------------------------------------------------------
 
@@ -29,13 +29,13 @@ from typing import Any, Dict, Optional
 
 from fastapi import WebSocket
 
-# NOTE: These schemas are expected to exist in your codebase.
-# - Single-item events:
-#     * WSImpactSetEvent:  {"event":"impact.set_level", "payload":{...}}
-#     * WSRiskSetEvent:    {"event":"risk.set_probability", "payload":{...}}
-# - Batch/list events:
-#     * WSImpactSetListEvent: {"event":"impact.set_levels", "payload":{assetId,..., impacts:[...]} }
-#     * WSRiskSetListEvent:   {"event":"risk.set_probabilities", "payload":{assetId,..., risks:[...]} }
+# Single-item events:
+#   * WSImpactSetEvent:  {"event":"impact.set_level", "payload":{...}}
+#   * WSRiskSetEvent:    {"event":"risk.set_probability", "payload":{...}}
+# Batch/list events:
+#   * WSImpactSetListEvent: {"event":"impact.set_levels", "payload":{impacts:[...]} }
+#   * WSRiskSetListEvent:   {"event":"risk.set_probabilities", "payload":{risks:[...]} }
+
 from workshops_ai.schemas.impact_models import (
     WSImpactSetEvent,
     WSImpactSetListEvent,
@@ -45,6 +45,10 @@ from workshops_ai.schemas.risk_models import (
     WSRiskSetListEvent,
     RiskChangeItem,
 )
+
+__all__ = [
+    "WsHub",
+]
 
 
 # ---- Internal structures -----------------------------------------------------
@@ -170,7 +174,7 @@ class WsHub:
         Broadcast a JSON payload to matching clients.
 
         Routing rules:
-        - Target tab is inferred from payload["event"] (impacts/threats/None).
+        - Target tab is inferred from payload["event"] (impacts/threats/assets/None).
         - If org_id is present (top-level or inside payload["payload"]), only
           clients with the same org_id (or no org_id set) receive the message.
         - Legacy clients without metadata receive all events.
@@ -217,12 +221,11 @@ class WsHub:
           - payload: {
               org_id, asset_id, asset_name?,
               impact_code, impact_name?,
-              level_index (0..4), level_value (5|20|50|70|100),
-              note?, actor, ts
+              level, note?, ts, idempotency_key?
             }
         """
         evt = WSImpactSetEvent.model_validate(payload)
-        await cls.broadcast_json(evt.model_dump())
+        await cls.broadcast_json(evt.model_dump(mode="json"))
 
     @classmethod
     async def aemit_impact_set_event(cls, payload: dict[str, Any]) -> None:
@@ -233,52 +236,50 @@ class WsHub:
           - event: "impact.set_levels"
           - payload: {
               org_id, asset_id, asset_name?,
-              impacts: [{impact_code, impact_name?, level_index, level_value, note?}, ...],
-              actor, ts
+              impacts: [{impact_code, level, note?, ts?, idempotency_key?}, ...]
             }
         """
         evt = WSImpactSetListEvent.model_validate(payload)
-        await cls.broadcast_json(evt.model_dump())
+        await cls.broadcast_json(evt.model_dump(mode="json"))
 
     @classmethod
     async def aemit_risk_set_probability(cls, payload: dict[str, Any]) -> None:
         """
-        Validate and emit a 'risk.set_probability' event (single-item) to all relevant clients.
+        Validate and emit a 'risk.set_probability' event (single-item).
 
         Accepted payloads:
           1) Full event envelope:
              {"event": "risk.set_probability", "payload": {...RiskChangeItem...}}
           2) Plain item (auto-wrapped):
-             {"org_id":"...", "asset_id":"...", "threat_code":"...", "probability": 3, "note": "...?"}
+             {"org_id":"...", "asset_id":"...", "threat_code":"...", "probability": 0..4, "note": "...?"}
 
-        Plain items are normalized into a RiskChangeItem, then wrapped with event.
+        Plain items are normalized into a RiskChangeItem, then wrapped with 'event'.
         """
         # Full envelope path
         if "event" in payload and "payload" in payload:
             evt = WSRiskSetEvent.model_validate(payload)
-            await cls.broadcast_json(evt.model_dump())
+            await cls.broadcast_json(evt.model_dump(mode="json"))
             return
 
         # Plain item path → normalize and wrap
         item = RiskChangeItem.model_validate(payload)
         evt = WSRiskSetEvent(event="risk.set_probability", payload=item)
-        await cls.broadcast_json(evt.model_dump())
+        await cls.broadcast_json(evt.model_dump(mode="json"))
 
     @classmethod
     async def aemit_risk_set_event(cls, payload: dict[str, Any]) -> None:
         """
-        Validate and emit a 'risk.set_probabilities' event (batch/list) to all relevant clients.
+        Validate and emit a 'risk.set_probabilities' event (batch/list).
 
         Expected envelope (Pydantic-enforced by WSRiskSetListEvent):
           - event: "risk.set_probabilities"
           - payload: {
               org_id, asset_id, asset_name?,
-              risks: [{threat_code, threat_name?, probability, note?}, ...],
-              actor, ts
+              risks: [{threat_code, probability, note?, ts?, idempotency_key?}, ...]
             }
         """
         evt = WSRiskSetListEvent.model_validate(payload)
-        await cls.broadcast_json(evt.model_dump())
+        await cls.broadcast_json(evt.model_dump(mode="json"))
 
     # -- Internals --------------------------------------------------------------
 
@@ -303,11 +304,14 @@ class WsHub:
         """
         Extract org_id from either the top-level payload or the inner 'payload' field.
         """
-        if "org_id" in payload and isinstance(payload["org_id"], str):
-            return payload["org_id"]
+        org_top = payload.get("org_id")
+        if isinstance(org_top, str) and org_top:
+            return org_top
         inner = payload.get("payload")
-        if isinstance(inner, dict) and isinstance(inner.get("org_id"), str):
-            return inner["org_id"]
+        if isinstance(inner, dict):
+            org_inner = inner.get("org_id")
+            if isinstance(org_inner, str) and org_inner:
+                return org_inner
         return None
 
     @classmethod

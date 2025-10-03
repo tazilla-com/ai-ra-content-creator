@@ -191,7 +191,7 @@ class LLMSettings(BaseModel):
 
     Canonical (nested) ENV:
       WORKSHOPS_AI_LLM__MODEL=gpt-4o-mini
-      WORKSHOPS_AI_LLM__TEMPERATURE=0.0
+      WORKSHOPS_AI_LLM__TEMPERATURE=0.2
       WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC=60
       WORKSHOPS_AI_LLM__OPENAI_MAX_RETRIES=3
 
@@ -199,7 +199,7 @@ class LLMSettings(BaseModel):
       LLM_MODEL, LLM_TEMPERATURE
     """
     model: str = "gpt-4o-mini"
-    temperature: float = 0.0
+    temperature: float = 0.2
     http_timeout_sec: int = 60
     openai_max_retries: int = 3
 

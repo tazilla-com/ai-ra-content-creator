@@ -8,8 +8,14 @@
 #   - Fail-closed: strict typing, explicit exceptions.
 #   - Atomic write: write → fsync → rename (same filesystem).
 #   - JSON payload: stable, sorted keys, UTF-8 (no ASCII escaping).
-#   - Idempotency: filename includes timestamp, kind, and idempotency key suffix.
+#   - Idempotency: filename includes timestamp, kind (if present), and idempotency suffix.
 #   - Pluggable submitter: supports async submitter (preferred) and a sync shim.
+#
+# IMPORTANT
+#   OUTBOX path source has changed:
+#     ✅ Primary:  get_settings().tazila.outbox_path
+#     ⚠️  Deprecated fallback: get_settings().paths.outbox_dir (logs a warning)
+#     ⬇️ Final fallback: /app/outbox
 #
 # Usage (async):
 #   from workshops_ai.models.changeset import ChangeSet
@@ -20,7 +26,6 @@
 #       log.info("Changeset queued in outbox: %s", result.fallback_path)
 #
 # Notes
-#   - OUTBOX path is taken from settings.paths.outbox_dir (or /app/outbox).
 #   - This module is write-only. Readers or drains should be implemented elsewhere.
 # -----------------------------------------------------------------------------
 
@@ -109,24 +114,43 @@ class SubmitResult:
 
 
 def _default_outbox_dir() -> Path:
+    """
+    Resolve the OUTBOX directory with the following precedence:
+
+      1) settings.tazila.outbox_path                 (authoritative)
+      2) settings.paths.outbox_dir (DEPRECATED)      (warn + use if set)
+      3) '/app/outbox'                               (hard default)
+    """
     try:
         settings = get_settings()
-        # Prefer settings.paths.outbox_dir if present; fallback to /app/outbox
-        path = getattr(getattr(settings, "paths", object()), "outbox_dir", None)
-        if path:
-            return Path(str(path))
+
+        # 1) New canonical location (authoritative)
+        tazila = getattr(settings, "tazila", None)
+        outbox_path = getattr(tazila, "outbox_path", None) if tazila is not None else None
+        if outbox_path:
+            return Path(str(outbox_path))
+
+        # 2) Deprecated legacy setting (keep temporarily for compatibility)
+        paths = getattr(settings, "paths", None)
+        deprecated_outbox = getattr(paths, "outbox_dir", None) if paths is not None else None
+        if deprecated_outbox:
+            logger.warning(
+                "DEPRECATED: settings.paths.outbox_dir is deprecated; "
+                "configure settings.tazila.outbox_path instead."
+            )
+            return Path(str(deprecated_outbox))
+
     except Exception:
         # Settings may not be fully initialized in some test contexts
         pass
+
+    # 3) Hard default
     return Path("/app/outbox")
 
 
 def ensure_outbox_dir(path: Optional[Path] = None) -> Path:
     """
     Ensure the OUTBOX directory exists with safe permissions.
-
-    Returns:
-        Path: absolute directory path.
     """
     out_dir = Path(path) if path else _default_outbox_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -141,32 +165,89 @@ def ensure_outbox_dir(path: Optional[Path] = None) -> Path:
 # ----- Serialization helpers --------------------------------------------------
 
 
-def serialize_changeset(changeset: ChangeSet) -> dict:
+def serialize_changeset(changeset: Any) -> dict:
     """
-    Convert a ChangeSet into a JSON-serializable dict with stable fields.
-
-    We use Pydantic v2 dump with JSON mode and explicit options for consistency.
+    Accept ChangeSet | dict and always return a JSON-serializable dict.
+    If a dict is passed, validate/normalize via ChangeSet.model_validate().
     """
-    try:
+    if isinstance(changeset, ChangeSet):
+        # Already validated
         return changeset.model_dump(
             mode="json",
             by_alias=True,
             serialize_as_any=True,
+            exclude_none=True,
         )
-    except ValidationError as ve:
-        # This should not happen if callers validated earlier; fail-closed.
-        raise ve
+    try:
+        # Validate unknown mapping into our model (raises on mismatch)
+        cs = ChangeSet.model_validate(changeset)
+        return cs.model_dump(
+            mode="json",
+            by_alias=True,
+            serialize_as_any=True,
+            exclude_none=True,
+        )
+    except ValidationError:
+        # Bubble up pydantic validation details
+        raise
 
 
-def _build_filename(changeset: ChangeSet, now: Optional[datetime] = None) -> str:
+def _safe_attr_or_key(obj: Any, key: str, default: Optional[str] = None) -> Optional[str]:
+    """
+    Helper that tries attribute first, then mapping key, else default.
+    """
+    val = getattr(obj, key, None)
+    if val is not None:
+        return str(val)
+    if isinstance(obj, dict):
+        v = obj.get(key)
+        if v is not None:
+            return str(v)
+        # Common nested location for idempotency in some payloads
+        if key == "idempotency_key":
+            audit = obj.get("audit") if isinstance(obj.get("audit"), dict) else None
+            if audit and "idempotency_key" in audit:
+                return str(audit["idempotency_key"])
+    return default
+
+
+def _infer_kind_if_missing(obj: Any) -> str:
+    """
+    If kind is not provided, try to infer a readable hint from actions[0].op,
+    otherwise fall back to 'changeset'.
+    """
+    kind = _safe_attr_or_key(obj, "kind")
+    if kind:
+        return kind
+    # best-effort inference
+    try:
+        actions = getattr(obj, "actions", None)
+        if actions is None and isinstance(obj, dict):
+            actions = obj.get("actions")
+        if isinstance(actions, (list, tuple)) and actions:
+            op = getattr(actions[0], "op", None)
+            if op is None and isinstance(actions[0], dict):
+                op = actions[0].get("op")
+            if op:
+                return f"changeset.{str(op)}"
+    except Exception:
+        pass
+    return "changeset"
+
+
+def _build_filename(changeset: Any, now: Optional[datetime] = None) -> str:
     """
     Filename pattern: YYYYMMDDTHHMMSSZ_KIND_IDEMP8.json
-    Example: 20251002T010203Z_asset.update_1a2b3c4d.json
+    Example: 20251002T010203Z_changeset.create_asset_1a2b3c4d.json
+
+    Tolerant to payloads without .kind / .idempotency_key.
     """
     ts = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
-    kind = (changeset.kind or "changeset").replace("/", ".").replace(" ", "_")
-    idem = (changeset.idempotency_key or "noidem").replace("-", "")
-    idem8 = idem[:8] if len(idem) >= 8 else idem
+    kind_raw = _infer_kind_if_missing(changeset)
+    kind = str(kind_raw).replace("/", ".").replace(" ", "_")
+    idem_raw = _safe_attr_or_key(changeset, "idempotency_key", default="noidem")
+    idem = str(idem_raw or "noidem").replace("-", "")
+    idem8 = idem[:8] if idem else "noidem"
     return f"{ts}_{kind}_{idem8}.json"
 
 
@@ -199,7 +280,7 @@ def _atomic_write_json(target_path: Path, payload: dict) -> None:
 
 
 def write_changeset_to_outbox(
-    changeset: ChangeSet,
+    changeset: Any,
     *,
     outbox_dir: Optional[Path] = None,
     filename: Optional[str] = None,
@@ -208,7 +289,7 @@ def write_changeset_to_outbox(
     Persist a ChangeSet JSON into the OUTBOX directory atomically.
 
     Args:
-        changeset: validated ChangeSet instance (strict).
+        changeset: validated ChangeSet instance or dict (will be validated).
         outbox_dir: optional directory override; default from settings.
         filename: optional custom filename; otherwise auto-generated.
 
@@ -254,7 +335,9 @@ async def _submit_async_via_any(
     Attempt submission using either async or sync submitter implementations.
     """
     # Async submitter (native coroutine method)
-    if hasattr(submitter, "submit_changeset") and asyncio.iscoroutinefunction(getattr(submitter, "submit_changeset")):
+    if hasattr(submitter, "submit_changeset") and asyncio.iscoroutinefunction(
+        getattr(submitter, "submit_changeset")
+    ):
         return await submitter.submit_changeset(changeset)  # type: ignore[arg-type]
 
     # Sync submitter; run in a worker thread to avoid blocking the event loop
@@ -283,13 +366,6 @@ async def submit_or_fallback(
         outbox_dir: override OUTBOX path.
         require_success: if True, raise SubmitError on submission failure
                          (no fallback). If False (default), fallback to outbox.
-
-    Returns:
-        SubmitOrFallbackResult
-
-    Raises:
-        SubmitError if require_success=True and submission fails.
-        OutboxWriteError if fallback write fails.
     """
     # Try online submit if submitter is present
     if submitter is not None:

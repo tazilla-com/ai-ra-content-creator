@@ -4,6 +4,7 @@ from uuid import UUID
 
 class Asset(BaseModel):
     org_id: str = Field(..., description="Organization ID of the asset.")
+    
     id: Optional[UUID] = Field(
         None, description="UUID v7 of an existing asset. Omit or set to null when creating a new asset."
     )

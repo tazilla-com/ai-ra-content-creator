@@ -39,6 +39,7 @@ from workshops_ai.backend.port import (
     BackendError,
     BackendPort,
     BackendValidationError,
+    BackendNotFound, 
 )
 from workshops_ai.settings import get_settings
 from workshops_ai.api.schema import Asset  # canonical DTO
@@ -190,7 +191,7 @@ def _id_matches(row_id: str, query_id: str) -> bool:
     return False
 
 # --------------------------------------------------------------------------------------
-# Low-level CSV helpers with mtime-based reload (encoding & delimiter tolerant)
+# CSV helpers with mtime-based reload (encoding & delimiter tolerant)
 # --------------------------------------------------------------------------------------
 
 @dataclass
@@ -306,8 +307,41 @@ def _first_present_column(rows: list[dict[str, str]], candidates: Iterable[str])
     return None
 
 # --------------------------------------------------------------------------------------
-# Catalog parsing (asset types, threats, impacts) – read-only helpers
+# Catalog helpers (asset types, threats, impacts) 
 # --------------------------------------------------------------------------------------
+
+# --- CSV write helpers (atomic replace) --------------------------------------
+
+def _atomic_write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            # coerce keys; ensure all headers present
+            row = {k: ("" if r.get(k) is None else r.get(k)) for k in fieldnames}
+            w.writerow(row)
+    tmp.replace(path)
+
+
+def _load_state_rows(path: Path) -> list[dict[str, Any]]:
+    """Read CSV or return [] if missing; tolerant just like _read_csv."""
+    try:
+        return _read_csv(path)
+    except Exception:
+        return []
+
+
+_ASSETS_HEADERS = [
+    "id", "name", "description", "isPrimary",
+    "confidentiality", "integrity", "availability",
+    "assetType", "org_id",
+]
+
+_ASSET_IMPACTS_HEADERS = ["asset_id", "impact_code", "level", "note"]
+_ASSET_RISKS_HEADERS   = ["asset_id", "threat_code", "probability", "note"]
+
 
 def _parse_bool(s: str | None) -> bool | None:
     if s is None:
@@ -861,7 +895,15 @@ def _asset_from_row(row: Mapping[str, str], *, catalogs: _Catalogs) -> Asset:
 # --------------------------------------------------------------------------------------
 
 class CsvBackend(BackendPort):
-    """CSV-backed implementation of BackendPort (read-only; staging not supported)."""
+    """
+    CSV-backed implementation of BackendPort.
+
+    - Catalogs: READ-ONLY (dropdown sources, no writes).
+    - State: READ + minimal WRITE (assets.csv, asset_impacts.csv, asset_risks.csv).
+    - Staging: not supported (raises BackendConflict).
+    - Pure code lists are available from the objects via extracting 'code'.
+      Richer definition objects are available via list_impact_defs / list_threat_defs.
+    """
 
     def __init__(self) -> None:
         self._catalogs = _Catalogs()
@@ -894,7 +936,7 @@ class CsvBackend(BackendPort):
         return self._catalogs.list_impacts(q=None, category=category)
 
     # Controls are intentionally out of scope (placeholders)
-    def list_controls(self, category: str | None = None, include_coverage: bool = True) -> list[str]:
+    def list_controls(self, category: str | None = None, include_coverage: bool = True) -> list[dict[str, Any]]:
         return []
 
     def get_control_coverage(self, control_code: str) -> int | None:
@@ -934,6 +976,201 @@ class CsvBackend(BackendPort):
         # Not tracked in CSV MVP
         return []
 
+     # ---- Minimal WRITE API over state/*.csv ---------------------------------
+
+    def create_asset(self, name: str, type: str | None = None, *, org_id: str | None = None,
+                     description: str | None = None, is_primary: bool | None = None) -> dict:
+        """
+        Append a new asset into data/state/assets.csv.
+        - Generates a UUIDv4 for 'id'
+        - CIA left empty (None) unless you later update
+        - assetType validated only softly (catalogs are advisory; do not block)
+        """
+        if not name:
+            raise BackendValidationError("Asset name is required")
+
+        new_id = str(uuid.uuid4())
+        rows = _load_state_rows(_ASSETS_STATE_FILE)
+
+        # soft validation: warn when type not in catalogs
+        if type:
+            types = set(self._catalogs.list_asset_types())
+            if types and type not in types:
+                telemetry_log("asset.create.unknown_type", {"assetType": type}, level="WARN")
+
+        def _bool_to_str(v: bool | None) -> str:
+            return "true" if v is True else ("false" if v is False else "")
+
+        row = {
+            "id": new_id,
+            "name": name,
+            "description": description or "",
+            "isPrimary": _bool_to_str(is_primary),
+            "confidentiality": "",
+            "integrity": "",
+            "availability": "",
+            "assetType": (type or "").strip(),
+            "org_id": (org_id or "").strip(),
+        }
+        rows.append(row)
+        _atomic_write_csv(_ASSETS_STATE_FILE, rows, _ASSETS_HEADERS)
+
+        # hot-reload cache (very light; next read will pick it up anyway)
+        try:
+            self._assets.assets.rows = None
+        except Exception:
+            pass
+
+        # Return a minimal DTO-like dict (not pydantic instance on purpose)
+        return dict(row)
+
+    def update_asset(self, asset_id: str, **fields) -> dict:
+        """
+        Update an existing asset row by 'id'. Accepts any of:
+          name, description, isPrimary, confidentiality, integrity, availability, assetType, org_id
+        Values are written as-is (CIA expected as 0..4 or canonical enums depending on your importer).
+        """
+        if not asset_id:
+            raise BackendValidationError("asset_id is required")
+
+        rows = _load_state_rows(_ASSETS_STATE_FILE)
+        if not rows:
+            raise BackendNotFound(f"Asset not found: {asset_id}")
+
+        found = False
+        for r in rows:
+            rid = (r.get("id") or r.get("ID") or "").strip()
+            if _id_matches(rid, asset_id):
+                found = True
+                # Normalize booleans to "true"/"false"
+                if "isPrimary" in fields and isinstance(fields["isPrimary"], bool):
+                    fields["isPrimary"] = "true" if fields["isPrimary"] else "false"
+                for k in ("name", "description", "isPrimary", "confidentiality",
+                          "integrity", "availability", "assetType", "org_id"):
+                    if k in fields and fields[k] is not None:
+                        r[k] = str(fields[k])
+                break
+
+        if not found:
+            raise BackendNotFound(f"Asset not found: {asset_id}")
+
+        _atomic_write_csv(_ASSETS_STATE_FILE, rows, _ASSETS_HEADERS)
+        try:
+            self._assets.assets.rows = None
+        except Exception:
+            pass
+
+        # return the updated row
+        for r in rows:
+            if _id_matches(r.get("id", ""), asset_id):
+                return dict(r)
+        return {}
+
+    def list_impact_defs(self) -> list[dict[str, Any]]:
+        """Read-only impact definitions from catalogs (dropdown source)."""
+        return self._catalogs.list_impacts(q=None, category=None)
+
+    def list_threat_defs(self, apply_asset_type: str | None = None) -> list[dict[str, Any]]:
+        """Read-only threat definitions from catalogs (dropdown source)."""
+        return self._catalogs.list_threats(q=None, category=None, apply_asset_type=apply_asset_type)
+
+    def create_impact_def(self, code: str, *, name: str | None = None,
+                          category: str | None = None, description: str | None = None) -> dict:
+        """
+        Catalogs are read-only in CSV backend. We intentionally do not write to catalogs/.
+        The graph will still submit a JSON ChangeSet to outbox for backend to ingest.
+        """
+        raise BackendConflict("CSV catalogs are read-only; impact definitions cannot be created here.")
+
+    def create_threat_def(self, code: str, *, name: str | None = None,
+                          category: str | None = None, description: str | None = None) -> dict:
+        """Same policy as create_impact_def: no write to catalogs in CSV backend."""
+        raise BackendConflict("CSV catalogs are read-only; threat definitions cannot be created here.")
+
+    def set_asset_impact_level(self, asset_id: str, code: str, level: int, note: str | None = None) -> dict:
+        """
+        Upsert a single (asset_id, impact_code) record in data/state/asset_impacts.csv.
+        Validates that `code` exists in catalogs; otherwise raises BackendNotFound.
+        """
+        if not asset_id or not code:
+            raise BackendValidationError("asset_id and impact code are required")
+        if level is None or not (0 <= int(level) <= 4):
+            raise BackendValidationError("level must be an integer 0..4")
+
+        # 1) asset must exist
+        if self._assets.get(asset_id) is None:
+            raise BackendNotFound(f"Asset not found: {asset_id}")
+
+        # 2) definition must exist
+        defs = self._catalogs.list_impacts(q=None, category=None)
+        known = {d.get("code") for d in defs}
+        if code not in known:
+            raise BackendNotFound(f"Impact code not found in catalogs: {code}")
+
+        rows = _load_state_rows(_ASSET_IMPACTS_FILE)
+        updated = False
+        for r in rows:
+            if _id_matches(r.get("asset_id", ""), asset_id) and (r.get("impact_code") or "").strip() == code:
+                r["level"] = str(int(level))
+                r["note"] = (note or r.get("note") or "") if note is not None else (r.get("note") or "")
+                updated = True
+                break
+        if not updated:
+            rows.append({
+                "asset_id": asset_id,
+                "impact_code": code,
+                "level": str(int(level)),
+                "note": note or "",
+            })
+        _atomic_write_csv(_ASSET_IMPACTS_FILE, rows, _ASSET_IMPACTS_HEADERS)
+        try:
+            self._assets.asset_impacts.rows = None
+        except Exception:
+            pass
+        return None
+
+    def set_asset_threat_level(self, asset_id: str, code: str, level: int, note: str | None = None) -> dict:
+        """
+        Upsert a single (asset_id, threat_code) record in data/state/asset_risks.csv.
+        Validates that `code` exists in catalogs; otherwise raises BackendNotFound.
+        Uses 'probability' column name for level.
+        """
+        if not asset_id or not code:
+            raise BackendValidationError("asset_id and threat code are required")
+        if level is None or not (0 <= int(level) <= 4):
+            raise BackendValidationError("level must be an integer 0..4")
+
+        # 1) asset must exist
+        if self._assets.get(asset_id) is None:
+            raise BackendNotFound(f"Asset not found: {asset_id}")
+
+        # 2) definition must exist
+        defs = self._catalogs.list_threats(q=None, category=None, apply_asset_type=None)
+        known = {d.get("code") for d in defs}
+        if code not in known:
+            raise BackendNotFound(f"Threat code not found in catalogs: {code}")
+
+        rows = _load_state_rows(_ASSET_RISKS_FILE)
+        updated = False
+        for r in rows:
+            if _id_matches(r.get("asset_id", ""), asset_id) and (r.get("threat_code") or "").strip() == code:
+                r["probability"] = str(int(level))
+                r["note"] = (note or r.get("note") or "") if note is not None else (r.get("note") or "")
+                updated = True
+                break
+        if not updated:
+            rows.append({
+                "asset_id": asset_id,
+                "threat_code": code,
+                "probability": str(int(level)),
+                "note": note or "",
+            })
+        _atomic_write_csv(_ASSET_RISKS_FILE, rows, _ASSET_RISKS_HEADERS)
+        try:
+            self._assets.asset_risks.rows = None
+        except Exception:
+            pass
+        return None
     # ---- Staging lifecycle (unsupported in CSV MVP) ----
 
     def staging_open_batch(self, org_id: str, tags: list[str], comment: str | None = None) -> str:

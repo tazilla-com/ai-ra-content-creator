@@ -7,8 +7,9 @@
 #   - Adds audit context (user_id, org_id, batch_tags, request_id, source, env, service).
 #
 # Usage:
-#   from workshops_ai.tools.telemetry import telemetry_log
+#   from workshops_ai.tools.telemetry import telemetry_log, telemetry_tool_call
 #   telemetry_log("chat.request", {"message_preview": "list assets"}, user_id="u-1", org_id="acme")
+#   telemetry_tool_call("set_asset_impact_level", asset_id="...", code="CONF", level=3, user_lang="cs")
 #
 # Notes:
 #   - Never raise exceptions; failures are swallowed (best-effort telemetry).
@@ -360,4 +361,60 @@ def telemetry_log(
         # Best-effort: never raise from telemetry
         pass
 
-__all__ = ["telemetry_log", "redact_pii", "redact_for_log", "safe_model_dump"]
+
+# --- Convenience helper for standardized tool-call payloads -------------------
+
+def telemetry_tool_call(
+    action: str,
+    *,
+    asset_id: str | None = None,
+    code: str | None = None,
+    level: int | None = None,
+    user_lang: str | None = None,
+    payload: Mapping[str, Any] | None = None,
+    log_level: str | int = "INFO",
+    user_id: str | None = None,
+    org_id: str | None = None,
+    batch_tags: Iterable[str] | None = None,
+    source: str = "AI",
+    **extra: Any,
+) -> None:
+    """
+    Log a standardized tool-call payload:
+      {action, asset_id, code, level, user_lang, ...}
+
+    Notes:
+      - `level` here is a domain value (e.g., 0..4 for impact/risk). The log severity
+        is controlled by `log_level` ("INFO"/"WARN"/... or int).
+      - Extra fields can be attached via `payload` or **extra (merged).
+    """
+    body: dict[str, Any] = {
+        "action": action,
+        "asset_id": asset_id,
+        "code": code,
+        "level": level,
+        "user_lang": user_lang,
+    }
+    if payload:
+        body.update(payload)
+    if extra:
+        body.update(extra)
+
+    telemetry_log(
+        "tool.call",
+        body,
+        level=log_level,
+        user_id=user_id,
+        org_id=org_id,
+        batch_tags=batch_tags,
+        source=source,
+    )
+
+
+__all__ = [
+    "telemetry_log",
+    "telemetry_tool_call",
+    "redact_pii",
+    "redact_for_log",
+    "safe_model_dump",
+]

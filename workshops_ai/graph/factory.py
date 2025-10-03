@@ -1,22 +1,10 @@
-# workshops_ai/graph/factory.py
-# -----------------------------------------------------------------------------
-# Purpose
-# Central LangGraph factory + lightweight DI for all tabs (assets | impacts | threats).
-#
-# Exposes:
-#   - GraphDeps: dependency bundle injected into each graph
-#   - build_graph(tab, deps) -> RunnableGraph
-#   - ainvoke_with_timeout(graph, inputs, timeout=...)  # async
-#   - invoke_with_timeout(graph, inputs, timeout=...)   # sync
-#   - make_default_deps() -> GraphDeps                  # default deps for routers
-#   - make_langgraph_config(...) -> dict                # builds required 'configurable' keys
-#   - build_checkpointer(settings=None)                 # compatibility alias
-#
-# Notes
-# - Imports are localized to avoid heavy module loads and circular deps.
-# - Dependencies are minimal; graphs must gracefully handle missing optional services.
-# - Checkpointer is selected via centralized builder in graph/checkpointer.py.
-# -----------------------------------------------------------------------------
+# File: workshops_ai/graph/factory.py
+# Purpose: Central LangGraph factory + lightweight DI for all tabs (assets | impacts | threats).
+# - Adds `llm_client` and `llm_temperature` to GraphDeps (keeps legacy `llm` for compatibility).
+# - Preserves checkpointer, memory (Redis-based), submit (online or OUTBOX).
+# - Exposes helpers to build per-turn LangGraph config (thread_id/checkpoint_ns).
+# - NEW: submitter passes outbox_dir=get_settings().tazila.outbox_path into submit_or_fallback(...)
+#        so ASSETS/IMPACTS/THREATS graphs store fallback uniformly.
 
 from __future__ import annotations
 
@@ -90,6 +78,11 @@ class SubmitChangeSet(Protocol):
 class GraphDeps:
     """
     Dependency injection container for graphs.
+
+    Notes on LLM DI:
+    - Prefer `llm_client` (primary handle for tool-choice / chat completion).
+    - `llm_temperature` is provided separately to avoid coupling to any client type.
+    - Legacy `llm` is kept for backward compatibility with older agent nodes.
     """
     backend_port: Any
     ws_hub: Any
@@ -97,14 +90,20 @@ class GraphDeps:
     checkpointer: Any
     settings: Any
     tab: str
-    # LLM used by planner/LLM nodes (can be None; graphs should degrade gracefully)
-    llm: Any | None = None
+
+    # --- LLM interfaces ---
+    llm_client: Any | None = None          # primary, preferred
+    llm_temperature: float | None = None   # preferred, explicit scalar
+    llm: Any | None = None                 # legacy (kept for compatibility)
+
     # Ephemeral memory helpers (Redis if configured, no-ops otherwise)
     memory_get: MemoryGet | None = None
     memory_set: MemorySet | None = None
+
     # Mutations: submit changeset (online preferred, fallback to OUTBOX)
     submit_changeset: SubmitChangeSet | None = None
-    # NEW: expose checkpoint namespace so routers/tests can pass it to LangGraph
+
+    # Expose checkpoint namespace so routers/tests can pass it to LangGraph
     checkpoint_ns: str | None = None
 
 
@@ -199,30 +198,91 @@ def _make_submit_callable(settings: Any) -> SubmitChangeSet:
     Returns a callable that tries to submit to the primary backend
     (if an API client is available), otherwise falls back to writing
     into the OUTBOX directory via submit_or_fallback().
+
+    IMPORTANT: The fallback outbox_dir is taken from settings.tazila.outbox_path
+               so all tabs (ASSETS/IMPACTS/THREATS) store uniformly.
     """
     # Try to locate an online submitter client (optional)
     submitter: Any = None
-    # Prefer a dedicated API client if present (soft dependency)
     try:
         from workshops_ai.app.services.tazila_client import get_client  # type: ignore
         submitter = get_client()  # expected to implement .submit_changeset(...)
     except Exception:
-        # No online client available; outbox fallback will be used.
         submitter = None
+
+    # Resolve configured OUTBOX directory once and capture it in the closure
+    try:
+        outbox_dir = getattr(getattr(settings, "tazila", object()), "outbox_path", None)
+    except Exception:
+        outbox_dir = None
 
     async def _submit(
         changeset: ChangeSet,
         *,
         require_success: bool = False,
     ) -> SubmitOrFallbackResult:
-        # submit_or_fallback handles both async and sync submitters transparently
         return await submit_or_fallback(
             changeset,
             submitter=submitter,
             require_success=require_success,
+            outbox_dir=outbox_dir,  # << pass configured OUTBOX for uniform fallback
         )
 
     return _submit
+
+
+# -----------------------------------------------------------------------------
+# Optional LLM provider resolution (soft dependencies)
+# -----------------------------------------------------------------------------
+
+def _resolve_llm_from_settings(s: Any) -> tuple[Any | None, float | None, Any | None]:
+    """
+    Resolve (llm_client, llm_temperature, legacy_llm) from settings or optional providers.
+    - First, try provider modules (if present).
+    - Then, fall back to settings fields like: s.llm_client / s.llm.temperature / s.llm.
+    - Finally, None/None/None if nothing is configured.
+    """
+    # Provider 1: app/services/llm_client
+    try:
+        from workshops_ai.app.services.llm_client import get_client, get_default_temperature  # type: ignore
+        client = get_client()
+        temp = None
+        try:
+            temp = float(get_default_temperature())  # type: ignore[arg-type]
+        except Exception:
+            temp = None
+        return client, temp, None
+    except Exception:
+        pass
+
+    # Provider 2: llm/provider
+    try:
+        from workshops_ai.llm.provider import get_llm_client, get_temperature, get_legacy_llm  # type: ignore
+        client = get_llm_client()
+        temp = None
+        try:
+            temp = float(get_temperature())  # type: ignore[arg-type]
+        except Exception:
+            temp = None
+        legacy = None
+        try:
+            legacy = get_legacy_llm()
+        except Exception:
+            legacy = None
+        return client, temp, legacy
+    except Exception:
+        pass
+
+    # Settings: direct attributes
+    client = getattr(s, "llm_client", None)
+    temp = getattr(s, "llm_temperature", None)
+    legacy = getattr(s, "llm", None)
+    try:
+        if temp is None and hasattr(getattr(s, "llm", None), "temperature"):
+            temp = float(getattr(s.llm, "temperature"))  # type: ignore[call-overload]
+    except Exception:
+        pass
+    return client, (float(temp) if isinstance(temp, (int, float)) else None), legacy
 
 
 # -----------------------------------------------------------------------------
@@ -236,7 +296,12 @@ def make_default_deps(
     backend_port: Any | None = None,
     ws_hub: Any | None = None,
     make_retriever: Optional[MakeRetriever] = None,
+    # --- LLM DI (new) ---
+    llm_client: Any | None = None,
+    llm_temperature: float | None = None,
+    # legacy LLM handle (kept to avoid breaking older graphs)
     llm: Any | None = None,
+    # Memory + submit
     memory_get: MemoryGet | None = None,
     memory_set: MemorySet | None = None,
     submit_changeset: SubmitChangeSet | None = None,
@@ -250,7 +315,9 @@ def make_default_deps(
       - backend_port       : CSV/API backend if available (can be None; graphs should degrade)
       - ws_hub             : optional; graphs should not hard-depend on it
       - make_retriever     : RAG retriever factory (optional; graphs degrade to LLM fallback)
-      - llm                : optional LLM instance
+      - llm_client         : primary LLM handle (preferred for agent/tool-choice)
+      - llm_temperature    : optional scalar temperature; do not rely on client internals
+      - llm                : legacy handle (maintain compatibility)
       - memory_get/set     : Redis-based ephemeral helpers when redis_url is set; else no-op
       - submit_changeset   : async callable performing online submit or OUTBOX fallback
     """
@@ -290,10 +357,17 @@ def make_default_deps(
     if submit_changeset is None:
         submit_changeset = _make_submit_callable(s)
 
+    # LLM DI resolution:
+    # - If caller didn't pass llm_client/temperature/legacy, try to resolve from settings/providers.
+    if llm_client is None and llm_temperature is None and llm is None:
+        res_client, res_temp, res_legacy = _resolve_llm_from_settings(s)
+        llm_client = res_client
+        llm_temperature = res_temp
+        llm = llm if llm is not None else res_legacy
+
     # Surface checkpoint namespace (from flat settings first; allow nested fallback)
     ns = getattr(s, "checkpoint_ns", None)
     if not ns:
-        # If your AppSettings nests checkpointer config, try to read it here
         ns = getattr(getattr(s, "checkpointer", object()), "namespace", None)
 
     return GraphDeps(
@@ -303,7 +377,11 @@ def make_default_deps(
         checkpointer=saver,
         settings=s,
         tab=(tab or "").lower() if tab else "",
+        # --- LLM DI (preferred + legacy) ---
+        llm_client=llm_client,
+        llm_temperature=llm_temperature,
         llm=llm,
+        # --- Memory + submit ---
         memory_get=memory_get,
         memory_set=memory_set,
         submit_changeset=submit_changeset,
@@ -316,9 +394,7 @@ def make_default_deps(
 # -----------------------------------------------------------------------------
 
 async def _invoke_async(graph: RunnableGraph, inputs: Any, config: Optional[dict]) -> Any:
-    """
-    Always prefer async. Do NOT fallback to sync for graphs with async-only nodes.
-    """
+    """Always prefer async. Do NOT fallback to sync for graphs with async-only nodes."""
     if hasattr(graph, "ainvoke"):
         if config is not None:
             return await graph.ainvoke(inputs, config=config)  # type: ignore[arg-type]
@@ -364,18 +440,23 @@ def make_langgraph_config(
     org_id: str,
     tab: str,
     user_id: str | None,
-    deps: GraphDeps
+    deps: GraphDeps,
+    user_lang: Optional[str] = None,   # NEW: optionally forward language to graph config
 ) -> dict:
     """
     Compose a LangGraph config with required 'configurable' keys for the checkpointer.
     - thread_id      : required by LangGraph checkpointers
     - checkpoint_ns  : optional but recommended (taken from deps.checkpoint_ns)
+    - user_lang      : optional pass-through; if provided, set as configurable hint for nodes
     """
     cfg: dict[str, Any] = {"configurable": {}}
     user = (user_id or "anon").strip() or "anon"
     cfg["configurable"]["thread_id"] = f"{org_id}:{tab}:{user}"
     if deps.checkpoint_ns:
         cfg["configurable"]["checkpoint_ns"] = deps.checkpoint_ns
+    # Keep this optional; graphs can read it via config["configurable"].get("user_lang")
+    if user_lang:
+        cfg["configurable"]["user_lang"] = user_lang.lower().strip()
     return cfg
 
 
