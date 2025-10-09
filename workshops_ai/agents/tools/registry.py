@@ -173,6 +173,35 @@ class AssetCreateArgs(BaseModel):
                 )
         return self
 
+class AssetSetMetaArgs(BaseModel):
+    """
+    Update metadata of an existing asset (aligns with asset_graph AssetUpdateItem).
+    All fields optional except assetId.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    assetId: StrictStr = Field(..., description="UUID v7 of the existing asset.")
+    assetType: Optional[AssetType] = None
+    isPrimary: Optional[StrictBool] = None
+    confidentiality: Optional[StrictInt] = Field(None, ge=0, le=4)
+    integrity: Optional[StrictInt] = Field(None, ge=0, le=4)
+    availability: Optional[StrictInt] = Field(None, ge=0, le=4)
+    description: Optional[StrictStr] = None
+
+    @field_validator("assetId")
+    @classmethod
+    def _uuid_v7_only(cls, v: str) -> str:
+        if not _is_uuid_v7_like(v):
+            raise ValueError("assetId must be UUID v7")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def _trim_or_none(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v2 = v.strip()
+        return v2 or None
 
 class AssetUpdateMetaArgs(BaseModel):
     """
@@ -205,6 +234,14 @@ class AssetUpdateMetaArgs(BaseModel):
 class AssetExplainArgs(AssetSelector):
     """Explain an asset (by ID or by name), using domain knowledge/RAG if available."""
     pass
+
+class AssetGetArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    assetId: Optional[StrictStr] = None
+    assetName: Optional[StrictStr] = None
+
+class NoArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 # -----------------------------------------------------------------------------
 # Impact tools (args) — aligned to Impact/AssetImpact DTOs
@@ -375,9 +412,6 @@ class ThreatExplainArgs(BaseModel):
 # Minimal toolset for now: list/explain (planning endpoint may be separate).
 # -----------------------------------------------------------------------------
 
-class ControlListArgs(BaseModel):
-    """List controls from catalog."""
-    model_config = ConfigDict(extra="forbid")
 
 class ControlExplainArgs(BaseModel):
     """Explain a control by its catalog name."""
@@ -394,6 +428,8 @@ class ControlExplainArgs(BaseModel):
 # -----------------------------------------------------------------------------
 # ToolSpec & Registry
 # -----------------------------------------------------------------------------
+class ControlListArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 class ToolSpec(BaseModel):
     """Canonical tool specification."""
@@ -410,6 +446,7 @@ class ToolSpec(BaseModel):
         schema = self.args_model.model_json_schema()
         schema.pop("title", None)  # cleaner payloads
         return schema
+
 
     def as_openai_function(self) -> dict[str, Any]:
         return {
@@ -444,6 +481,30 @@ class ToolRegistry:
             op="asset.list",
         ))
         tools.append(ToolSpec(
+            name="asset.list_types",
+            description="List available asset types from catalog.",
+            args_model=NoArgs,   # prázdný model stačí; žádné args
+            tab="assets",
+            endpoint="/graph/assets",
+            op="asset.list_types",
+        ))
+        tools.append(ToolSpec(
+            name="asset.get",
+            description="Get asset detail by selection (UI selection.asset_id is preferred).",
+            args_model=AssetGetArgs,
+            tab="assets",
+            endpoint="/graph/assets",
+            op="asset.get",
+        ))
+        tools.append(ToolSpec(
+            name="asset.ask_next",
+            description="Ask one concise follow-up question to complete asset creation (shows catalog).",
+            args_model=NoArgs,
+            tab="assets",
+            endpoint="/graph/assets",
+            op="asset.ask_next",
+        ))
+        tools.append(ToolSpec(
             name="asset.create",
             description="Create a new asset, including isPrimary and assetType.",
             args_model=AssetCreateArgs,
@@ -467,7 +528,22 @@ class ToolRegistry:
             endpoint="/graph/assets",
             op="asset.explain",
         ))
-
+        tools.append(ToolSpec(
+            name="asset.set_meta",
+            description="Update asset metadata (assetType, CIA, description, isPrimary).",
+            args_model=AssetSetMetaArgs, 
+            tab="assets",
+            endpoint="/graph/assets",
+            op="asset.set_meta",
+        ))
+        tools.append(ToolSpec(
+            name="llm.explain",
+            description="Explain assets domain question using RAG.",
+            args_model=AssetExplainArgs,  
+            tab="assets",
+            endpoint="/graph/assets",
+            op="llm.explain",
+        ))
         # --- Impacts ---
         tools.append(ToolSpec(
             name="impact.list",

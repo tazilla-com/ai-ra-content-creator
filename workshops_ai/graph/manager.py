@@ -57,6 +57,8 @@ _SETTINGS = get_settings()
 _SUPPORTED_TABS: Final[set[str]] = {"assets", "impacts", "threats"}
 # If/when the Controls graph is ready, add: "controls"
 
+_GRAPHS = {}
+
 # Namespaces for memory
 _CHAT_NS: Final[str] = "chat"
 _SESSION_NS: Final[str] = "session"

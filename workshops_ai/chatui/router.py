@@ -189,7 +189,10 @@ async def demo_page() -> str:
               // line('sys', '[JSON attached → see Events]');
             }
           });
-
+          // If server returned a legacy `outbox_path` outside of messages, show it in Events
+          if (data.outbox_path) {
+            ev({ type: 'outbox', path: data.outbox_path });
+          }
           if (data.proposals) {
             line('sys', '[proposals attached]');
             ev({ type: 'proposals', proposals: data.proposals });
@@ -238,6 +241,16 @@ async def demo_page() -> str:
               if (data.type === 'info' && data.payload && data.payload.message) {
                 // Only plain text goes into the chat
                 line('sys', data.payload.message);
+              }
+              // Friendly one-liner for our changeset events
+              if (data.type === 'changeset.submitted' && data.payload) {
+                const n = data.payload.actions ?? '?';
+                const transport = data.payload.transport ?? 'unknown';
+                line('sys', `Changeset submitted (${n} action(s)) via ${transport}.`);
+              }
+              if (data.type === 'changeset.queued' && data.payload) {
+                const p = data.payload.outbox_path ?? '(outbox)';
+                line('sys', `Changeset queued to outbox: ${p}`);
               }
             } else {
               // Raw AgentEvent (asset.created / impact.set / etc.) → Events only

@@ -14,6 +14,7 @@ import atexit
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol, Final
 
+
 # LangGraph type (soft-optional at import-time to avoid hard dependency in tests)
 try:  # pragma: no cover
     from langgraph.types import RunnableGraph  # type: ignore
