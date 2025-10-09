@@ -1,140 +1,101 @@
 # File: workshops_ai/rag/retriever.py
 """
-Scoped RAG retriever constructor.
+Scoped RAG retriever constructor (settings-first, no ENV fallbacks).
 
-What this module does
+What this module does:
 - Builds a retriever bound to (org_id, tab) scope.
-- Picks the backing VectorStore driver (default: Chroma).
+- Picks the backing VectorStore driver (default: Chroma) from settings.
 - Applies unified defaults for `top_k`, optional MMR re-ranking, and metadata filters.
 
-Design
+Design:
 - `make_retriever(org_id, tab)` returns an object with `.search()` and `.asearch()`.
 - Under the hood we get a VectorStorePort, create a scope, and wrap its retriever.
-- Optional MMR (Maximal Marginal Relevance) is applied as a post-processing step:
-  we re-rank the top-N (N >= top_k) results using embeddings; if embedding backend
-  is unavailable, we fall back to base ranking.
-
-Env/Settings (central settings with ENV fallbacks)
-- settings.rag.* is preferred; WORKSHOPS_AI_RAG__* acts as a fallback.
+- MMR (Maximal Marginal Relevance) is optional, controlled by settings.rag.*.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
 from workshops_ai.rag.port import RetrieverPort, Scope, VectorStorePort
-from workshops_ai.settings import get_settings
+from workshops_ai.settings import AppSettings, get_settings
 
 logger = logging.getLogger(__name__)
 
 
-# ----------------------------
-# Settings helpers
-# ----------------------------
+# ------------------------------------------------------------------------------
+# Settings helpers (settings-first)
+# ------------------------------------------------------------------------------
 
-def _env_bool(val: Optional[str], default: bool = False) -> bool:
-    if val is None:
-        return default
-    return val.strip().lower() in ("1", "true", "yes", "on")
+class _RagCfg:
+    """Materialized subset of RAG config derived solely from AppSettings."""
 
+    def __init__(self, settings: AppSettings):
+        rag = settings.rag
+        self.enabled: bool = bool(rag.enabled)
+        self.store: str = rag.store
 
-def _effective_rag_cfg():
-    """
-    Prefer settings().rag; fall back to ENV if needed.
-    """
-    s = get_settings()
-    rag = getattr(s, "rag", None)
+        # Embeddings backend selection
+        self.embed_provider: str = rag.embed_provider
+        self.embed_model: str = rag.embed_model
+        self.openai_api_key: Optional[str] = getattr(settings.llm, "api_key", None)
 
-    # Store
-    store = (rag.store if rag and getattr(rag, "store", None) else
-             (os.getenv("WORKSHOPS_AI_RAG__STORE") or "chroma")).strip().lower()
+        # Retriever params
+        self.top_k: int = int(rag.top_k)
+        self.mmr_enabled: bool = bool(rag.effective_use_mmr())
+        self.mmr_lambda: float = float(rag.mmr_lambda)
+        self.mmr_pool: int = int(rag.mmr_pool)
 
-    # Embeddings
-    embed_provider = (rag.embed_provider if rag and getattr(rag, "embed_provider", None) else
-                      (os.getenv("WORKSHOPS_AI_RAG__EMBED_PROVIDER") or "fastembed")).strip().lower()
-    embed_model = (rag.embed_model if rag and getattr(rag, "embed_model", None) else
-                   (os.getenv("WORKSHOPS_AI_RAG__EMBED_MODEL") or
-                    ("BAAI/bge-small-en-v1.5" if embed_provider == "fastembed" else "text-embedding-3-small")))
-
-    # Retriever params
-    top_k = int(rag.top_k if rag and getattr(rag, "top_k", None) is not None
-                else os.getenv("WORKSHOPS_AI_RAG__TOP_K", 5))
-    # mmr_enabled respects new flag, otherwise legacy use_mmr; as ENV fallback keep the original var
-    mmr_enabled = (rag.effective_use_mmr() if rag else
-                   _env_bool(os.getenv("WORKSHOPS_AI_RAG__MMR_ENABLED", os.getenv("WORKSHOPS_AI_RAG__USE_MMR", "false"))))
-    mmr_lambda = float(rag.mmr_lambda if rag and getattr(rag, "mmr_lambda", None) is not None
-                       else os.getenv("WORKSHOPS_AI_RAG__MMR_LAMBDA", 0.5))
-    mmr_pool = int(rag.mmr_pool if rag and getattr(rag, "mmr_pool", None) is not None
-                   else os.getenv("WORKSHOPS_AI_RAG__MMR_POOL", max(top_k * 3, 12)))
-
-    # Global enable switch
-    enabled = bool(rag.enabled) if rag and getattr(rag, "enabled", None) is not None \
-        else _env_bool(os.getenv("WORKSHOPS_AI_RAG__ENABLED", "true"), True)
-
-    # Namespace/data_dir are consumed by the store factory; leave to make_chroma_store via settings
-    return {
-        "enabled": enabled,
-        "store": store,
-        "top_k": top_k,
-        "mmr_enabled": mmr_enabled,
-        "mmr_lambda": mmr_lambda,
-        "mmr_pool": mmr_pool,
-        "embed_provider": embed_provider,
-        "embed_model": embed_model,
-        "settings": s,  # pass through for store factory
-    }
+        # Store paths/namespacing (consumed by store factory)
+        self.namespace: str = rag.namespace
+        self.data_dir: str = rag.effective_index_dir()
 
 
-# ----------------------------
-# Vector store selector
-# ----------------------------
-
-def _make_store() -> VectorStorePort:
-    cfg = _effective_rag_cfg()
-    if cfg["store"] == "chroma":
+def _make_store(settings: AppSettings) -> VectorStorePort:
+    """Select and build the vector store according to settings."""
+    if settings.rag.store == "chroma":
         from workshops_ai.rag.chroma_store import make_chroma_store
-        return make_chroma_store(cfg["settings"])  # settings carries rag.data_dir/namespace
-    # Future: qdrant/weaviate
-    raise ValueError(f"Unsupported RAG store '{cfg['store']}'")
+        return make_chroma_store(settings)
+    raise ValueError(f"Unsupported RAG store '{settings.rag.store}'")
 
 
-# ----------------------------
+# ------------------------------------------------------------------------------
 # Lightweight embeddings for MMR
-# ----------------------------
+# ------------------------------------------------------------------------------
 
 class _Embedder:
     """
     Minimal embedding helper controlled by settings.rag.embed_provider/model.
-    - "fastembed": local, zero-config
-    - "openai"   : needs OPENAI_API_KEY
+
+    Modes:
+      - "fastembed": local, zero-config
+      - "openai"   : requires settings.llm.api_key (provided externally via settings)
     Falls back to 'disabled' if unavailable → MMR off.
     """
-    def __init__(self, provider: str, model: str):
+
+    def __init__(self, provider: str, model: str, *, openai_api_key: Optional[str]):
         self._mode: Optional[str] = None
         self._model = model
         self._openai = None
         self._fe_cls = None
 
-        provider = (provider or "").strip().lower()
-        if provider == "fastembed":
+        p = (provider or "").strip().lower()
+        if p == "fastembed":
             try:
                 from fastembed import TextEmbedding  # type: ignore
                 self._fe_cls = TextEmbedding
                 self._mode = "fastembed"
             except Exception as e:
-                logger.info("FastEmbed unavailable (%s); falling back to OpenAI if configured.", e)
+                logger.info("FastEmbed unavailable (%s); will try OpenAI if configured.", e)
 
-        if self._mode is None and provider in ("openai", "fastembed"):
+        if self._mode is None and p in ("openai", "fastembed") and openai_api_key:
             try:
                 import openai  # type: ignore
                 self._openai = openai
-                self._openai.api_key = os.getenv("OPENAI_API_KEY")
-                if not self._openai.api_key:
-                    raise RuntimeError("OPENAI_API_KEY not set")
+                self._openai.api_key = openai_api_key  # settings-provided (no env read)
                 self._mode = "openai"
             except Exception as e:
                 logger.info("OpenAI embeddings unavailable (%s). MMR will be disabled.", e)
@@ -201,9 +162,9 @@ def _mmr_rerank(query: str, docs: list[dict], *, lambda_: float, top_k: int, emb
     return [docs[i] for i in selected]
 
 
-# ----------------------------
+# ------------------------------------------------------------------------------
 # Wrapper retriever with defaults + MMR
-# ----------------------------
+# ------------------------------------------------------------------------------
 
 @dataclass
 class _ScopedRetriever(RetrieverPort):
@@ -223,7 +184,6 @@ class _ScopedRetriever(RetrieverPort):
 
     def search(self, query: str, *, k: int = 5, where: Optional[Mapping[str, Any]] = None) -> list[dict]:
         if not self.enabled:
-            # RAG disabled → empty list -> graphs will fall back to LLM-only explain.
             return []
         k_final = int(k or self.top_k)
         pool = max(int(self.mmr_pool), k_final) if self.mmr_enabled else k_final
@@ -243,33 +203,36 @@ class _ScopedRetriever(RetrieverPort):
         return docs[:k_final]
 
 
-# ----------------------------
+# ------------------------------------------------------------------------------
 # Public factory
-# ----------------------------
+# ------------------------------------------------------------------------------
 
 def make_retriever(*, org_id: str, tab: str) -> RetrieverPort:
     """
     Return a retriever bound to (org_id, tab), with unified defaults and optional MMR.
-    Respects settings.rag (enabled, top_k, MMR, embeddings).
+    Respects settings.rag (enabled, top_k, MMR, embeddings). No ENV read.
     """
-    cfg = _effective_rag_cfg()
-    store = _make_store()
+    settings = get_settings()
+    cfg = _RagCfg(settings)
+    store = _make_store(settings)
     scope = Scope(org_id=org_id, tab=tab)
 
-    # Base retriever from the store
     base = store.make_retriever(scope)
 
-    # Embedder according to config (reused on the retriever)
-    embedder = _Embedder(cfg["embed_provider"], cfg["embed_model"]) if cfg["mmr_enabled"] else None
+    embedder = _Embedder(
+        cfg.embed_provider,
+        cfg.embed_model,
+        openai_api_key=cfg.openai_api_key,
+    ) if cfg.mmr_enabled else None
 
     return _ScopedRetriever(
         base=base,
         org_id=org_id,
         tab=tab,
-        enabled=bool(cfg["enabled"]),
-        top_k=int(cfg["top_k"]),
-        mmr_enabled=bool(cfg["mmr_enabled"]),
-        mmr_lambda=float(cfg["mmr_lambda"]),
-        mmr_pool=int(cfg["mmr_pool"]),
+        enabled=cfg.enabled,
+        top_k=cfg.top_k,
+        mmr_enabled=cfg.mmr_enabled,
+        mmr_lambda=cfg.mmr_lambda,
+        mmr_pool=cfg.mmr_pool,
         embedder=embedder,
     )

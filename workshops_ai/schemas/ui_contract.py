@@ -275,6 +275,30 @@ class UIResponse(BaseModel):
             raise ValueError("messages must contain at least one non-empty item")
         return cleaned
 
+    @staticmethod
+    def ok(tab: str, op: str, result: dict) -> "UIResponse":
+        """Create a successful UIResponse."""
+        return UIResponse(
+            messages=[{"kind": "success", "tab": tab, "op": op, "result": result}],
+            proposals={"tab": tab, "op": op, "result": result}
+        )
+
+    @staticmethod
+    def error(tab: str, op: str, error: str, details: Optional[list] = None) -> "UIResponse":
+        """Create an error UIResponse."""
+        return UIResponse(
+            messages=[{"kind": "error", "tab": tab, "op": op, "error": error, "details": details}],
+            proposals={"tab": tab, "op": op, "error": error, "details": details}
+        )
+
+    @staticmethod
+    def submitted(tab: str, op: str, changeset: dict, submit: dict, result: dict) -> "UIResponse":
+        """Create a submitted UIResponse."""
+        return UIResponse(
+            messages=[{"kind": "submitted", "tab": tab, "op": op, "changeset": changeset, "submit": submit, "result": result}],
+            proposals={"tab": tab, "op": op, "changeset": changeset, "submit": submit, "result": result}
+        )
+
 
 __all__ = [
     "ActiveTab",

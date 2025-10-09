@@ -16,7 +16,21 @@ from pydantic import (
     model_validator,
     TypeAdapter,
     field_serializer,
+    field_validator,
 )
+
+# =============================================================================
+# Optional op-name constants (handy for call-sites/tests; not used in Literals)
+# =============================================================================
+
+OP_CREATE_ASSET    = "create_asset"
+OP_SET_ASSET_META  = "set_asset_meta"
+OP_SET_IMPACTS     = "set_impacts"
+OP_SET_RISKS       = "set_risks"
+OP_UPSERT_CONTROLS = "upsert_controls"
+OP_REMOVE_CONTROLS = "remove_controls"
+OP_UPSERT_THREATS  = "upsert_threats"
+OP_UPSERT_IMPACTS  = "upsert_impacts"
 
 # =============================================================================
 # Audit envelope (strict, snake_case on the wire)
@@ -56,6 +70,14 @@ class ImpactItem(BaseModel):
     level: StrictInt = Field(ge=0, le=4)
     note: Optional[str] = None
 
+    @field_validator("impact_code")
+    @classmethod
+    def _trim_code(cls, v: str) -> str:
+        v2 = v.strip()
+        if not v2:
+            raise ValueError("impact_code must be a non-empty string")
+        return v2
+
 
 class RiskItem(BaseModel):
     """Single risk probability entry for a specific threat code (0..4)."""
@@ -64,6 +86,14 @@ class RiskItem(BaseModel):
     threat_code: StrictStr
     probability: StrictInt = Field(ge=0, le=4)
     note: Optional[str] = None
+
+    @field_validator("threat_code")
+    @classmethod
+    def _trim_code(cls, v: str) -> str:
+        v2 = v.strip()
+        if not v2:
+            raise ValueError("threat_code must be a non-empty string")
+        return v2
 
 
 class ControlUpsert(BaseModel):
@@ -74,6 +104,17 @@ class ControlUpsert(BaseModel):
     rationale: Optional[str] = None
     expected_coverage: Optional[StrictFloat] = Field(default=None, ge=0.0, le=1.0)
 
+    @field_validator("control_code", "rationale")
+    @classmethod
+    def _trim_opt(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v2 = v.strip()
+        return v2 or None
+
+# =============================================================================
+# Catalog upserts (org-scope, not tied to a single asset)
+# =============================================================================
 
 class ThreatUpsert(BaseModel):
     """
@@ -95,6 +136,35 @@ class ThreatUpsert(BaseModel):
     environmental: bool = False
     description: Optional[str] = None
 
+    # Trim + basic non-empty checks (backwards compatible)
+    @field_validator("code", "name", "category", "description")
+    @classmethod
+    def _trim_fields(cls, v: Optional[str], info) -> Optional[str]:
+        if v is None:
+            return v
+        v2 = v.strip()
+        # Require non-empty for required fields
+        if info.field_name in ("name", "category") and not v2:
+            raise ValueError(f"{info.field_name} must be a non-empty string")
+        # For optional fields, normalize empty -> None
+        return v2 or None
+
+    @model_validator(mode="after")
+    def _normalize_asset_types(self) -> "ThreatUpsert":
+        """
+        Normalize asset_type_codes: trim, drop empties, preserve order, deduplicate.
+        """
+        if self.asset_type_codes:
+            cleaned: list[str] = []
+            seen: set[str] = set()
+            for x in self.asset_type_codes:
+                s = x.strip()
+                if s and s not in seen:
+                    seen.add(s)
+                    cleaned.append(s)
+            self.asset_type_codes = cleaned
+        return self
+
 
 class ImpactUpsert(BaseModel):
     """
@@ -110,6 +180,16 @@ class ImpactUpsert(BaseModel):
     description: Optional[str] = None
     weight: Optional[StrictFloat] = None
 
+    # Trim + basic non-empty checks (backwards compatible)
+    @field_validator("code", "name", "category", "description")
+    @classmethod
+    def _trim_fields(cls, v: Optional[str], info) -> Optional[str]:
+        if v is None:
+            return v
+        v2 = v.strip()
+        if info.field_name in ("name", "category") and not v2:
+            raise ValueError(f"{info.field_name} must be a non-empty string")
+        return v2 or None
 
 # =============================================================================
 # Action models (strict, fail-closed) — discriminator is Literal[...] `op`
@@ -123,7 +203,7 @@ class ActionSetImpacts(BaseModel):
     """
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    op: Literal["set_impacts"] = "set_impacts"
+    op: Literal["set_impacts"] = OP_SET_IMPACTS
     mode: Literal["merge", "replace"] = "merge"
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None  # e.g. "client:<token>"
@@ -143,7 +223,7 @@ class ActionSetRisks(BaseModel):
     """
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    op: Literal["set_risks"] = "set_risks"
+    op: Literal["set_risks"] = OP_SET_RISKS
     mode: Literal["merge", "replace"] = "merge"
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
@@ -160,7 +240,7 @@ class ActionUpsertControls(BaseModel):
     """Upsert a set of controls (per asset or client-side reference)."""
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    op: Literal["upsert_controls"] = "upsert_controls"
+    op: Literal["upsert_controls"] = OP_UPSERT_CONTROLS
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
 
@@ -177,7 +257,7 @@ class ActionRemoveControls(BaseModel):
     """Remove listed controls (by code) from the given asset/ref)."""
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    op: Literal["remove_controls"] = "remove_controls"
+    op: Literal["remove_controls"] = OP_REMOVE_CONTROLS
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
 
@@ -197,7 +277,7 @@ class ActionSetAssetMeta(BaseModel):
     """
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    op: Literal["set_asset_meta"] = "set_asset_meta"
+    op: Literal["set_asset_meta"] = OP_SET_ASSET_META
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
 
@@ -217,9 +297,17 @@ class ActionCreateAsset(BaseModel):
     """
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    op: Literal["create_asset"] = "create_asset"
+    op: Literal["create_asset"] = OP_CREATE_ASSET
     client_token: StrictStr
     fields: dict[str, Any]
+
+    @field_validator("client_token")
+    @classmethod
+    def _non_empty_client_token(cls, v: str) -> str:
+        v2 = v.strip()
+        if not v2:
+            raise ValueError("client_token must be a non-empty string")
+        return v2
 
 
 class ActionUpsertThreats(BaseModel):
@@ -229,7 +317,7 @@ class ActionUpsertThreats(BaseModel):
     """
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    op: Literal["upsert_threats"] = "upsert_threats"
+    op: Literal["upsert_threats"] = OP_UPSERT_THREATS
     items: list[ThreatUpsert]
 
 
@@ -240,7 +328,7 @@ class ActionUpsertImpacts(BaseModel):
     """
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    op: Literal["upsert_impacts"] = "upsert_impacts"
+    op: Literal["upsert_impacts"] = OP_UPSERT_IMPACTS
     items: list[ImpactUpsert]
 
 
@@ -305,7 +393,7 @@ def _canonical_dump(obj: Any) -> str:
         obj = obj.model_dump(mode="json")
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
-def _actions_digest(actions: list[Action] ) -> str:
+def _actions_digest(actions: list[Action]) -> str:
     """
     Create a stable digest of the action list that is insensitive to
     incidental formatting. Assumes items already normalized by the agent.
@@ -328,6 +416,11 @@ def _make_idempotency_key(
     digest = _actions_digest(actions)
     base = f"cs:v1:{org_id}:{user_id}:{intent}:{digest}"
     return base
+
+# Lightweight helper for logging/tests (optional public utility)
+def actions_digest_for_logging(actions: list[Action]) -> str:
+    """Expose the normalized actions digest for logs/snapshots."""
+    return _actions_digest(actions)
 
 # ---- Public builder used by agents/graphs -----------------------------------
 
@@ -383,6 +476,16 @@ def build_changeset(
     )
 
 __all__ = [
+    # constants
+    "OP_CREATE_ASSET",
+    "OP_SET_ASSET_META",
+    "OP_SET_IMPACTS",
+    "OP_SET_RISKS",
+    "OP_UPSERT_CONTROLS",
+    "OP_REMOVE_CONTROLS",
+    "OP_UPSERT_THREATS",
+    "OP_UPSERT_IMPACTS",
+    # models
     "Audit",
     "ImpactItem",
     "RiskItem",
@@ -399,5 +502,7 @@ __all__ = [
     "ActionUpsertImpacts",
     "Action",
     "ChangeSet",
+    # helpers
+    "actions_digest_for_logging",
     "build_changeset",
 ]

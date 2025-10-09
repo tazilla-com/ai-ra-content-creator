@@ -110,11 +110,27 @@ async def demo_page() -> str:
 
     let ws = null;
 
-    function line(kind, text) {
-      const div = document.createElement('div');
-      div.className = `msg ${kind}`;
-      div.textContent = text;
-      chat.appendChild(div);
+    // Chat lines: text only. Any non-string is hinted and logged to Events.
+    function line(kind, content) {
+      const wrap = document.createElement('div');
+      wrap.className = `msg ${kind}`;
+
+      let text;
+      if (content === null || content === undefined) {
+        text = String(content);
+      } else if (typeof content === 'string') {
+        text = content;
+      } else {
+        text = '[JSON attached → see Events]';
+        // Also mirror the raw object to the right panel for inspection
+        try { ev({ type: 'chat_message_json', payload: content }); } catch {}
+      }
+
+      const el = document.createElement('div');
+      el.textContent = text;
+      wrap.appendChild(el);
+
+      chat.appendChild(wrap);
       chat.scrollTop = chat.scrollHeight;
     }
 
@@ -163,7 +179,17 @@ async def demo_page() -> str:
         }
 
         if (res.ok) {
-          (data.messages || []).forEach(t => line('ai', t));
+          // Chat bubble shows only strings; JSONs go to Events
+          (data.messages || []).forEach(item => {
+            if (typeof item === 'string') {
+              line('ai', item);
+            } else {
+              ev({ type: 'chat_message_json', payload: item });
+              // Optional short hint in chat:
+              // line('sys', '[JSON attached → see Events]');
+            }
+          });
+
           if (data.proposals) {
             line('sys', '[proposals attached]');
             ev({ type: 'proposals', proposals: data.proposals });
@@ -172,6 +198,7 @@ async def demo_page() -> str:
             ev({ type: 'staging', staging: data.staging });
           }
           if (data.agent_events) {
+            // Only in the right panel (no JSON in chat)
             ev({ type: 'agent_events', events: data.agent_events });
           }
         } else {
@@ -188,7 +215,7 @@ async def demo_page() -> str:
         ws.close(1000, 'reconnect');
       }
       const url = new URL(window.location.href);
-      url.protocol = url.protocol.replace('http', 'ws');
+      url.protocol = url.protocol.replace('http', 'ws'); // http → ws, https → wss
       url.pathname = '/ws';
       // Send both for compatibility (server commonly expects `tab`)
       url.searchParams.set('tab', tab.value);
@@ -206,16 +233,16 @@ async def demo_page() -> str:
           // AgentEvent frames are raw JSON; chat frames may be wrapped {type, payload}
           if (data && typeof data === 'object') {
             if (data.type && data.payload) {
+              // Structured chat/info frames from server
               ev({ ws_type: data.type, payload: data.payload });
               if (data.type === 'info' && data.payload && data.payload.message) {
+                // Only plain text goes into the chat
                 line('sys', data.payload.message);
               }
             } else {
-              // AgentEvent (asset.create / impact.set_level / risk.set_probability, etc.)
+              // Raw AgentEvent (asset.created / impact.set / etc.) → Events only
               ev(data);
-              if (data.event) {
-                line('sys', `event: ${data.event}`);
-              }
+              // No JSON echo into chat
             }
           }
         } catch (e) {
@@ -242,12 +269,12 @@ async def demo_page() -> str:
       const url = new URL(location.href);
       const apiKeyEl = document.getElementById('apiKey');
       const initialKey = url.searchParams.get('api_key') || '';
-      if (initialKey && apiKeyEl) apiKeyEl.value = initialKey; // předvyplň input
-      // Připoj se jen pokud máme klíč
+      if (initialKey && apiKeyEl) apiKeyEl.value = initialKey; // prefill the input
+
       if (initialKey || (apiKeyEl && apiKeyEl.value.trim())) {
         connectWs();
       } else {
-        log('WS', 'API key missing: add ?api_key=… to URL or fill the box and click Connect.');
+        line('sys', 'API key missing: add ?api_key=… to URL or fill the box and click Connect.');
       }
     });
     window.addEventListener('beforeunload', () => { if (ws) try { ws.close(1000, 'leaving'); } catch {} });

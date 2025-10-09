@@ -1,40 +1,50 @@
 # File: workshops_ai/tools/search_catalogs.py
 # Purpose:
-#   Read-only helpers to query CSV catalogs for “explain/help” use-cases.
-#   - Zero writes. Dependency-light (stdlib csv).
+#   Read-only helpers to query CSV catalogs for “explain/help” and listing use-cases.
+#   - Zero writes (catalogs are immutable here).
+#   - Minimal dependencies (stdlib csv).
 #   - Hot-reload via mtime cache.
 #   - Heuristic column + delimiter/encoding detection.
 #   - Safe: never raises for missing catalogs; returns empty results instead.
 #
-# Catalogs (expected locations; resilient if absent):
+# Expected catalog locations (robust fallbacks in order):
 #   <settings.paths.catalogs_dir>/...
 #   (fallback) workshops_ai/data/catalogs/...
 #   (fallback) /app/data/catalogs/...
 #
-# API:
-#   list_asset_types() -> list[str]
-#   search_asset_types(q: str|None, *, limit=50) -> list[str]
-#   explain_asset_type(code: str) -> dict|None
-#   mapped_threats_for_asset_type(asset_type_code: str) -> list[str]
+# Public API (mapped to tools/ops):
+#   Asset types (UI helper)
+#     list_asset_types() -> list[str]
+#     search_asset_types(q: str|None, *, limit=50) -> list[str]
+#     explain_asset_type(code: str) -> dict|None
+#     mapped_threats_for_asset_type(asset_type_code: str) -> list[str]
 #
-#   list_threat_categories() -> list[str]
-#   normalize_threat_category(code_or_alias: str) -> str|None
-#   explain_threat_category(category_code: str) -> dict|None
+#   Threats:
+#     list_threat_categories() -> list[str]                       # filter helper
+#     normalize_threat_category(code_or_alias: str) -> str|None
+#     explain_threat_category(category_code: str) -> dict|None
 #
-#   normalize_threat_code(code_or_alias: str) -> str|None
-#   search_threats(q: str|None, *, category: str|None = None,
-#                  apply_asset_type: str|None = None, limit=200) -> list[dict]
-#   list_threats(...)  -> alias of search_threats (same params)
-#   explain_threat(code: str) -> dict|None
+#     normalize_threat_code(code_or_alias: str) -> str|None
+#     search_threats(q: str|None, *, category: str|None = None,
+#                    apply_asset_type: str|None = None, limit=200) -> list[dict]
+#     list_threats(...)  -> alias of search_threats                # used by tool 'threat.list'
+#     explain_threat(code: str) -> dict|None                       # used by tool 'threat.explain'
 #
-#   list_impact_categories() -> list[str]
-#   normalize_impact_code(code_or_alias: str) -> str|None
-#   search_impacts(q: str|None, *, category: str|None = None, limit=200) -> list[dict]
-#   list_impacts(...) -> alias of search_impacts
-#   explain_impact(code: str) -> dict|None
+#   Impacts:
+#     list_impact_categories() -> list[str]                        # filter helper
+#     normalize_impact_code(code_or_alias: str) -> str|None
+#     search_impacts(q: str|None, *, category: str|None = None, limit=200) -> list[dict]
+#     list_impacts(...) -> alias of search_impacts                 # used by tool 'impact.list'
+#     explain_impact(code: str) -> dict|None                       # used by tool 'impact.explain'
 #
-#   generic_search(file_name: str, q: str|None, *, fields: list[str]|None = None, limit=50) -> list[dict]
+#   Generic:
+#     generic_search(file_name: str, q: str|None,
+#                    *, fields: list[str]|None = None, limit=50) -> list[dict]
 #
+# Notes:
+#   - Catalogs are read-only here by design; creation/upsert is handled elsewhere
+#     (e.g., by submitting a ChangeSet to the backend).
+#   - This module intentionally tolerates varied CSV headers, encodings, and delimiters.
 
 from __future__ import annotations
 
@@ -42,11 +52,11 @@ import csv
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Callable
 
 from workshops_ai.settings import get_settings
 
-# Optional telemetry (best-effort)
+# Optional telemetry (best-effort). Never fail the caller if telemetry is unavailable.
 try:  # pragma: no cover
     from workshops_ai.tools.telemetry import telemetry_log  # type: ignore
 except Exception:  # pragma: no cover
@@ -113,7 +123,7 @@ class _CsvCache:
     rows: list[dict[str, str]] | None = None
 
     def load(self) -> list[dict[str, str]]:
-        """Load or serve cached rows. Returns [] if missing."""
+        """Load or serve cached rows. Returns [] if missing or on any read error."""
         try:
             if not self.path.exists():
                 self.mtime, self.rows = 0.0, []
@@ -215,6 +225,7 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
 
 
 def _first_present_column(rows: list[dict[str, str]], candidates: Iterable[str]) -> Optional[str]:
+    """Return the first candidate header that exists in rows (case-insensitive)."""
     if not rows:
         return None
     cols_lc = {(c or "").strip().casefold(): c for c in rows[0].keys()}
@@ -233,8 +244,8 @@ def _slug(s: str | None) -> str:
     """
     Lowercased, ASCII-only slug for tolerant matching:
       - removes diacritics (č->c, ě->e, ľ->l, etc.)
-      - strips non-alnum to single spaces
-      - trims spaces
+      - replaces non-alnum by single spaces
+      - trims duplicate/edge spaces
     """
     if not s:
         return ""
@@ -501,7 +512,7 @@ def _build_threat_index() -> dict[str, dict[str, Any]]:
             raw_th = (r.get(att_threat_col) or "").strip()
             if not raw_th:
                 continue
-            # respektuj Value==TRUE, když je k dispozici
+            # respect Value==TRUE when available (treat falsey as unmapped)
             if att_val_col:
                 val = (r.get(att_val_col) or "").strip().lower()
                 if val not in {"1", "true", "t", "yes", "y", "ano"}:
@@ -541,6 +552,7 @@ def _build_threat_index() -> dict[str, dict[str, Any]]:
 
 
 def _truthy(v: Any) -> bool:
+    """Return True for common truthy tokens used in CSVs (1/true/yes/ano/...)."""
     if v is None:
         return False
     return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "ano"}
@@ -633,12 +645,12 @@ def list_threats(
     apply_asset_type: str | None = None,
     limit: int = 200,
 ) -> list[dict[str, Any]]:
-    """Alias to search_threats (same parameters)."""
+    """Alias to search_threats (same parameters). Used by tool 'threat.list'."""
     return search_threats(q, category=category, apply_asset_type=apply_asset_type, limit=limit)
 
 
 def explain_threat(code: str) -> Optional[dict[str, Any]]:
-    """Return the indexed detail dict for a threat code (or None)."""
+    """Return the indexed detail dict for a threat code (or None). Used by tool 'threat.explain'."""
     if not code:
         return None
     idx = _build_threat_index()
@@ -697,7 +709,7 @@ def _build_impact_index() -> dict[str, dict[str, Any]]:
 
 
 def list_impact_categories() -> list[str]:
-    """Return canonical impact category codes."""
+    """Return canonical impact category codes (best-effort header detection)."""
     rows = _impact_categories.load()
     if not rows:
         return []
@@ -716,7 +728,7 @@ def list_impact_categories() -> list[str]:
 
 
 def normalize_impact_code(code_or_alias: str) -> str | None:
-    """Normalize a code or human label to canonical impact code."""
+    """Normalize a code or human label to the canonical impact code."""
     if not code_or_alias:
         return None
     idx = _build_impact_index()
@@ -740,6 +752,7 @@ def normalize_impact_code(code_or_alias: str) -> str | None:
 def search_impacts(q: str | None, *, category: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
     """
     Search impacts with tolerant filters (q over code/name/description/categories).
+    Returns detailed dicts: {code, name, description?, categories, category}
     """
     idx = _build_impact_index()
     if not idx:
@@ -752,6 +765,7 @@ def search_impacts(q: str | None, *, category: str | None = None, limit: int = 2
 
     if q:
         qn = _slug(q)
+
         def _hay(i: dict[str, Any]) -> str:
             return _slug(
                 " ".join(
@@ -763,6 +777,7 @@ def search_impacts(q: str | None, *, category: str | None = None, limit: int = 2
                     ]
                 )
             )
+
         items = [i for i in items if qn in _hay(i)]
 
     items.sort(key=lambda i: (i.get("code") or "").casefold())
@@ -770,12 +785,12 @@ def search_impacts(q: str | None, *, category: str | None = None, limit: int = 2
 
 
 def list_impacts(q: str | None = None, *, category: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
-    """Alias to search_impacts."""
+    """Alias to search_impacts (same parameters). Used by tool 'impact.list'."""
     return search_impacts(q, category=category, limit=limit)
 
 
 def explain_impact(code: str) -> dict[str, Any] | None:
-    """Return indexed impact detail by canonical code."""
+    """Return indexed impact detail by canonical code. Used by tool 'impact.explain'."""
     if not code:
         return None
     idx = _build_impact_index()
@@ -787,6 +802,10 @@ def explain_impact(code: str) -> dict[str, Any] | None:
 # --------------------------------------------------------------------------------------
 
 def mapped_threats_for_asset_type(asset_type_code: str) -> list[str]:
+    """
+    Return sorted list of canonical threat codes mapped to the given asset type code.
+    Honors the "Value" / "Enabled" column when present (truthy only).
+    """
     if not asset_type_code:
         return []
     rows = _at_x_threat.load()
@@ -821,7 +840,7 @@ def mapped_threats_for_asset_type(asset_type_code: str) -> list[str]:
 def generic_search(file_name: str, q: str | None, *, fields: list[str] | None = None, limit: int = 50) -> list[dict[str, str]]:
     """
     Generic read-only search over an arbitrary catalog CSV in <catalogs_dir>.
-    - q=None returns first `limit` rows.
+    - q=None returns the first `limit` rows (no filtering).
     - If `fields` is specified, only those columns are searched (missing are ignored).
     - Otherwise, searches all columns.
     """
@@ -861,6 +880,50 @@ def generic_search(file_name: str, q: str | None, *, fields: list[str] | None = 
 
     return res
 
+OP_MAP: dict[str, Callable[..., Any]] = {
+    # Asset types (catalog)
+    "asset_type.list": list_asset_types,
+    "asset_type.search": search_asset_types,
+    "asset_type.explain": explain_asset_type,
+
+    # Threat categories (catalog)
+    "threat.category.list": list_threat_categories,
+    "threat.category.normalize": normalize_threat_category,
+    "threat.category.explain": explain_threat_category,
+
+    # Threats (catalog)
+    "threat.normalize_code": normalize_threat_code,
+    "threat.search": search_threats,
+    "threat.list": list_threats,
+    "threat.explain": explain_threat,
+
+    # Impacts (catalog)
+    "impact.category.list": list_impact_categories,
+    "impact.normalize_code": normalize_impact_code,
+    "impact.search": search_impacts,
+    "impact.list": list_impacts,
+    "impact.explain": explain_impact,
+
+    # Mappings
+    "asset_type.mapped_threats": mapped_threats_for_asset_type,
+
+    # Generic
+    "catalog.generic_search": generic_search,
+}
+
+
+def call_op(op: str, /, **kwargs):
+    """
+    Invoke a catalog helper by its canonical op-name.
+    Raises KeyError if the op is unknown. This is convenient for places where
+    we only see 'op' strings (e.g., tool router) but still want to reuse the
+    read-only helpers here without extra if/else chains.
+    """
+    func = OP_MAP.get(op)
+    if func is None:
+        raise KeyError(f"Unknown catalog op: {op}")
+    return func(**kwargs)
+
 
 __all__ = [
     # Asset types
@@ -886,4 +949,7 @@ __all__ = [
     "mapped_threats_for_asset_type",
     # Generic
     "generic_search",
+    # Canonical op-name mapping
+    "OP_MAP",
+    "call_op",
 ]

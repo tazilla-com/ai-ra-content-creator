@@ -1,32 +1,7 @@
 # workshops_ai/app/services/outbox_writer.py
 # -----------------------------------------------------------------------------
-# Purpose
-#   Submit a ChangeSet to the primary backend if available, otherwise
-#   atomically persist the ChangeSet as JSON into the local OUTBOX directory.
+# Persist & submit ChangeSets w/ deterministic OUTBOX fallback
 #
-# Design
-#   - Fail-closed: strict typing, explicit exceptions.
-#   - Atomic write: write → fsync → rename (same filesystem).
-#   - JSON payload: stable, sorted keys, UTF-8 (no ASCII escaping).
-#   - Idempotency: filename includes timestamp, kind (if present), and idempotency suffix.
-#   - Pluggable submitter: supports async submitter (preferred) and a sync shim.
-#
-# IMPORTANT
-#   OUTBOX path source has changed:
-#     ✅ Primary:  get_settings().tazila.outbox_path
-#     ⚠️  Deprecated fallback: get_settings().paths.outbox_dir (logs a warning)
-#     ⬇️ Final fallback: /app/outbox
-#
-# Usage (async):
-#   from workshops_ai.models.changeset import ChangeSet
-#   from workshops_ai.app.services.outbox_writer import submit_or_fallback
-#
-#   result = await submit_or_fallback(changeset, submitter=maybe_client)
-#   if result.fallback_path:
-#       log.info("Changeset queued in outbox: %s", result.fallback_path)
-#
-# Notes
-#   - This module is write-only. Readers or drains should be implemented elsewhere.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -75,29 +50,13 @@ class SubmitError(RuntimeError):
 
 @runtime_checkable
 class AsyncChangeSetSubmitter(Protocol):
-    """Async submitter interface used by API clients."""
-
     async def submit_changeset(self, changeset: ChangeSet) -> "SubmitResult":
-        """
-        Submit a ChangeSet to the primary backend.
-
-        Returns:
-            SubmitResult: success status including optional HTTP info.
-        """
         ...
 
 
 @runtime_checkable
 class SyncChangeSetSubmitter(Protocol):
-    """Sync submitter interface (shimmed to async internally)."""
-
     def submit_changeset(self, changeset: ChangeSet) -> "SubmitResult":
-        """
-        Submit a ChangeSet to the primary backend (synchronous variant).
-
-        Returns:
-            SubmitResult: success status including optional HTTP info.
-        """
         ...
 
 
@@ -149,12 +108,9 @@ def _default_outbox_dir() -> Path:
 
 
 def ensure_outbox_dir(path: Optional[Path] = None) -> Path:
-    """
-    Ensure the OUTBOX directory exists with safe permissions.
-    """
+    """Ensure the OUTBOX directory exists with safe permissions."""
     out_dir = Path(path) if path else _default_outbox_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Best-effort perm tightening (does not fail hard if unsupported)
     try:
         os.chmod(out_dir, 0o750)
     except Exception:
@@ -171,31 +127,23 @@ def serialize_changeset(changeset: Any) -> dict:
     If a dict is passed, validate/normalize via ChangeSet.model_validate().
     """
     if isinstance(changeset, ChangeSet):
-        # Already validated
         return changeset.model_dump(
             mode="json",
             by_alias=True,
             serialize_as_any=True,
             exclude_none=True,
         )
-    try:
-        # Validate unknown mapping into our model (raises on mismatch)
-        cs = ChangeSet.model_validate(changeset)
-        return cs.model_dump(
-            mode="json",
-            by_alias=True,
-            serialize_as_any=True,
-            exclude_none=True,
-        )
-    except ValidationError:
-        # Bubble up pydantic validation details
-        raise
+    cs = ChangeSet.model_validate(changeset)  # raises ValidationError on mismatch
+    return cs.model_dump(
+        mode="json",
+        by_alias=True,
+        serialize_as_any=True,
+        exclude_none=True,
+    )
 
 
 def _safe_attr_or_key(obj: Any, key: str, default: Optional[str] = None) -> Optional[str]:
-    """
-    Helper that tries attribute first, then mapping key, else default.
-    """
+    """Helper that tries attribute first, then mapping key, else default."""
     val = getattr(obj, key, None)
     if val is not None:
         return str(val)
@@ -203,7 +151,6 @@ def _safe_attr_or_key(obj: Any, key: str, default: Optional[str] = None) -> Opti
         v = obj.get(key)
         if v is not None:
             return str(v)
-        # Common nested location for idempotency in some payloads
         if key == "idempotency_key":
             audit = obj.get("audit") if isinstance(obj.get("audit"), dict) else None
             if audit and "idempotency_key" in audit:
@@ -212,14 +159,10 @@ def _safe_attr_or_key(obj: Any, key: str, default: Optional[str] = None) -> Opti
 
 
 def _infer_kind_if_missing(obj: Any) -> str:
-    """
-    If kind is not provided, try to infer a readable hint from actions[0].op,
-    otherwise fall back to 'changeset'.
-    """
+    """If kind is missing, infer from actions[0].op, else 'changeset'."""
     kind = _safe_attr_or_key(obj, "kind")
     if kind:
         return kind
-    # best-effort inference
     try:
         actions = getattr(obj, "actions", None)
         if actions is None and isinstance(obj, dict):
@@ -237,10 +180,8 @@ def _infer_kind_if_missing(obj: Any) -> str:
 
 def _build_filename(changeset: Any, now: Optional[datetime] = None) -> str:
     """
-    Filename pattern: YYYYMMDDTHHMMSSZ_KIND_IDEMP8.json
+    Filename pattern: YYYYMMDDT%H%M%SZ_KIND_IDEMP8.json
     Example: 20251002T010203Z_changeset.create_asset_1a2b3c4d.json
-
-    Tolerant to payloads without .kind / .idempotency_key.
     """
     ts = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
     kind_raw = _infer_kind_if_missing(changeset)
@@ -249,6 +190,17 @@ def _build_filename(changeset: Any, now: Optional[datetime] = None) -> str:
     idem = str(idem_raw or "noidem").replace("-", "")
     idem8 = idem[:8] if idem else "noidem"
     return f"{ts}_{kind}_{idem8}.json"
+
+
+def _get_actions_len(changeset: Any) -> int:
+    """Return number of actions, tolerant to dict or model."""
+    try:
+        acts = getattr(changeset, "actions", None)
+        if acts is None and isinstance(changeset, dict):
+            acts = changeset.get("actions")
+        return len(acts or [])
+    except Exception:
+        return 0
 
 
 # ----- Atomic write -----------------------------------------------------------
@@ -263,19 +215,16 @@ def _atomic_write_json(target_path: Path, payload: dict) -> None:
     directory = target_path.parent
     tmp_path = directory / f".{target_path.name}.tmp"
 
-    # Open with O_CREAT|O_EXCL via 'x' to avoid clobbering any existing temp
     with tmp_path.open("x", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         f.flush()
         os.fsync(f.fileno())
 
-    # Best-effort permissions
     try:
         os.chmod(tmp_path, 0o640)
     except Exception:
         pass
 
-    # Atomic rename
     os.replace(tmp_path, target_path)
 
 
@@ -287,11 +236,6 @@ def write_changeset_to_outbox(
 ) -> Path:
     """
     Persist a ChangeSet JSON into the OUTBOX directory atomically.
-
-    Args:
-        changeset: validated ChangeSet instance or dict (will be validated).
-        outbox_dir: optional directory override; default from settings.
-        filename: optional custom filename; otherwise auto-generated.
 
     Returns:
         Path to the created JSON file.
@@ -305,7 +249,6 @@ def write_changeset_to_outbox(
         name = filename or _build_filename(changeset)
         target = (out_dir / name).resolve()
 
-        # Ensure parent dir is really under outbox root (defense-in-depth)
         if out_dir not in target.parents:
             raise OutboxWriteError(f"Refusing to write outside of OUTBOX: {target}")
 
@@ -325,22 +268,20 @@ class SubmitOrFallbackResult:
     submitted: bool
     submit_result: Optional[SubmitResult]
     fallback_path: Optional[Path]
+    # Structured reason for the caller/UI (e.g., empty changeset)
+    reason: Optional[dict] = None
 
 
 async def _submit_async_via_any(
     changeset: ChangeSet,
     submitter: Any,
 ) -> SubmitResult:
-    """
-    Attempt submission using either async or sync submitter implementations.
-    """
-    # Async submitter (native coroutine method)
+    """Attempt submission using either async or sync submitter implementations."""
     if hasattr(submitter, "submit_changeset") and asyncio.iscoroutinefunction(
         getattr(submitter, "submit_changeset")
     ):
         return await submitter.submit_changeset(changeset)  # type: ignore[arg-type]
 
-    # Sync submitter; run in a worker thread to avoid blocking the event loop
     if hasattr(submitter, "submit_changeset"):
         def _call_sync() -> SubmitResult:
             return submitter.submit_changeset(changeset)  # type: ignore[arg-type]
@@ -360,13 +301,24 @@ async def submit_or_fallback(
     Try to submit the ChangeSet via the provided submitter; on failure (or if
     no submitter is given), persist it into the OUTBOX directory.
 
-    Args:
-        changeset: validated ChangeSet.
-        submitter: optional async/sync submitter with submit_changeset().
-        outbox_dir: override OUTBOX path.
-        require_success: if True, raise SubmitError on submission failure
-                         (no fallback). If False (default), fallback to outbox.
+    Special case:
+      - If the ChangeSet has 0 actions, do not submit or write. Return a structured reason.
     """
+    # Short-circuit: empty changeset → structured reason for UI (no IO)
+    if _get_actions_len(changeset) == 0:
+        reason = {
+            "code": "empty_changeset",
+            "message": "No actions to submit.",
+            "actions": 0,
+        }
+        logger.info("Empty ChangeSet: %s", reason)
+        return SubmitOrFallbackResult(
+            submitted=False,
+            submit_result=None,
+            fallback_path=None,
+            reason=reason,
+        )
+
     # Try online submit if submitter is present
     if submitter is not None:
         try:
@@ -378,9 +330,8 @@ async def submit_or_fallback(
                     submit_result.status_code,
                 )
                 return SubmitOrFallbackResult(
-                    submitted=True, submit_result=submit_result, fallback_path=None
+                    submitted=True, submit_result=submit_result, fallback_path=None, reason=None
                 )
-            # Submission attempted but failed
             err_msg = submit_result.error or f"submit failed (status={submit_result.status_code})"
             logger.warning("ChangeSet submission failed: %s", err_msg)
             if require_success:
@@ -391,8 +342,8 @@ async def submit_or_fallback(
             if require_success:
                 raise SubmitError(str(exc)) from exc
 
-    # Fallback to outbox
+    # Fallback to OUTBOX (authoritative path settings.tazila.outbox_path)
     path = write_changeset_to_outbox(changeset, outbox_dir=outbox_dir)
     return SubmitOrFallbackResult(
-        submitted=False, submit_result=None, fallback_path=path
+        submitted=False, submit_result=None, fallback_path=path, reason={"code": "queued_outbox", "path": str(path)}
     )

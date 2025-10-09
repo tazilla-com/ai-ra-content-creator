@@ -155,7 +155,7 @@ class BackendPort(Protocol):
 
     def assets_list(
         self,
-        org_id: str,
+        org_id: str | None = None,
         search: str | None = None,
         type: str | None = None,
         is_primary: bool | None = None,

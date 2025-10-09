@@ -1,32 +1,43 @@
 # File: workshops_ai/graph/factory.py
 # Purpose: Central LangGraph factory + lightweight DI for all tabs (assets | impacts | threats).
-# - Adds `llm_client` and `llm_temperature` to GraphDeps (keeps legacy `llm` for compatibility).
-# - Preserves checkpointer, memory (Redis-based), submit (online or OUTBOX).
-# - Exposes helpers to build per-turn LangGraph config (thread_id/checkpoint_ns).
-# - NEW: submitter passes outbox_dir=get_settings().tazila.outbox_path into submit_or_fallback(...)
-#        so ASSETS/IMPACTS/THREATS graphs store fallback uniformly.
+# - Single source of truth for building GraphDeps (used by manager + routers)
+# - Injects a centralized llm_client (forced to LangChain ChatOpenAI) and explicit llm_temperature
+# - Preserves checkpointer, Redis-backed ephemeral memory, and submit (online or OUTBOX)
+# - Exposes helpers to build per-turn LangGraph config (thread_id/checkpoint_ns)
+# - Ensures RAG retriever is wired consistently via the retriever factory
 
 from __future__ import annotations
 
+import logging
 import asyncio
 import atexit
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Protocol, Final, Awaitable
+from typing import Any, Callable, Optional, Protocol, Final
 
-# LangGraph type (soft-optional at import-time)
+# LangGraph type (soft-optional at import-time to avoid hard dependency in tests)
 try:  # pragma: no cover
     from langgraph.types import RunnableGraph  # type: ignore
 except Exception:  # pragma: no cover
     RunnableGraph = Any  # type: ignore[misc,assignment]
 
-# Optional redis client (ephemeral memory)
+# Optional redis client (for ephemeral memory)
 try:  # pragma: no cover
     from redis.asyncio import Redis as AsyncRedis  # type: ignore
 except Exception:  # pragma: no cover
     AsyncRedis = None  # type: ignore
 
-from workshops_ai.settings import get_settings
+from workshops_ai.settings import get_settings, AppSettings
 from workshops_ai.graph.checkpointer import make_checkpointer as _central_make_checkpointer
+
+# Central LLM client + RAG retriever
+# NOTE: We keep the import for consistency, but we no longer use the ad-hoc client maker.
+# OLD: from workshops_ai.llm.client import make_llm_client_from_settings
+# NEW: We force LangChain ChatOpenAI, configured from settings.
+from workshops_ai.llm.client import make_llm_client_from_settings  # nosec B101 (kept for backward compat, not used)
+from workshops_ai.rag.retriever import make_retriever as _rag_make_retriever
+
+# Enforce LangChain OpenAI chat model
+from langchain_openai import ChatOpenAI  # type: ignore
 
 # Submitter/outbox (online submit preferred, fallback to OUTBOX)
 from workshops_ai.app.services.outbox_writer import (
@@ -34,13 +45,14 @@ from workshops_ai.app.services.outbox_writer import (
     SubmitOrFallbackResult,
 )
 
-# Changeset model for type hints in submit callable
+# Changeset model (type hints for submit callable)
 from workshops_ai.models.changeset import ChangeSet
 
+logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Minimal retriever protocol + factory type
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 class Retriever(Protocol):
     """Minimal retriever interface used by 'explain' nodes inside graphs."""
@@ -51,13 +63,24 @@ class Retriever(Protocol):
 MakeRetriever = Callable[[str, str], Optional[Retriever]]
 
 
+# =============================================================================
 # Redis-backed ephemeral memory accessors (per-org/session)
+# =============================================================================
+# NOTE: Graph memory callers in our codebase are of two kinds:
+#   1) Rolling window KV adapter → calls get(key) / set(key, value, ttl=...)
+#   2) Manager/routers rich access → call with kwargs (org_id=..., thread_id=..., key=..., ...)
+# We therefore provide an adapter that supports BOTH forms.
+
 class MemoryGet(Protocol):
     async def __call__(self, key: str) -> Optional[str]: ...
+    # Runtime adapter also accepts keyword-only args:
+    #   memory_get(org_id=..., user_id=..., thread_id=..., namespace=..., key=...)
 
 
 class MemorySet(Protocol):
     async def __call__(self, key: str, value: str, *, ttl_sec: Optional[int] = None) -> None: ...
+    # Runtime adapter also accepts keyword-only args:
+    #   memory_set(org_id=..., user_id=..., thread_id=..., namespace=..., key=..., value=..., ttl_sec=...)
 
 
 # Submit callable protocol (graphs call this to persist mutations)
@@ -70,31 +93,32 @@ class SubmitChangeSet(Protocol):
     ) -> SubmitOrFallbackResult: ...
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Dependency bundle injected into each graph
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 @dataclass(frozen=True)
 class GraphDeps:
     """
     Dependency injection container for graphs.
 
-    Notes on LLM DI:
-    - Prefer `llm_client` (primary handle for tool-choice / chat completion).
+    LLM DI:
+    - Prefer `llm_client` (primary handle for tool-choice / chat completion),
+      forced to LangChain ChatOpenAI by the factory.
     - `llm_temperature` is provided separately to avoid coupling to any client type.
-    - Legacy `llm` is kept for backward compatibility with older agent nodes.
+    - `llm` is kept for backward compatibility with older agent nodes (avoid in new code).
     """
     backend_port: Any
     ws_hub: Any
     make_retriever: MakeRetriever
     checkpointer: Any
-    settings: Any
+    settings: AppSettings
     tab: str
 
     # --- LLM interfaces ---
-    llm_client: Any | None = None          # primary, preferred
-    llm_temperature: float | None = None   # preferred, explicit scalar
-    llm: Any | None = None                 # legacy (kept for compatibility)
+    llm_client: Any | None = None          # preferred (LangChain ChatOpenAI)
+    llm_temperature: float | None = None   # explicit scalar
+    llm: Any | None = None                 # legacy (avoid in new code)
 
     # Ephemeral memory helpers (Redis if configured, no-ops otherwise)
     memory_get: MemoryGet | None = None
@@ -107,9 +131,9 @@ class GraphDeps:
     checkpoint_ns: str | None = None
 
 
-# -----------------------------------------------------------------------------
-# Graph construction
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Graph construction (tab-aware dispatcher)
+# =============================================================================
 
 _SUPPORTED_TABS: Final[set[str]] = {"assets", "impacts", "threats"}
 
@@ -123,59 +147,169 @@ def build_graph(tab: str, deps: GraphDeps) -> RunnableGraph:
     """
     key = (tab or "").strip().lower()
     if key not in _SUPPORTED_TABS:
-        raise ValueError(
-            "Unsupported tab '{tab}'. Must be one of: assets, impacts, threats.".format(tab=tab)
-        )
+        raise ValueError(f"Unsupported tab '{key}'. Must be one of: assets, impacts, threats.")
 
-    # Localized imports to avoid import-time side effects and cycles.
+    # Lazy imports avoid import-time side effects and circular deps.
     if key == "assets":
         from workshops_ai.graph.asset_graph import create_graph  # type: ignore
     elif key == "impacts":
         from workshops_ai.graph.impact_graph import create_graph  # type: ignore
-    else:  # key == "threats"
+    else:  # "threats"
         from workshops_ai.graph.threat_graph import create_graph  # type: ignore
 
     graph = create_graph(deps)
     return graph
 
 
-# -----------------------------------------------------------------------------
-# Ephemeral memory (Redis), safe no-op fallback if Redis missing
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Helpers for memory adapters
+# =============================================================================
 
-def make_redis_memory(settings: Any):
+def _coerce_mem_args(*args, **kwargs) -> dict[str, Any]:
     """
-    Return (async) memory_get, memory_set functions backed by Redis if available,
-    else safe no-ops. Keys are stored under f"{checkpoint_ns}:mem:{key}".
+    Normalize arguments for memory_get/set adapter to support both calling styles.
+
+    Returns a dict:
+      {
+        "mode": "simple" | "rich",
+        "key": str,
+        "value": str,
+        "ttl": Optional[int],
+        "org_id": str, "user_id": Optional[str], "thread_id": str, "namespace": str
+      }
     """
+    # SIMPLE positional: get(key) / set(key, value, ttl=?)
+    if args and isinstance(args[0], str) and not {"org_id", "thread_id", "namespace", "key"} & set(kwargs):
+        key = args[0]
+        value = args[1] if len(args) > 1 else kwargs.get("value", "")
+        ttl = kwargs.get("ttl", kwargs.get("ttl_sec", None))
+        return {
+            "mode": "simple",
+            "key": key,
+            "value": value,
+            "ttl": ttl,
+            "org_id": "",
+            "user_id": None,
+            "thread_id": "",
+            "namespace": "mem",
+        }
+
+    # SIMPLE keyword: get(key="...") / set(key="...", value="...", ttl=?)
+    if "key" in kwargs and not {"org_id", "thread_id", "namespace"} & set(kwargs):
+        return {
+            "mode": "simple",
+            "key": kwargs.get("key", ""),
+            "value": kwargs.get("value", ""),
+            "ttl": kwargs.get("ttl", kwargs.get("ttl_sec", None)),
+            "org_id": "",
+            "user_id": None,
+            "thread_id": "",
+            "namespace": "mem",
+        }
+
+    # RICH keyword form
+    return {
+        "mode": "rich",
+        "key": kwargs.get("key", ""),
+        "value": kwargs.get("value", ""),
+        "ttl": kwargs.get("ttl_sec", kwargs.get("ttl", None)),
+        "org_id": kwargs.get("org_id", ""),
+        "user_id": kwargs.get("user_id"),
+        "thread_id": kwargs.get("thread_id", ""),
+        "namespace": kwargs.get("namespace", "mem"),
+    }
+
+
+# =============================================================================
+# Ephemeral memory (Redis), safe no-op fallback if Redis missing
+# =============================================================================
+
+def make_redis_memory(settings: AppSettings):
+    """
+    Return (async) memory_get, memory_set functions.
+
+    Manager/routers may call with rich kwargs:
+      memory_get(org_id=..., user_id=..., thread_id=..., namespace=..., key=...)
+      memory_set(org_id=..., user_id=..., thread_id=..., namespace=..., key=..., value=..., ttl_sec=...)
+
+    Rolling window adapters call with simple positional/keyword:
+      get(key), set(key, value, ttl=?)
+
+    We support both. If Redis is unavailable, return no-op coroutines with the same API.
+    """
+    # Resolve Redis URL from settings
     redis_url = getattr(settings, "redis_url", None) or getattr(
         getattr(settings, "redis", None), "url", None
     )
+    # Use the checkpoint namespace as a stable prefix to avoid collisions across envs
     ns = getattr(settings, "checkpoint_ns", None) or "lg:ckpt"
 
+    # ------------------------------
+    # No Redis available → no-op API
+    # ------------------------------
     if not redis_url or AsyncRedis is None:
-        async def _get(_key: str) -> Optional[str]:
+        async def memory_get_noop(*args, **kwargs) -> Optional[str]:
+            # Accept both calling styles; always return None
+            _ = _coerce_mem_args(*args, **kwargs)
             return None
 
-        async def _set(_key: str, _value: str, *, ttl_sec: Optional[int] = None) -> None:
+        async def memory_set_noop(*args, **kwargs) -> None:
+            # Accept both calling styles; do nothing
+            _ = _coerce_mem_args(*args, **kwargs)
             return None
 
-        return _get, _set
+        return memory_get_noop, memory_set_noop
 
+    # ------------------------------
+    # Redis-backed implementation
+    # ------------------------------
     client = AsyncRedis.from_url(redis_url, decode_responses=True)
 
-    async def memory_get(key: str) -> Optional[str]:
-        return await client.get(f"{ns}:mem:{key}")
+    def _compose_key(*, org_id: str, user_id: str | None, thread_id: str, namespace: str, key: str) -> str:
+        uid = (user_id or "anon").strip() or "anon"
+        # Structure: <ckpt-ns>:mem:<org>:<thread>:<user>:<namespace>:<key>
+        return f"{ns}:mem:{org_id}:{thread_id}:{uid}:{namespace}:{key}"
 
-    async def memory_set(key: str, value: str, *, ttl_sec: Optional[int] = None) -> None:
-        k = f"{ns}:mem:{key}"
-        if ttl_sec and ttl_sec > 0:
-            await client.setex(k, ttl_sec, value)
+    async def memory_get(*args, **kwargs) -> Optional[str]:
+        fields = _coerce_mem_args(*args, **kwargs)
+        if fields["mode"] == "simple":
+            # The simple form already passes a fully-composed key (produced by RollingWindowMemory)
+            return await client.get(fields["key"])
+        # Rich form → we compose a deterministic key
+        k = _compose_key(
+            org_id=fields["org_id"],
+            user_id=fields["user_id"],
+            thread_id=fields["thread_id"],
+            namespace=fields["namespace"],
+            key=fields["key"],
+        )
+        return await client.get(k)
+
+    async def memory_set(*args, **kwargs) -> None:
+        fields = _coerce_mem_args(*args, **kwargs)
+        if fields["mode"] == "simple":
+            ttl = fields["ttl"]
+            if ttl and int(ttl) > 0:
+                await client.setex(fields["key"], int(ttl), fields["value"])
+            else:
+                await client.set(fields["key"], fields["value"])
+            return
+
+        k = _compose_key(
+            org_id=fields["org_id"],
+            user_id=fields["user_id"],
+            thread_id=fields["thread_id"],
+            namespace=fields["namespace"],
+            key=fields["key"],
+        )
+        ttl = fields["ttl"]
+        if ttl and int(ttl) > 0:
+            await client.setex(k, int(ttl), fields["value"])
         else:
-            await client.set(k, value)
+            await client.set(k, fields["value"])
 
     # Close client on interpreter exit (best-effort)
-    def _finalizer():
+    def _finalizer() -> None:
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -183,26 +317,26 @@ def make_redis_memory(settings: Any):
             else:
                 loop.run_until_complete(client.close())
         except Exception:
+            # Swallow any shutdown errors
             pass
 
     atexit.register(_finalizer)
     return memory_get, memory_set
 
 
-# -----------------------------------------------------------------------------
-# Helper: build submit_changeset callable
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Helper: build submit_changeset callable (online → fallback OUTBOX)
+# =============================================================================
 
-def _make_submit_callable(settings: Any) -> SubmitChangeSet:
+def _make_submit_callable(settings: AppSettings) -> SubmitChangeSet:
     """
     Returns a callable that tries to submit to the primary backend
     (if an API client is available), otherwise falls back to writing
     into the OUTBOX directory via submit_or_fallback().
 
-    IMPORTANT: The fallback outbox_dir is taken from settings.tazila.outbox_path
-               so all tabs (ASSETS/IMPACTS/THREATS) store uniformly.
+    The fallback outbox_dir is taken from settings.tazila.outbox_path
+    so all tabs (ASSETS/IMPACTS/THREATS) store uniformly.
     """
-    # Try to locate an online submitter client (optional)
     submitter: Any = None
     try:
         from workshops_ai.app.services.tazila_client import get_client  # type: ignore
@@ -210,11 +344,7 @@ def _make_submit_callable(settings: Any) -> SubmitChangeSet:
     except Exception:
         submitter = None
 
-    # Resolve configured OUTBOX directory once and capture it in the closure
-    try:
-        outbox_dir = getattr(getattr(settings, "tazila", object()), "outbox_path", None)
-    except Exception:
-        outbox_dir = None
+    outbox_dir = getattr(getattr(settings, "tazila", object()), "outbox_path", None)
 
     async def _submit(
         changeset: ChangeSet,
@@ -225,78 +355,24 @@ def _make_submit_callable(settings: Any) -> SubmitChangeSet:
             changeset,
             submitter=submitter,
             require_success=require_success,
-            outbox_dir=outbox_dir,  # << pass configured OUTBOX for uniform fallback
+            outbox_dir=outbox_dir,
         )
 
     return _submit
 
 
-# -----------------------------------------------------------------------------
-# Optional LLM provider resolution (soft dependencies)
-# -----------------------------------------------------------------------------
-
-def _resolve_llm_from_settings(s: Any) -> tuple[Any | None, float | None, Any | None]:
-    """
-    Resolve (llm_client, llm_temperature, legacy_llm) from settings or optional providers.
-    - First, try provider modules (if present).
-    - Then, fall back to settings fields like: s.llm_client / s.llm.temperature / s.llm.
-    - Finally, None/None/None if nothing is configured.
-    """
-    # Provider 1: app/services/llm_client
-    try:
-        from workshops_ai.app.services.llm_client import get_client, get_default_temperature  # type: ignore
-        client = get_client()
-        temp = None
-        try:
-            temp = float(get_default_temperature())  # type: ignore[arg-type]
-        except Exception:
-            temp = None
-        return client, temp, None
-    except Exception:
-        pass
-
-    # Provider 2: llm/provider
-    try:
-        from workshops_ai.llm.provider import get_llm_client, get_temperature, get_legacy_llm  # type: ignore
-        client = get_llm_client()
-        temp = None
-        try:
-            temp = float(get_temperature())  # type: ignore[arg-type]
-        except Exception:
-            temp = None
-        legacy = None
-        try:
-            legacy = get_legacy_llm()
-        except Exception:
-            legacy = None
-        return client, temp, legacy
-    except Exception:
-        pass
-
-    # Settings: direct attributes
-    client = getattr(s, "llm_client", None)
-    temp = getattr(s, "llm_temperature", None)
-    legacy = getattr(s, "llm", None)
-    try:
-        if temp is None and hasattr(getattr(s, "llm", None), "temperature"):
-            temp = float(getattr(s.llm, "temperature"))  # type: ignore[call-overload]
-    except Exception:
-        pass
-    return client, (float(temp) if isinstance(temp, (int, float)) else None), legacy
-
-
-# -----------------------------------------------------------------------------
-# Default dependencies factory
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Default dependencies factory (used by manager and routers)
+# =============================================================================
 
 def make_default_deps(
     tab: str | None = None,
     *,
-    settings: Any | None = None,
+    settings: AppSettings | None = None,
     backend_port: Any | None = None,
     ws_hub: Any | None = None,
     make_retriever: Optional[MakeRetriever] = None,
-    # --- LLM DI (new) ---
+    # --- LLM DI (preferred) ---
     llm_client: Any | None = None,
     llm_temperature: float | None = None,
     # legacy LLM handle (kept to avoid breaking older graphs)
@@ -309,24 +385,17 @@ def make_default_deps(
     """
     Build a minimal, safe set of dependencies for graph compilation/execution.
 
-    Provided:
-      - settings           : loaded via get_settings() if not provided
-      - checkpointer       : Redis/SQLite/Memory per settings (built internally)
-      - backend_port       : CSV/API backend if available (can be None; graphs should degrade)
-      - ws_hub             : optional; graphs should not hard-depend on it
-      - make_retriever     : RAG retriever factory (optional; graphs degrade to LLM fallback)
-      - llm_client         : primary LLM handle (preferred for agent/tool-choice)
-      - llm_temperature    : optional scalar temperature; do not rely on client internals
-      - llm                : legacy handle (maintain compatibility)
-      - memory_get/set     : Redis-based ephemeral helpers when redis_url is set; else no-op
-      - submit_changeset   : async callable performing online submit or OUTBOX fallback
+    CHANGE:
+    - We *always* construct a LangChain `ChatOpenAI` from settings and inject it as `llm_client`.
+      Any ad-hoc/legacy client is ignored to keep graphs clean and consistent.
     """
+    # Settings first (manager may pass settings; routers often pass app.state.settings)
     s = settings or get_settings()
 
-    # Checkpointer from the centralized builder (robust across versions)
+    # Central checkpointer (redis/sqlite/memory per settings)
     saver = _central_make_checkpointer(settings=s)
 
-    # Backend (allow external injection; otherwise try provider → CSV fallback)
+    # Backend port (prefer provider, fallback to CSV, else None)
     if backend_port is None:
         try:
             from workshops_ai.backend.provider import get_backend_port  # type: ignore
@@ -338,16 +407,16 @@ def make_default_deps(
             except Exception:
                 backend_port = None
 
-    # WS hub: optional; graphs should not hard-depend on it
+    # WS hub passthrough (optional)
     ws = ws_hub
 
-    # Retriever factory (optional)
+    # Retriever factory (default to our RAG retriever)
     if make_retriever is None:
-        def _none_retriever(_org_id: str, _tab: str) -> Optional[Retriever]:
-            return None
-        make_retriever = _none_retriever
+        def _default_make_retriever(org_id: str, tab: str) -> Optional[Retriever]:
+            return _rag_make_retriever(org_id=org_id, tab=tab)
+        make_retriever = _default_make_retriever
 
-    # Ephemeral memory (Redis if configured; otherwise no-op)
+    # Ephemeral memory (Redis if configured; else no-op)
     if memory_get is None or memory_set is None:
         mget, mset = make_redis_memory(s)
         memory_get = memory_get or mget
@@ -357,18 +426,42 @@ def make_default_deps(
     if submit_changeset is None:
         submit_changeset = _make_submit_callable(s)
 
-    # LLM DI resolution:
-    # - If caller didn't pass llm_client/temperature/legacy, try to resolve from settings/providers.
-    if llm_client is None and llm_temperature is None and llm is None:
-        res_client, res_temp, res_legacy = _resolve_llm_from_settings(s)
-        llm_client = res_client
-        llm_temperature = res_temp
-        llm = llm if llm is not None else res_legacy
+    # Force LangChain ChatOpenAI from settings; do not rely on external clients.
+    if llm_temperature is None:
+        llm_temperature = float(getattr(getattr(s, "llm", object()), "temperature", 0.2))
 
-    # Surface checkpoint namespace (from flat settings first; allow nested fallback)
-    ns = getattr(s, "checkpoint_ns", None)
-    if not ns:
-        ns = getattr(getattr(s, "checkpointer", object()), "namespace", None)
+    model = getattr(getattr(s, "llm", object()), "model", None)
+    api_key = getattr(getattr(s, "llm", object()), "api_key", None) or getattr(s, "openai_api_key", None)
+    base_url = getattr(getattr(s, "llm", object()), "base_url", None) or getattr(s, "openai_base_url", None)
+    http_timeout = getattr(getattr(s, "llm", object()), "http_timeout_sec", None)
+    max_retries = getattr(getattr(s, "llm", object()), "openai_max_retries", None)
+
+    if not model or not api_key:
+        raise RuntimeError("ChatOpenAI cannot be constructed: missing llm.model or API key in settings.")
+
+    # Construct ChatOpenAI using settings (model, api_key, base_url, temperature, timeout, max_retries)
+    llm_client = ChatOpenAI(  # type: ignore[call-arg]
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=llm_temperature,
+        timeout=http_timeout,
+        max_retries=max_retries,
+    )
+
+    # One-time wiring log for the LLM client (best-effort)
+    try:
+        logger.info(
+            "LLM client wired (LangChain ChatOpenAI): model=%s, base_url=%s, temperature=%s",
+            model,
+            base_url,
+            llm_temperature,
+        )
+    except Exception:
+        pass
+
+    # Expose checkpoint namespace (helps routers/tests pass it to LangGraph)
+    ns = getattr(s, "checkpoint_ns", None) or getattr(getattr(s, "checkpointer", object()), "namespace", None)
 
     return GraphDeps(
         backend_port=backend_port,
@@ -378,20 +471,39 @@ def make_default_deps(
         settings=s,
         tab=(tab or "").lower() if tab else "",
         # --- LLM DI (preferred + legacy) ---
-        llm_client=llm_client,
+        llm_client=llm_client,             # guaranteed ChatOpenAI
         llm_temperature=llm_temperature,
-        llm=llm,
+        llm=llm,                           # legacy passthrough (avoid using in new code)
         # --- Memory + submit ---
-        memory_get=memory_get,
-        memory_set=memory_set,
+        memory_get=memory_get,             # rich-kwargs + simple positional adapter (or no-op)
+        memory_set=memory_set,             # rich-kwargs + simple positional adapter (or no-op)
         submit_changeset=submit_changeset,
         checkpoint_ns=ns,
     )
 
 
-# -----------------------------------------------------------------------------
+def get_graph_deps(
+    *,
+    tab: str | None = None,
+    settings: AppSettings | None = None,
+    backend_port: Any | None = None,
+    ws_hub: Any | None = None,
+) -> GraphDeps:
+    """
+    Router/manager-facing name expected across the codebase.
+    Thin wrapper over make_default_deps(...) to keep one source of truth.
+    """
+    return make_default_deps(
+        tab=tab,
+        settings=settings,
+        backend_port=backend_port,
+        ws_hub=ws_hub,
+    )
+
+
+# =============================================================================
 # Invoke helpers with timeout (support optional 'config'), robust async→sync fallback
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 async def _invoke_async(graph: RunnableGraph, inputs: Any, config: Optional[dict]) -> Any:
     """Always prefer async. Do NOT fallback to sync for graphs with async-only nodes."""
@@ -431,9 +543,9 @@ def invoke_with_timeout(
     return asyncio.run(ainvoke_with_timeout(graph, inputs, timeout=timeout, config=config))
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Utility: build the LangGraph 'configurable' dict (thread_id/namespace)
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 def make_langgraph_config(
     *,
@@ -441,7 +553,7 @@ def make_langgraph_config(
     tab: str,
     user_id: str | None,
     deps: GraphDeps,
-    user_lang: Optional[str] = None,   # NEW: optionally forward language to graph config
+    user_lang: Optional[str] = None,
 ) -> dict:
     """
     Compose a LangGraph config with required 'configurable' keys for the checkpointer.
@@ -454,22 +566,21 @@ def make_langgraph_config(
     cfg["configurable"]["thread_id"] = f"{org_id}:{tab}:{user}"
     if deps.checkpoint_ns:
         cfg["configurable"]["checkpoint_ns"] = deps.checkpoint_ns
-    # Keep this optional; graphs can read it via config["configurable"].get("user_lang")
     if user_lang:
         cfg["configurable"]["user_lang"] = user_lang.lower().strip()
     return cfg
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Compatibility alias (accepts optional argument)
-# -----------------------------------------------------------------------------
+# =============================================================================
 
-def build_checkpointer(settings: Any | None = None) -> Any:
+def build_checkpointer(settings: AppSettings | None = None) -> Any:
     """
     Compatibility wrapper.
     - If called as build_checkpointer() -> uses get_settings() internally.
-    - If called as build_checkpointer(settings) or build_checkpointer(settings=...)
-      -> forwards to the centralized builder.
+    - If called as build_checkpointer(settings) or build_checkpointer(settings=...),
+      forwards to the centralized builder.
     """
     if settings is None:
         settings = get_settings()
@@ -486,6 +597,7 @@ __all__ = [
     "invoke_with_timeout",
     "make_redis_memory",
     "make_default_deps",
+    "get_graph_deps",
     "make_langgraph_config",
     "build_checkpointer",
 ]

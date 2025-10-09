@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os  # [ADD] env-based defaults for staging
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
@@ -59,6 +60,24 @@ WS_EVENT_TIMEOUT_S: int = int(_settings.ws.timeout_sec)
 # Cookie name used by SessionMiddleware for session id
 COOKIE_NAME = "wsai.sid"
 
+# -----------------------------------------------------------------------------
+# [ADD] Small helper to parse boolean env flags consistently
+# -----------------------------------------------------------------------------
+def _env_bool(name: str, default: bool) -> bool:
+    """
+    Read a boolean from env with common truthy strings. Falls back to default.
+    Examples of truthy: "1", "true", "yes", "on" (case-insensitive).
+    """
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "on"}
+
+# [ADD] Default staging behavior:
+# In dev we typically want staging on by default so write tools can run.
+# Can be overridden by exporting WS_DEFAULT_STAGING=0/false to disable.
+DEFAULT_STAGING: bool = _env_bool("WS_DEFAULT_STAGING", True)
+
 
 # ------------------------------ Inbound schema --------------------------------
 class InboundEvent(BaseModel):
@@ -97,6 +116,8 @@ class Conn:
     sid: Optional[str] = None
     # Correlation id captured at connect time (echoed in error frames)
     request_id: str = "n/a"
+    # [ADD] Staging toggle (read/write gating). We seed at connect time.
+    staging: bool = True
 
 
 # --------------------------------- Helpers ------------------------------------
@@ -190,7 +211,7 @@ async def ws_endpoint(
 
     # Security validation BEFORE accept() to reject early if unauthorized
     auth_ok = await verify_ws_auth(ws)
-    if not auth_ok:   
+    if not auth_ok:
         return
     # Accept the connection after passing security
     await ws.accept()
@@ -204,7 +225,15 @@ async def ws_endpoint(
     # Capture correlation id right after we accept
     rid = get_request_id() or "n/a"
 
-    state = Conn(org_id=org_id, user_id=user_id, active_tab=active_tab, sid=sid, request_id=rid)
+    # [ADD] Seed staging from env default at connect time (no behavior removed/changed elsewhere)
+    state = Conn(
+        org_id=org_id,
+        user_id=user_id,
+        active_tab=active_tab,
+        sid=sid,
+        request_id=rid,
+        staging=DEFAULT_STAGING,  # <— the only semantic change vs previous hardcoded False
+    )
 
     # Initial hello (+ info about broadcast mode)
     await _ws_send(
@@ -219,6 +248,8 @@ async def ws_endpoint(
             "user_id": state.user_id,
             "sid": state.sid,
             "agent_events": {"subscribed": True, "mode": "raw_json"},
+            # [ADD] expose current staging so client can show proper banner/toggle
+            "staging": state.staging,
         },
     )
 
@@ -303,7 +334,11 @@ async def ws_endpoint(
                         await _ws_error(ws, "Empty message for 'chat' event", conn_id=state.conn_id, state=state)
                         continue
 
-                    ui_req = _build_ui_request(state, text, staging=False)
+                    # -----------------------------------------------------------------
+                    # IMPORTANT CHANGE:
+                    # all WRITE tools. We now forward the connection's staging flag.
+                    # -----------------------------------------------------------------
+                    ui_req = _build_ui_request(state, text, staging=state.staging)
 
                     await _ws_send(
                         ws,

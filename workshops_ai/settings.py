@@ -194,14 +194,16 @@ class LLMSettings(BaseModel):
       WORKSHOPS_AI_LLM__TEMPERATURE=0.2
       WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC=60
       WORKSHOPS_AI_LLM__OPENAI_MAX_RETRIES=3
+      WORKSHOPS_AI_LLM__API_KEY=sk-...
 
     Legacy (flat) ENV handled in AppSettings.model_post_init():
-      LLM_MODEL, LLM_TEMPERATURE
+      LLM_MODEL, LLM_TEMPERATURE, OPENAI_API_KEY
     """
     model: str = "gpt-4o-mini"
     temperature: float = 0.2
     http_timeout_sec: int = 60
     openai_max_retries: int = 3
+    api_key: Optional[str] = None
 
 
 class ChatSettings(BaseModel):
@@ -435,6 +437,7 @@ class AppSettings(BaseSettings):
     # LLM legacy flat
     llm_model_flat: Optional[str] = Field(default=None, validation_alias="LLM_MODEL")
     llm_temperature_flat: Optional[float] = Field(default=None, validation_alias="LLM_TEMPERATURE")
+    openai_api_key_flat: Optional[str] = Field(default=None, validation_alias="OPENAI_API_KEY")
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -543,12 +546,12 @@ class AppSettings(BaseSettings):
         if self.llm_model_flat:
             self.llm.model = self.llm_model_flat
         if self.llm_temperature_flat is not None:
-            # pydantic already coerces to float; keep as-is
             self.llm.temperature = float(self.llm_temperature_flat)
+        if self.openai_api_key_flat:
+            self.llm.api_key = self.openai_api_key_flat
 
         # RAG back-compat: prefer chroma_dir if provided
         if self.rag.chroma_dir:
-            # keep both but ensure effective_index_dir() uses chroma_dir
             pass
 
 

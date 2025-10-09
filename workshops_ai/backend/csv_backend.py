@@ -24,14 +24,15 @@
 #     (when explicitly requested) and for explain/list operations.
 
 from __future__ import annotations
-
+import secrets
+import time
 import csv
 import uuid
 from uuid import UUID
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence, Optional
-
+from workshops_ai.utils.compat import accepts_org_id_kw
 from pydantic import ValidationError
 
 from workshops_ai.backend.port import (
@@ -135,60 +136,44 @@ _CAT_IMPACT_X_CATEGORY_FILE = _CAT_DIR / "Impact x Impact category.csv"
 # UUID helpers: map any string asset id -> deterministic UUIDv5 (stable across runs)
 # --------------------------------------------------------------------------------------
 
-def _uuid_namespace_from_settings() -> UUID:
-    """
-    Use settings.rag.uuid5_namespace if valid, otherwise a fixed, private fallback.
-    The fallback is constant so IDs remain deterministic across environments.
-    """
-    try:
-        ns = str(get_settings().rag.uuid5_namespace or "").strip()
-        if ns:
-            return UUID(ns)
-    except Exception:
-        pass
-    return UUID("00000000-0000-5000-a000-000000000000")
-
-
-_NS_UUID5 = _uuid_namespace_from_settings()
-
-
-def _uuid5_for_asset_id(raw_id: str) -> UUID:
-    """
-    Deterministically map any arbitrary asset identifier to UUIDv5.
-    If `raw_id` is already a UUID string, return that UUID.
-    """
-    if not raw_id:
-        return uuid.uuid5(_NS_UUID5, "asset:")
-    try:
-        return UUID(raw_id)
-    except Exception:
-        return uuid.uuid5(_NS_UUID5, f"asset:{raw_id}")
-
-
 def _id_matches(row_id: str, query_id: str) -> bool:
     """
     True iff:
-      - exact string match, OR
-      - UUIDv5(row_id) equals query_id (parsed as UUID), OR
-      - query_id parses as UUID and equals row_id parsed as UUID (if row_id itself is UUID text)
+      - přesná shoda stringů, nebo
+      - oba jdou parsovat jako UUID a jsou rovné
     """
     if not row_id or not query_id:
         return False
     if row_id == query_id:
         return True
     try:
-        q_uuid = UUID(query_id)
+        return UUID(row_id) == UUID(query_id)
     except Exception:
-        q_uuid = None
-    try:
-        r_uuid = UUID(row_id)
-    except Exception:
-        r_uuid = None
-    if r_uuid and q_uuid and r_uuid == q_uuid:
-        return True
-    if q_uuid and _uuid5_for_asset_id(row_id) == q_uuid:
-        return True
-    return False
+        return False
+
+
+def _uuid7_str() -> str:
+    """
+    Generate a UUIDv7 per draft-ietf-uuidrev-rfc4122bis:
+      - 48 bits: unix time in milliseconds
+      - 4  bits: version (0b0111)
+      - 12 bits: rand_a
+      - 2  bits: variant (0b10)
+      - 62 bits: rand_b
+    """
+    ts_ms = int(time.time_ns() // 1_000_000) & ((1 << 48) - 1)
+    rand_a = secrets.randbits(12)
+    rand_b = secrets.randbits(62)
+
+    value = (
+        (ts_ms << (4 + 12 + 2 + 62)) |   # timestamp
+        (0x7 << (12 + 2 + 62))       |   # version (7)
+        (rand_a << (2 + 62))         |   # rand_a
+        (0b10 << 62)                 |   # variant (RFC 4122)
+        rand_b                           # rand_b
+    )
+    return str(UUID(int=value))
+
 
 # --------------------------------------------------------------------------------------
 # CSV helpers with mtime-based reload (encoding & delimiter tolerant)
@@ -640,22 +625,22 @@ def _build_asset_with_cia_fallback(payload: dict[str, Any]) -> Asset:
     - Map numeric CIA → canonical enums.
     Always returns `Asset`.
     """
-    import uuid
 
-    def _uuid_or_none(v: Any) -> str | None:
+    def _uuid_v7_or_none(v: Any) -> Optional[str]:
         if v is None:
             return None
         s = str(v).strip()
         if not s:
             return None
         try:
-            return str(uuid.UUID(s))
+            u = UUID(s)
+            return str(u) if getattr(u, "version", None) == 7 else None
         except Exception:
             return None
 
     # 0) normalize ID up-front
     base = dict(payload)
-    base["id"] = _uuid_or_none(base.get("id"))
+    base["id"] = _uuid_v7_or_none(base.get("id"))
 
     # 1) optimistic 
     try:
@@ -717,13 +702,14 @@ class _AssetsState:
 
         out: list[Asset] = []
         for r in rows:
+            if org_id:
+                org_raw = r.get("org_id") or r.get("org") or r.get("Org")
+                org_row = org_raw.strip() if isinstance(org_raw, str) else ""
+                if org_row != org_id:
+                    continue
             try:
                 a = _asset_from_row(r, catalogs=self.catalogs)
             except BackendValidationError:
-                continue
-
-            # org filter
-            if org_id and (getattr(a, "org_id", None) or "") != org_id:
                 continue
 
             # explicit type filter (exact string match on the asset's value)
@@ -836,7 +822,13 @@ def _asset_from_row(row: Mapping[str, str], *, catalogs: _Catalogs) -> Asset:
     name = (row.get("name") or row.get("Name") or "").strip()
     description_raw = row.get("description") or row.get("Description")
     description = description_raw.strip() if isinstance(description_raw, str) else None
-
+    if id_:
+        try:
+            u = UUID(id_)
+            if getattr(u, "version", None) != 7:
+                telemetry_log("asset.id_non_v7", {"id": id_}, level="WARN")
+        except Exception:
+            telemetry_log("asset.id_invalid", {"id": id_}, level="WARN")
     is_primary = _parse_bool(
         row.get("isPrimary") or row.get("is_primary") or row.get("primary") or row.get("Is primary")
     )
@@ -854,8 +846,6 @@ def _asset_from_row(row: Mapping[str, str], *, catalogs: _Catalogs) -> Asset:
         or ""
     ).strip()
 
-    org_id_raw = row.get("org_id") or row.get("org") or row.get("Org")
-    org_id = org_id_raw.strip() if isinstance(org_id_raw, str) else None
 
     if not id_ or not name or not asset_type:
         raise BackendValidationError("Asset row missing mandatory fields (id, name, assetType).")
@@ -882,7 +872,6 @@ def _asset_from_row(row: Mapping[str, str], *, catalogs: _Catalogs) -> Asset:
         "integrity": i,
         "availability": a,
         "assetType": asset_type,
-        "org_id": org_id,
     }
 
     try:
@@ -911,12 +900,35 @@ class CsvBackend(BackendPort):
 
     # ---- Catalog helpers ----
 
+    @accepts_org_id_kw
     def list_asset_types(self) -> list[str]:
         return self._catalogs.list_asset_types()
 
+    @accepts_org_id_kw
     def list_threat_categories(self) -> list[str]:
         return self._catalogs.list_threat_categories()
 
+        # For op="impact.list"
+    @accepts_org_id_kw
+    def impact_defs_list(self, *, category: str | None = None) -> list[dict[str, Any]]:
+        return self.list_impact_defs() if category is None else self._catalogs.list_impacts(q=None, category=category)
+
+    # For op="threat.list"
+    @accepts_org_id_kw
+    def threat_defs_list(self, *, apply_asset_type: str | None = None, category: str | None = None) -> list[dict[str, Any]]:
+        return self._catalogs.list_threats(q=None, category=category, apply_asset_type=apply_asset_type)
+
+    # For op="impact.set_level" (name se v graphu mapuje na code; backend pracuje s code)
+    @accepts_org_id_kw
+    def impact_set_level(self, asset_id: str, *, impact_code: str, impact_level: int, note: str | None = None) -> dict:
+        return self.set_asset_impact_level(asset_id, code=impact_code, level=int(impact_level), note=note)
+
+    # For op="threat.set_probability"
+    @accepts_org_id_kw
+    def threat_set_probability(self, asset_id: str, *, threat_code: str, probability: int, note: str | None = None) -> dict:
+        return self.set_asset_threat_level(asset_id, code=threat_code, level=int(probability), note=note)
+
+    @accepts_org_id_kw
     def list_threats(self, apply_asset_type: str | None = None, **kwargs) -> list[dict[str, Any]]:
         """
         Return detailed threats with optional filters.
@@ -928,9 +940,11 @@ class CsvBackend(BackendPort):
         category = kwargs.get("category")
         return self._catalogs.list_threats(q=q, category=category, apply_asset_type=apply_asset_type)
 
+    @accepts_org_id_kw
     def threat_detail(self, code: str) -> dict[str, Any] | None:
         return self._catalogs.threat_detail(code)
 
+    @accepts_org_id_kw
     def list_impacts(self, category: str | None = None) -> list[dict[str, Any]]:
         """Return detailed impacts from catalog with optional category filter."""
         return self._catalogs.list_impacts(q=None, category=category)
@@ -944,52 +958,56 @@ class CsvBackend(BackendPort):
 
     # ---- State (read) ----
 
+    @accepts_org_id_kw
     def assets_list(
         self,
-        org_id: str,
+        org_id: str | None = None,
         search: str | None = None,
         type: str | None = None,
         is_primary: bool | None = None,
     ) -> Sequence[Asset]:
-        if not org_id:
-            raise BackendValidationError("org_id is required")
         return self._assets.list(org_id, search, type, is_primary)
 
+    @accepts_org_id_kw
     def asset_get(self, asset_id: str) -> Asset | None:
         if not asset_id:
             raise BackendValidationError("asset_id is required")
         return self._assets.get(asset_id)
 
+    @accepts_org_id_kw
     def asset_get_impacts(self, asset_id: str) -> list[Mapping[str, object]]:
         if not asset_id:
             raise BackendValidationError("asset_id is required")
         # optional state file; returns [] if missing/empty
         return self._assets.get_impacts(asset_id)
 
+    @accepts_org_id_kw
     def asset_get_risks(self, asset_id: str) -> list[Mapping[str, object]]:
         if not asset_id:
             raise BackendValidationError("asset_id is required")
         # optional state file; returns [] if missing/empty
         return self._assets.get_risks(asset_id)
 
+    @accepts_org_id_kw
     def asset_get_controls(self, asset_id: str) -> list[Mapping[str, object]]:
         # Not tracked in CSV MVP
         return []
 
      # ---- Minimal WRITE API over state/*.csv ---------------------------------
 
+    @accepts_org_id_kw
     def create_asset(self, name: str, type: str | None = None, *, org_id: str | None = None,
                      description: str | None = None, is_primary: bool | None = None) -> dict:
         """
         Append a new asset into data/state/assets.csv.
-        - Generates a UUIDv4 for 'id'
+        - Generates a UUIDv7 for 'id'
         - CIA left empty (None) unless you later update
         - assetType validated only softly (catalogs are advisory; do not block)
         """
         if not name:
             raise BackendValidationError("Asset name is required")
 
-        new_id = str(uuid.uuid4())
+        new_id = _uuid7_str()
         rows = _load_state_rows(_ASSETS_STATE_FILE)
 
         # soft validation: warn when type not in catalogs
@@ -1024,6 +1042,7 @@ class CsvBackend(BackendPort):
         # Return a minimal DTO-like dict (not pydantic instance on purpose)
         return dict(row)
 
+    @accepts_org_id_kw
     def update_asset(self, asset_id: str, **fields) -> dict:
         """
         Update an existing asset row by 'id'. Accepts any of:
@@ -1066,14 +1085,17 @@ class CsvBackend(BackendPort):
                 return dict(r)
         return {}
 
+    @accepts_org_id_kw
     def list_impact_defs(self) -> list[dict[str, Any]]:
         """Read-only impact definitions from catalogs (dropdown source)."""
         return self._catalogs.list_impacts(q=None, category=None)
 
+    @accepts_org_id_kw
     def list_threat_defs(self, apply_asset_type: str | None = None) -> list[dict[str, Any]]:
         """Read-only threat definitions from catalogs (dropdown source)."""
         return self._catalogs.list_threats(q=None, category=None, apply_asset_type=apply_asset_type)
 
+    @accepts_org_id_kw
     def create_impact_def(self, code: str, *, name: str | None = None,
                           category: str | None = None, description: str | None = None) -> dict:
         """
@@ -1082,11 +1104,13 @@ class CsvBackend(BackendPort):
         """
         raise BackendConflict("CSV catalogs are read-only; impact definitions cannot be created here.")
 
+    @accepts_org_id_kw
     def create_threat_def(self, code: str, *, name: str | None = None,
                           category: str | None = None, description: str | None = None) -> dict:
         """Same policy as create_impact_def: no write to catalogs in CSV backend."""
         raise BackendConflict("CSV catalogs are read-only; threat definitions cannot be created here.")
 
+    @accepts_org_id_kw
     def set_asset_impact_level(self, asset_id: str, code: str, level: int, note: str | None = None) -> dict:
         """
         Upsert a single (asset_id, impact_code) record in data/state/asset_impacts.csv.
@@ -1129,6 +1153,7 @@ class CsvBackend(BackendPort):
             pass
         return None
 
+    @accepts_org_id_kw
     def set_asset_threat_level(self, asset_id: str, code: str, level: int, note: str | None = None) -> dict:
         """
         Upsert a single (asset_id, threat_code) record in data/state/asset_risks.csv.

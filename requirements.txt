@@ -23,7 +23,7 @@ qdrant-client[fastembed]
 onnxruntime
 
 # Lang *chain/graph*
-langchain
+langchain-core
 langchain-openai
 langgraph
 langsmith

@@ -7,7 +7,8 @@ Chat Router (UIRequest → route_chat → UIResponse)
 - Auth-protected POST /api/chat endpoint used by the UI.
 - Strictly validates incoming payload as UIRequest; falls back to legacy ChatIn.
 - Returns a strictly validated UIResponse.
-- Calls the unified LangGraph manager (workshops_ai.graph.manager:route_chat).
+- Calls the unified LangGraph manager with DI built via graph.factory.make_default_deps()
+  so the manager/graphs receive a centralized `llm_client` and related deps.
 - Single timeout from settings.chat.timeout_sec.
 - Best-effort telemetry; safe error mapping.
 """
@@ -23,7 +24,7 @@ from pydantic import ValidationError
 from workshops_ai.settings import get_settings
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 
-# --- Security dependency (API key / JWT) --------------------------------------
+# Security dependency (API key / JWT)
 try:
     from workshops_ai.app.security import require_auth  # preferred path
     _AUTH_DEPS = [Depends(require_auth)]
@@ -35,12 +36,15 @@ except Exception:  # pragma: no cover
     except Exception:  # pragma: no cover
         _AUTH_DEPS = []
 
-# --- Telemetry (best-effort, optional) ----------------------------------------
+# Telemetry (best-effort, optional)
 try:
     from workshops_ai.tools.telemetry import telemetry_log  # type: ignore
 except Exception:  # pragma: no cover
     def telemetry_log(event: str, payload: dict) -> None:  # type: ignore
         return
+
+# DI factory (ensures llm_client + checkpointer + memory + retriever)
+from workshops_ai.graph.factory import make_default_deps
 
 settings = get_settings()
 router = APIRouter(prefix="/api", dependencies=_AUTH_DEPS)
@@ -112,9 +116,10 @@ async def chat_endpoint(
 
     Safety:
     - Strict Pydantic v2 validation (fail-closed).
-    - Message length limit (MAX_MESSAGE_LEN).
+    - Message length guard (MAX_MESSAGE_LEN).
     - Unified timeout (CHAT_TIMEOUT_SEC).
     - Backward-compatible acceptance of legacy ChatIn (auto-bridged).
+    - DI: manager receives GraphDeps via make_default_deps() with a centralized llm_client.
     """
     # 1) Validate inbound payload (UIRequest or legacy)
     ui_req = _to_ui_request(payload)
@@ -151,12 +156,21 @@ async def chat_endpoint(
     except Exception:
         pass
 
-    # 4) Route strictly to the LangGraph manager
+    # 4) Build DI (GraphDeps) with centralized llm_client and friends
+    deps = make_default_deps(tab=ui_req.active_tab)
+
+    # 5) Route strictly to the LangGraph manager
     try:
         from workshops_ai.graph.manager import route_chat  # lazy import to avoid import cycles
-        result = await _run_with_timeout(route_chat(ui_req), timeout_sec=CHAT_TIMEOUT_SEC)
 
-        # 5) Validate outbound payload (strict → UIResponse)
+        # Prefer calling with DI if supported; else fallback (maintains backward compatibility)
+        if "deps" in inspect.signature(route_chat).parameters:
+            result = await _run_with_timeout(route_chat(ui_req, deps=deps), timeout_sec=CHAT_TIMEOUT_SEC)
+        else:
+            # Legacy manager signature without DI (not recommended)
+            result = await _run_with_timeout(route_chat(ui_req), timeout_sec=CHAT_TIMEOUT_SEC)
+
+        # 6) Validate outbound payload (strict → UIResponse)
         if isinstance(result, dict):
             ui_resp = UIResponse.model_validate(result)
         elif isinstance(result, UIResponse):
@@ -183,7 +197,7 @@ async def chat_endpoint(
             detail={"message": "Router error", "error": str(ex)},
         ) from ex
 
-    # 6) Telemetry (best-effort)
+    # 7) Telemetry (best-effort)
     try:
         telemetry_log(
             "chat.response",

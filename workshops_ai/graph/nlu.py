@@ -11,11 +11,16 @@ Contract-first rules
 - Levels/probabilities are integers in [0, 4].
 - Bulk payloads are strongly typed with UUID-verified asset_ids.
 - Use these models to parse/validate LLM NLU JSON before routing to agent logic.
+
+Additions in this revision
+- No forced fallback to "list" in ensure_action_is_string (let clarifying logic handle it).
+- AssetsNLU gains `question: Optional[str]` for explain flows.
+- Multilingual (CZ/SK/EN) action aliases for more natural chat inputs.
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional, Sequence, Union
+from typing import Any, Literal, Optional, Union
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -27,7 +32,6 @@ __all__ = [
     "AssetsAction", "AssetsNLU",
     "ImpactSetItem", "ImpactsAction", "ImpactsBulkEntry", "ImpactsNLU",
     "ThreatSetItem", "ThreatsAction", "ThreatsBulkEntry", "ThreatsNLU",
-    # "ControlsAction", "ControlsNLU",
     "Tab",
     "parse_nlu_for_tab",
     "ensure_action_is_string",
@@ -138,26 +142,28 @@ class UpdateAssetNLU(_StrictModel):
             return None
         return _int_in_range(v, name="level")
 
+
 class AssetsNLU(_StrictModel):
     """
     NLU result for the Assets agent.
     - `action`: intent ("list" | "get" | "create" | "set_meta" | "explain" | "list_types")
-        Accepted aliases:
-          - "update", "edit"        -> "set_meta"
-          - "add", "new"            -> "create"
-          - "create_asset"          -> "create"
-          - "show", "details"       -> "get"
-        Notes:
-          - "list_types" is a special action to list available asset types
-            (catalog) — it passes through unchanged.
+        Accepted aliases (EN + CZ/SK):
+          - "update", "edit", "uprav", "zmen", "zmeniť"                -> "set_meta"
+          - "add", "new", "create_asset", "vytvor", "vytvoř", "pridej" -> "create"
+          - "show", "details", "ukaz", "ukaž", "zobraz", "detail"      -> "get"
+          - "types", "typy", "dostupne_typy", "dostupné typy"          -> "list_types"
+          - "explain", "vysvetli", "vysvětli"                          -> "explain"
+          - "list", "seznam", "zoznam"                                 -> "list"
     - `selection`: target selection (e.g., selection.asset_id)
     - `new_asset`: data for creation when action=create
     - `update`:    data for partial update when action=set_meta
+    - `question`:  optional question for explain
     """
     action: AssetsAction
     selection: Optional[Selection] = None
     new_asset: Optional[NewAssetNLU] = None
     update: Optional[UpdateAssetNLU] = None
+    question: Optional[str] = None  # for explain
 
     @field_validator("action", mode="before")
     @classmethod
@@ -165,7 +171,7 @@ class AssetsNLU(_StrictModel):
         """
         Guard against the LLM emitting ["list"] instead of "list".
         Accept a single-item list[str] (coerce), reject any other arrays.
-        Normalize to lowercase and map common aliases.
+        Normalize to lowercase and map common aliases (EN + CZ/SK).
         """
         # Coerce from ["list"] shape
         if isinstance(v, list):
@@ -175,17 +181,28 @@ class AssetsNLU(_StrictModel):
                 raise ValueError("action must be a string, not array")
         s = str(v).strip().lower()
 
-        # Alias mapping (assets)
-        if s in {"update", "edit"}:
+        # Alias mapping (assets; EN + CZ/SK)
+        if s in {"update", "edit", "uprav", "zmen", "zmeniť"}:
             return "set_meta"
-        if s in {"add", "new", "create_asset"}:
+        if s in {"add", "new", "create_asset", "vytvor", "vytvoř", "pridej", "pridaj"}:
             return "create"
-        if s in {"show", "details"}:
+        if s in {"show", "details", "ukaz", "ukaž", "zobraz", "detail"}:
             return "get"
+        if s in {"types", "typy", "dostupne_typy", "dostupné typy"}:
+            return "list_types"
+        if s in {"explain", "vysvetli", "vysvětli"}:
+            return "explain"
+        if s in {"list", "seznam", "zoznam"}:
+            return "list"
 
-        # Allow "list_types" (and other supported literals) to pass unchanged
+        # Pass through literal when already normalized
         return s
 
+    def effective_asset_id(self) -> Optional[UUID]:
+        """Prefer explicit `update.asset_id` (when present), then `selection.asset_id`."""
+        if self.update and self.update.asset_id:
+            return self.update.asset_id
+        return self.selection.asset_id if self.selection else None
 
 
 # ---------- Impacts tab ----------
@@ -384,28 +401,6 @@ class ThreatsNLU(_StrictModel):
         """Prefer explicit `asset_id`; fallback to `selection.asset_id`."""
         return self.asset_id or (self.selection.asset_id if self.selection else None)
 
-# ---------- Controls tab (placeholder for future) ----------
-
-# ControlsAction = Literal["list", "get", "set", "explain"]
-
-
-# class ControlsNLU(_StrictModel):
-#     """
-#     Minimal NLU result for the Controls agent (extend as needed).
-#     """
-#     action: ControlsAction
-#     selection: Optional[Selection] = None
-#     question: Optional[str] = None
-#
-#     @field_validator("action", mode="before")
-#     @classmethod
-#     def action_must_be_str(cls, v: Any) -> str:
-#         if isinstance(v, list):
-#             if len(v) == 1 and isinstance(v[0], str):
-#                 return v[0].strip().lower()
-#             raise ValueError("action must be a string, not array")
-#         return str(v).strip().lower()
-
 
 # ---------- Unified parsing helpers ----------
 
@@ -413,13 +408,12 @@ class Tab(str):
     ASSETS = "assets"
     IMPACTS = "impacts"
     THREATS = "threats"
-    # CONTROLS = "controls"
 
 
 def parse_nlu_for_tab(
     tab: str,
     data: dict[str, Any],
-) -> Union[AssetsNLU, ImpactsNLU, ThreatsNLU]:  # ControlsNLU
+) -> Union[AssetsNLU, ImpactsNLU, ThreatsNLU]:
     """
     Parse an LLM-produced NLU JSON into a strict, tab-specific model.
     Use this right after the LLM call, before downstream agent logic.
@@ -431,12 +425,20 @@ def parse_nlu_for_tab(
         return ImpactsNLU.model_validate(data)
     if t == Tab.THREATS:
         return ThreatsNLU.model_validate(data)
-    # if t == Tab.CONTROLS:
-    #     return ControlsNLU.model_validate(data)
     raise ValueError(f"Unsupported tab '{tab}'")
 
 
+# ---------- Normalization shim (no longer forces a fallback) ----------
+
 def ensure_action_is_string(nlu_dict: dict[str, Any], tab: str | None = None) -> dict[str, Any]:
+    """
+    Lightweight normalization shim for callers that still pass raw dicts.
+    - Coerces ["list"] -> "list"
+    - Lowercases string values
+    - Applies basic alias mapping (EN + CZ/SK) for assets
+    - Does NOT force an invalid/unknown action to "list" anymore
+      (let higher layers do clarify-first instead).
+    """
     v = nlu_dict.get("action", None)
     if isinstance(v, list):
         if len(v) == 1 and isinstance(v[0], str):
@@ -446,33 +448,25 @@ def ensure_action_is_string(nlu_dict: dict[str, Any], tab: str | None = None) ->
     elif isinstance(v, str):
         nlu_dict["action"] = v.strip().lower()
 
-    # alias mapping for convenience (mirrors AssetsNLU validator)
+    # alias mapping for convenience (mirrors AssetsNLU validator; EN + CZ/SK)
     aliases_assets = {
-        "update": "set_meta",
-        "edit": "set_meta",
-        "add": "create",
-        "new": "create",
-        "create_asset": "create",
-        "show": "get",
-        "details": "get",
+        # set_meta
+        "update": "set_meta", "edit": "set_meta", "uprav": "set_meta", "zmen": "set_meta", "zmeniť": "set_meta",
+        # create
+        "add": "create", "new": "create", "create_asset": "create", "vytvor": "create", "vytvoř": "create",
+        "pridej": "create", "pridaj": "create",
+        # get
+        "show": "get", "details": "get", "ukaz": "get", "ukaž": "get", "zobraz": "get", "detail": "get",
+        # list_types
+        "types": "list_types", "typy": "list_types", "dostupne_typy": "list_types", "dostupné typy": "list_types",
+        # explain
+        "explain": "explain", "vysvetli": "explain", "vysvětli": "explain",
+        # list
+        "list": "list", "seznam": "list", "zoznam": "list",
     }
     if (tab or "").strip().lower() == "assets":
         act = nlu_dict.get("action")
         if isinstance(act, str) and act in aliases_assets:
             nlu_dict["action"] = aliases_assets[act]
 
-    allowed_by_tab = {
-        "assets":   {"list", "get", "create", "set_meta", "explain", "list_types"},  # <- added list_types
-        "impacts":  {"list", "get", "set", "bulk_set", "explain", "defs_create"},
-        "threats":  {"list", "get", "set", "bulk_set", "explain", "defs_create"},
-        # "controls": {"list", "get", "set", "explain"},
-    }
-    allowed_all = set().union(*allowed_by_tab.values())
-
-    act = nlu_dict.get("action")
-    t = (tab or "").strip().lower()
-    allowed = allowed_by_tab.get(t, allowed_all)
-
-    if act not in allowed:
-        nlu_dict["action"] = "list"
     return nlu_dict
