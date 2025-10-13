@@ -3,13 +3,17 @@
 # Purpose
 # WebSocket endpoint with strict event validation, centralized settings-based auth,
 # timeout handling, and integration with WsHub for broadcasting AgentEvents.
+# Adds:
+#   - Accept-Language support (query param > header) → mapped to UIRequest.language
+#   - DI parity with chat_router (make_default_deps → route_chat(..., deps=...))
+#   - Allowed tabs include "controls"
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os  # [ADD] env-based defaults for staging
+import os
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
@@ -20,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from workshops_ai.settings import get_settings
 from workshops_ai.schemas.ui_contract import UIRequest
 from workshops_ai.graph.manager import route_chat
+from workshops_ai.graph.factory import make_default_deps
 from workshops_ai.app.security import verify_ws_auth  # unified WS auth (API-key/JWT)
 
 # WS Hub (agent → client broadcasts)
@@ -50,51 +55,30 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # Allowed tabs (fail-closed; aligned with available graphs)
-ALLOWED_TABS = {"assets", "impacts", "threats"}
+ALLOWED_TABS = {"assets", "impacts", "threats", "controls"}
 
 # Centralized settings
 _settings = get_settings()
-# Correct namespaced read (previous flat attr caused mismatches):
 WS_EVENT_TIMEOUT_S: int = int(_settings.ws.timeout_sec)
 
 # Cookie name used by SessionMiddleware for session id
 COOKIE_NAME = "wsai.sid"
 
 # -----------------------------------------------------------------------------
-# [ADD] Small helper to parse boolean env flags consistently
-# -----------------------------------------------------------------------------
+
+
 def _env_bool(name: str, default: bool) -> bool:
-    """
-    Read a boolean from env with common truthy strings. Falls back to default.
-    Examples of truthy: "1", "true", "yes", "on" (case-insensitive).
-    """
     v = os.getenv(name)
     if v is None:
         return default
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
-# [ADD] Default staging behavior:
-# In dev we typically want staging on by default so write tools can run.
-# Can be overridden by exporting WS_DEFAULT_STAGING=0/false to disable.
+# Default staging behavior (can be overridden via WS_DEFAULT_STAGING=0/false)
 DEFAULT_STAGING: bool = _env_bool("WS_DEFAULT_STAGING", True)
 
 
 # ------------------------------ Inbound schema --------------------------------
 class InboundEvent(BaseModel):
-    """
-    Unified inbound WS event schema.
-
-    Types:
-      - "ping"        : health check
-      - "switch_tab"  : { active_tab: "assets|impacts|threats" }
-      - "select"      : { asset_id: "..." }
-      - "chat"        : { message: "..." }
-      - "export"      : no payload (synthetic "export" message)
-
-    Out-of-band:
-      - Agent change events (create/set_meta) are broadcast via WsHub and delivered
-        to the client as raw JSON frames (AgentEvent) with no envelope.
-    """
     type: Literal["select", "chat", "export", "ping", "switch_tab"]
     message: str | None = None
     asset_id: str | None = None
@@ -111,16 +95,28 @@ class Conn:
     active_tab: str
     selected_asset_id: str | None = None
     conn_id: str = uuid.uuid4().hex
-    busy: bool = False  # simple anti-reentrancy guard
-    # Session id (from cookie); may be None if cookie wasn't present
+    busy: bool = False
     sid: Optional[str] = None
-    # Correlation id captured at connect time (echoed in error frames)
     request_id: str = "n/a"
-    # [ADD] Staging toggle (read/write gating). We seed at connect time.
     staging: bool = True
+    accept_language: Optional[str] = None  # language hint we expose to UI; mapped to UIRequest.language
 
 
 # --------------------------------- Helpers ------------------------------------
+def _pick_accept_language(ws: WebSocket, query_value: Optional[str]) -> Optional[str]:
+    """
+    Determine Accept-Language hint with precedence:
+      1) query ?accept_language=...
+      2) HTTP header "Accept-Language" on upgrade
+    """
+    if query_value and isinstance(query_value, str) and query_value.strip():
+        return query_value.strip()[:256]
+    h = ws.headers.get("accept-language")
+    if isinstance(h, str) and h.strip():
+        return h.strip()[:256]
+    return None
+
+
 def _build_ui_request(state: Conn, message: str, *, staging: bool = False) -> UIRequest:
     """Build UIRequest for the Manager/Router based on current connection state."""
     return UIRequest(
@@ -130,8 +126,9 @@ def _build_ui_request(state: Conn, message: str, *, staging: bool = False) -> UI
         message=message,
         staging=staging,
         user_id=state.user_id,
-        session_id=state.sid,  # forward session id to the agent
-        # language can be injected later if you decide to store it in session
+        session_id=state.sid,
+        # IMPORTANT: UIRequest typically has `language`, not `accept_language`
+        language=state.accept_language,
     )
 
 
@@ -147,11 +144,6 @@ async def _ws_send(ws: WebSocket, event_type: str, payload: dict[str, Any] | lis
 
 
 def _cur_request_id(state: Optional[Conn]) -> str:
-    """
-    Resolve the current request id for correlation:
-    1) prefer state.request_id captured at connect time
-    2) fallback to ContextVar getter from the HTTP layer (may be "n/a")
-    """
     if state and state.request_id and state.request_id != "n/a":
         return state.request_id
     return get_request_id() or "n/a"
@@ -165,18 +157,6 @@ async def _ws_error(
     details: Any | None = None,
     state: Optional[Conn] = None,
 ) -> None:
-    """
-    Unified WS error frame:
-    {
-      "type":"error",
-      "payload": {
-        "message": "...",
-        "details": ...,
-        "conn_id": "...",
-        "request_id": "..."
-      }
-    }
-    """
     await _ws_send(
         ws,
         "error",
@@ -195,47 +175,36 @@ async def ws_endpoint(
     ws: WebSocket,
     org_id: str = Query(..., description="Organization ID"),
     user_id: str = Query(..., description="User ID"),
-    active_tab: str = Query("assets", description="assets|impacts|threats"),
+    active_tab: str = Query("assets", description="assets|impacts|threats|controls"),
+    accept_language: Optional[str] = Query(None, description="Optional Accept-Language hint (e.g., 'cs, sk;q=0.9, en;q=0.7')"),
 ) -> None:
     """
-    Real-time chat endpoint:
-    - Security: API key or JWT via verify_ws_auth (query ?api_key=... or header X-API-Key / Authorization: Bearer).
-    - Strictly validates all inbound messages (Pydantic v2, fail-closed).
-    - Prevents concurrent long-running actions per connection (busy-guard).
-    - Wraps route_chat(...) with timeout and unified error frames (including conn_id & request_id).
-    - Registers the socket in WsHub so agents can broadcast AgentEvent JSON frames.
-    - Applies rate-limit per session (sid) for "chat" and "export" events.
+    Real-time chat endpoint with Accept-Language passthrough (mapped to UIRequest.language).
     """
-    # Normalize/validate the initial tab
     active_tab = active_tab if active_tab in ALLOWED_TABS else "assets"
 
-    # Security validation BEFORE accept() to reject early if unauthorized
+    # Auth before accept
     auth_ok = await verify_ws_auth(ws)
     if not auth_ok:
         return
-    # Accept the connection after passing security
     await ws.accept()
 
-    # Register this client in the hub to receive agent broadcasts
     await WsHub.register(ws)
 
-    # Try to read session id (set by HTTP SessionMiddleware)
     sid = ws.cookies.get(COOKIE_NAME)
-
-    # Capture correlation id right after we accept
     rid = get_request_id() or "n/a"
+    al = _pick_accept_language(ws, accept_language)
 
-    # [ADD] Seed staging from env default at connect time (no behavior removed/changed elsewhere)
     state = Conn(
         org_id=org_id,
         user_id=user_id,
         active_tab=active_tab,
         sid=sid,
         request_id=rid,
-        staging=DEFAULT_STAGING,  # <— the only semantic change vs previous hardcoded False
+        staging=DEFAULT_STAGING,
+        accept_language=al,
     )
 
-    # Initial hello (+ info about broadcast mode)
     await _ws_send(
         ws,
         "hello",
@@ -248,14 +217,13 @@ async def ws_endpoint(
             "user_id": state.user_id,
             "sid": state.sid,
             "agent_events": {"subscribed": True, "mode": "raw_json"},
-            # [ADD] expose current staging so client can show proper banner/toggle
             "staging": state.staging,
+            "accept_language": state.accept_language,
         },
     )
 
     try:
         while True:
-            # Receive + validate
             try:
                 raw = await ws.receive_json()
             except Exception as e:
@@ -275,12 +243,10 @@ async def ws_endpoint(
                 await _ws_error(ws, "Invalid event payload", conn_id=state.conn_id, details=str(e), state=state)
                 continue
 
-            # Health check
             if evt.type == "ping":
                 await _ws_send(ws, "pong", {"conn_id": state.conn_id, "request_id": state.request_id})
                 continue
 
-            # Switch active tab (enforce allowed set)
             if evt.type == "switch_tab":
                 new_tab = (evt.active_tab or "").strip().lower()
                 if new_tab in ALLOWED_TABS:
@@ -296,28 +262,20 @@ async def ws_endpoint(
                     )
                 continue
 
-            # Select asset
             if evt.type == "select":
                 state.selected_asset_id = evt.asset_id or None
                 await _ws_send(ws, "select_ack", {"asset_id": state.selected_asset_id, "request_id": state.request_id})
                 continue
 
-            # Long-running actions (chat/export) — guarded + with timeout
             if evt.type in {"chat", "export"}:
-                # WS rate-limit per minute (uses session sid; fallback to anon:conn)
+                # Rate limit
                 if getattr(_settings, "ratelimit", None) and getattr(_settings.ratelimit, "enabled", False):
                     event_for_rl = "chat" if evt.type == "chat" else "export"
                     sid_for_rl = state.sid or f"anon:{state.conn_id[:8]}"
                     try:
                         ok = await allow_ws(event_for_rl, sid_for_rl, _settings.ratelimit.per_minute)
-                    except Exception as rl_err:  # explicit; don't fail-open
-                        await _ws_error(
-                            ws,
-                            "Rate-limit check failed",
-                            conn_id=state.conn_id,
-                            details=str(rl_err),
-                            state=state,
-                        )
+                    except Exception as rl_err:
+                        await _ws_error(ws, "Rate-limit check failed", conn_id=state.conn_id, details=str(rl_err), state=state)
                         continue
                     if not ok:
                         await _ws_error(ws, "Too many messages", conn_id=state.conn_id, state=state)
@@ -334,10 +292,7 @@ async def ws_endpoint(
                         await _ws_error(ws, "Empty message for 'chat' event", conn_id=state.conn_id, state=state)
                         continue
 
-                    # -----------------------------------------------------------------
-                    # IMPORTANT CHANGE:
-                    # all WRITE tools. We now forward the connection's staging flag.
-                    # -----------------------------------------------------------------
+                    deps = make_default_deps(tab=state.active_tab)
                     ui_req = _build_ui_request(state, text, staging=state.staging)
 
                     await _ws_send(
@@ -351,9 +306,12 @@ async def ws_endpoint(
                         },
                     )
 
-                    ui_res = await asyncio.wait_for(route_chat(ui_req), timeout=WS_EVENT_TIMEOUT_S)
+                    # Backward/forward compatible call: route_chat may or may not accept `deps`
+                    if "deps" in route_chat.__code__.co_varnames:
+                        ui_res = await asyncio.wait_for(route_chat(ui_req, deps=deps), timeout=WS_EVENT_TIMEOUT_S)
+                    else:
+                        ui_res = await asyncio.wait_for(route_chat(ui_req), timeout=WS_EVENT_TIMEOUT_S)
 
-                    # Support both Pydantic model and plain dict
                     payload = ui_res.model_dump(mode="json") if hasattr(ui_res, "model_dump") else ui_res
                     await _ws_send(ws, "ui_response", payload)
                     await _ws_send(ws, "progress", {"status": "done", "conn_id": state.conn_id, "request_id": state.request_id})
@@ -373,7 +331,6 @@ async def ws_endpoint(
                     state.busy = False
                 continue
 
-            # Fallback (should never happen due to strict validation)
             await _ws_error(ws, f"Unknown event type: {evt.type}", conn_id=state.conn_id, state=state)
 
     except WebSocketDisconnect:

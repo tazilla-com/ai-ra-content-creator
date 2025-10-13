@@ -1,6 +1,4 @@
 # File: workshops_ai/graph/manager.py
-
-
 """
 Unified Graph Manager
 ---------------------
@@ -14,11 +12,11 @@ Unified Graph Manager
 from __future__ import annotations
 import asyncio
 import inspect
+import json           # NEW: JSON persistence for session state in KV
+import ast            # NEW: Back-compat parser for legacy str(dict) payloads
 from typing import Any, Final, Mapping, Optional, cast
 
 from pydantic import ValidationError
-
-
 
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 from workshops_ai.models.agent_event import AgentEvent as WireAgentEvent
@@ -100,7 +98,7 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
 
     # 2) Build DI deps (backend, ws hub, retriever, memory, **llm_client**, settings, submit_changeset)
     deps = _deps(tab)
-    # Propagate the trace to DI so that nodes (decide) ho můžou použít
+    # Propagate the trace to DI so that nodes (decide) can use it
     try:
         setattr(deps, "telemetry_trace", _trace)
     except Exception:
@@ -138,20 +136,20 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
         session_state = _session_set_current_asset(
             session_state,
             asset_id=str(selection_asset_id),
-            name=getattr(req.selection, "asset_name", None),
+            name=getattr(req, "selection", None) and getattr(req.selection, "asset_name", None),
         )
 
     # 5) Language autodetection (cs/sk/en)
     language = _autodetect_language(req.message, req.language, req.locale)
 
     # 6) Prepare SSOT tool specs for this tab (registry → prompt+tooling)
-    tools_json = ToolRegistry.as_prompt_json(cast(Any, tab))            # JSON string for prompt templates
+    tools_json = ToolRegistry.as_prompt_json(cast(Any, tab))              # JSON string for prompts
     allowed_functions = ToolRegistry.as_openai_functions(cast(Any, tab))  # OpenAI-style function list
 
     # 7) Prepare inputs for the graph (dict-based; minimal + stable)
     selection_dump = (
         req.selection.model_dump()
-        if hasattr(req.selection, "model_dump")
+        if hasattr(req, "selection") and hasattr(req.selection, "model_dump")
         else dict(getattr(req, "selection", {}) or {})
     )
     inputs: dict[str, Any] = {
@@ -178,8 +176,6 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
         "existing_assets": getattr(req, "existing_assets", None),
         "user_instructions": getattr(req, "user_instructions", None),
         #  Manager context with SSOT tool registry data for the agent/graphs
-        # (graphs/agent nodes should read manager_ctx.allowed_functions for LLM tool-choice
-        #  and manager_ctx.tools_json for prompt injection)
         "manager_ctx": {  # NEW
             "tools_json": tools_json,
             "allowed_functions": allowed_functions,
@@ -224,8 +220,6 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
         _telemetry_from_response_tool_events(resp, tab=tab, org_id=req.org_id, user_id=req.user_id)
 
         # 10b) Do NOT clobber policy returned by the graph.
-        #     Specifically: keep resp.policy.emit_changes_enabled as decided by graph/staging flow.
-        #     Only ensure policy exists minimally if missing.
         if not getattr(resp, "policy", None):
             resp.policy = {"emit_changes_enabled": True}  # minimal default; graphs usually set this
 
@@ -243,14 +237,13 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
         await _save_session_state(deps, org_id=req.org_id, user_id=req.user_id, thread_id=thread_id, state=session_state)
 
         # --- Debug trace (response summary) ---
-
         try:
             if _trace is not None:
                 from workshops_ai.telemetry_debug import summarize_ui_response
                 summarize_ui_response(_trace, resp.model_dump(mode="json"))
         except Exception:
             pass
-        
+
         return resp
 
     except ValidationError as ve:
@@ -294,16 +287,22 @@ def _deps(tab: str) -> GraphDeps:
 
 
 def _resolve_backend_port() -> Any | None:
+    """
+    Try provider → fallback to a CSV backend instance → final fallback to module-level port.
+    This prevents graphs from receiving None in common single-node CSV setups.
+    """
     try:
         from workshops_ai.backend.provider import get_backend_port  # type: ignore
         return get_backend_port()
     except Exception:
         pass
+    # NEW: attempt to construct CsvBackend directly if available
     try:
-        from workshops_ai.backend.csv_backend import get_backend_port  # type: ignore
-        return get_backend_port()
+        from workshops_ai.backend.csv_backend import CsvBackend  # type: ignore
+        return CsvBackend()
     except Exception:
         pass
+    # Legacy fallback
     try:
         from workshops_ai.backend.port import backend_port  # type: ignore
         return backend_port
@@ -691,18 +690,45 @@ def _autodetect_language(message: Optional[str], explicit: Optional[str], locale
 # Session state helpers (current_asset + MRU + one-time clarify flags)
 # =============================================================================
 async def _load_session_state(deps: GraphDeps, *, org_id: str, user_id: Optional[str], thread_id: str) -> dict:
-    """Load session state dict from KV. Returns a normalized structure."""
+    """
+    Load session state dict from KV.
+    - JSON is the canonical format (this function decodes JSON).
+    - For backward compatibility, also accepts a legacy Python dict string and
+      tries ast.literal_eval as a safe fallback.
+    Returns a normalized structure.
+    """
     try:
         if not getattr(deps, "memory_get", None):
             return {"current_asset": None, "recent_assets": [], "once_flags": {"asked_for_asset": False}}
         raw = await deps.memory_get(  # type: ignore[attr-defined]
             org_id=org_id, user_id=user_id, thread_id=thread_id, namespace=_SESSION_NS, key=_SESSION_STATE_KEY
         )
-        if not isinstance(raw, Mapping):
+        if raw is None:
             return {"current_asset": None, "recent_assets": [], "once_flags": {"asked_for_asset": False}}
-        state = dict(raw)
+
+        state: dict[str, Any] | None = None
+        if isinstance(raw, Mapping):
+            state = dict(raw)
+        elif isinstance(raw, str):
+            # Prefer JSON
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, Mapping):
+                    state = dict(parsed)
+            except Exception:
+                # Back-compat: legacy str(dict) with single quotes
+                try:
+                    parsed = ast.literal_eval(raw)
+                    if isinstance(parsed, Mapping):
+                        state = dict(parsed)
+                except Exception:
+                    state = None
+
+        if not isinstance(state, dict):
+            return {"current_asset": None, "recent_assets": [], "once_flags": {"asked_for_asset": False}}
     except Exception:
         state = {}
+
     current = state.get("current_asset") if isinstance(state.get("current_asset"), Mapping) else None
     recent = state.get("recent_assets") if isinstance(state.get("recent_assets"), list) else []
     once = state.get("once_flags") if isinstance(state.get("once_flags"), Mapping) else {"asked_for_asset": False}
@@ -714,12 +740,17 @@ async def _load_session_state(deps: GraphDeps, *, org_id: str, user_id: Optional
 
 
 async def _save_session_state(deps: GraphDeps, *, org_id: str, user_id: Optional[str], thread_id: str, state: dict) -> None:
-    """Persist session state dict into KV."""
+    """
+    Persist session state dict into KV as JSON (canonical).
+    If the memory backend stores raw strings (e.g., Redis), this guarantees
+    a round-trip that _load_session_state() can decode.
+    """
     try:
         if not getattr(deps, "memory_set", None):
             return
+        payload = json.dumps(state, separators=(",", ":"), ensure_ascii=False)
         await deps.memory_set(  # type: ignore[attr-defined]
-            org_id=org_id, user_id=user_id, thread_id=thread_id, namespace=_SESSION_NS, key=_SESSION_STATE_KEY, value=state
+            org_id=org_id, user_id=user_id, thread_id=thread_id, namespace=_SESSION_NS, key=_SESSION_STATE_KEY, value=payload
         )
     except Exception:
         pass

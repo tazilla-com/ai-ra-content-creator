@@ -1,12 +1,18 @@
 # File: workshops_ai/backend/csv_backend.py
+# =============================================================================
 # CSV-based backend implementing BackendPort (read-only for assets/impacts/risks).
+#
+# Scope & guarantees
+# ------------------
 # - Reads state from <settings.paths.state_dir>:
 #       assets.csv (required)
 #       asset_impacts.csv (optional)   -> [{asset_id, impact_code, level(0..4), note?}]
 #       asset_risks.csv   (optional)   -> [{asset_id, threat_code, probability(0..4), note?}]
 # - Reads catalogs from <settings.paths.catalogs_dir> with robust fallbacks
-# - Defensive CSV parsing (BOM, ; delimiter, CP1250/CP1252/ISO-8859-2), mtime-based hot reload
+# - Defensive CSV parsing (BOM, ; delimiter, CP1250/CP1252/ISO-8859-2), mtime hot reload
 # - Pydantic v2 validation of Asset; STATE is the source of truth (fail-open for assetType)
+# - Tenancy: `org_id` is **intentionally ignored** via @accepts_org_id_kw decorator
+#   (see workshops_ai/utils/compat.py). This preserves behavior while keeping logs clean.
 #
 # Catalog files (relative to resolved catalogs dir) – read-only helpers:
 #   Asset type.csv
@@ -22,25 +28,28 @@
 #   - STATE is tenant truth. We DO NOT drop assets just because their assetType
 #     is not present in catalogs. We only use catalogs for optional filtering
 #     (when explicitly requested) and for explain/list operations.
+# =============================================================================
 
 from __future__ import annotations
+
 import secrets
 import time
 import csv
-import uuid
 from uuid import UUID
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence, Optional
-from workshops_ai.utils.compat import accepts_org_id_kw
+
 from pydantic import ValidationError
+
+from workshops_ai.utils.compat import accepts_org_id_kw  # conditional org_id ignore + tidy logging
 
 from workshops_ai.backend.port import (
     BackendConflict,
     BackendError,
     BackendPort,
     BackendValidationError,
-    BackendNotFound, 
+    BackendNotFound,
 )
 from workshops_ai.settings import get_settings
 from workshops_ai.api.schema import Asset  # canonical DTO
@@ -52,11 +61,13 @@ except Exception:  # pragma: no cover
     def telemetry_log(*args, **kwargs):  # type: ignore
         return None
 
+
 __all__ = ["CsvBackend"]
 
-# --------------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
 # Paths & config (harmonized with tools/search_catalogs.py)
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 _s = get_settings()
 
@@ -132,15 +143,16 @@ _CAT_IMPACT_FILE = _CAT_DIR / "Impact.csv"
 _CAT_IMPACT_CATEGORY_FILE = _CAT_DIR / "Impact category.csv"
 _CAT_IMPACT_X_CATEGORY_FILE = _CAT_DIR / "Impact x Impact category.csv"
 
-# --------------------------------------------------------------------------------------
-# UUID helpers: map any string asset id -> deterministic UUIDv5 (stable across runs)
-# --------------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# UUID helpers: map any string asset id -> deterministic checks; UUIDv7 generator
+# -----------------------------------------------------------------------------
 
 def _id_matches(row_id: str, query_id: str) -> bool:
     """
     True iff:
-      - přesná shoda stringů, nebo
-      - oba jdou parsovat jako UUID a jsou rovné
+      - exact string match, or
+      - both parse as UUID and are equal
     """
     if not row_id or not query_id:
         return False
@@ -175,9 +187,9 @@ def _uuid7_str() -> str:
     return str(UUID(int=value))
 
 
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # CSV helpers with mtime-based reload (encoding & delimiter tolerant)
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 @dataclass
 class _CsvCache:
@@ -291,13 +303,18 @@ def _first_present_column(rows: list[dict[str, str]], candidates: Iterable[str])
             return cols_lc[key]
     return None
 
-# --------------------------------------------------------------------------------------
-# Catalog helpers (asset types, threats, impacts) 
-# --------------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Catalog helpers (asset types, threats, impacts)
+# -----------------------------------------------------------------------------
 
 # --- CSV write helpers (atomic replace) --------------------------------------
 
 def _atomic_write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    """
+    Atomic write (temp file + replace) to minimize corruption risk.
+    Unknown keys in `rows` are ignored (extrasaction='ignore').
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8", newline="") as f:
@@ -515,7 +532,7 @@ class _Catalogs:
             items = [t for t in items if qn in _hay(t)]
 
         items.sort(key=lambda t: (t.get("code") or "").casefold())
-        return items
+        return items  # <-- FULL catalog (no slicing)
 
     # -------- Impacts (catalog helper) --------
 
@@ -590,11 +607,12 @@ class _Catalogs:
             items = [i for i in items if qn in _hay(i)]
 
         items.sort(key=lambda i: (i.get("code") or "").casefold())
-        return items
+        return items  # <-- FULL catalog (no slicing)
 
-# --------------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
 # State (assets.csv / asset_impacts.csv / asset_risks.csv)
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 def _parse_int_0_4(s: str | None) -> int | None:
     if s is None or s == "":
@@ -621,9 +639,9 @@ def _map_ia_int_to_canonical(i: int | None) -> str | None:
 def _build_asset_with_cia_fallback(payload: dict[str, Any]) -> Asset:
     """
     Build Asset while being robust to CIA representation and ID type.
-    - If 'id' is not a valid UUID, set it to None (graphs/DTO pak nepadnou).
-    - Map numeric CIA → canonical enums.
-    Always returns `Asset`.
+    - If 'id' is not a valid UUID v7, set it to None (DTO may still accept).
+    - Map numeric CIA → canonical enums as needed.
+    Always returns `Asset` or raises BackendValidationError.
     """
 
     def _uuid_v7_or_none(v: Any) -> Optional[str]:
@@ -642,7 +660,7 @@ def _build_asset_with_cia_fallback(payload: dict[str, Any]) -> Asset:
     base = dict(payload)
     base["id"] = _uuid_v7_or_none(base.get("id"))
 
-    # 1) optimistic 
+    # 1) optimistic
     try:
         return Asset(**base)  # type: ignore[arg-type]
     except Exception:
@@ -661,10 +679,13 @@ def _build_asset_with_cia_fallback(payload: dict[str, Any]) -> Asset:
     except Exception:
         pass
 
-    # 3) last resort: force CIA to strings the DTO 
+    # 3) last resort: force CIA to strings for the DTO
     try:
         alt = dict(base)
-        def _digits(i: int | None) -> str | None: return None if i is None else str(i)
+
+        def _digits(i: int | None) -> str | None:
+            return None if i is None else str(i)
+
         for k in ("confidentiality", "integrity", "availability"):
             v = alt.get(k)
             if isinstance(v, int):
@@ -672,7 +693,6 @@ def _build_asset_with_cia_fallback(payload: dict[str, Any]) -> Asset:
         return Asset(**alt)  # type: ignore[arg-type]
     except Exception as e:
         raise BackendValidationError(f"Invalid Asset row (CIA/ID mapping failed): {e}")
-
 
 
 class _AssetsState:
@@ -846,7 +866,6 @@ def _asset_from_row(row: Mapping[str, str], *, catalogs: _Catalogs) -> Asset:
         or ""
     ).strip()
 
-
     if not id_ or not name or not asset_type:
         raise BackendValidationError("Asset row missing mandatory fields (id, name, assetType).")
 
@@ -879,9 +898,10 @@ def _asset_from_row(row: Mapping[str, str], *, catalogs: _Catalogs) -> Asset:
     except ValidationError as ve:
         raise BackendValidationError(f"Invalid Asset row: {ve}") from ve
 
-# --------------------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
 # CsvBackend implementation
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 class CsvBackend(BackendPort):
     """
@@ -908,7 +928,7 @@ class CsvBackend(BackendPort):
     def list_threat_categories(self) -> list[str]:
         return self._catalogs.list_threat_categories()
 
-        # For op="impact.list"
+    # For op="impact.list"
     @accepts_org_id_kw
     def impact_defs_list(self, *, category: str | None = None) -> list[dict[str, Any]]:
         return self.list_impact_defs() if category is None else self._catalogs.list_impacts(q=None, category=category)
@@ -918,15 +938,15 @@ class CsvBackend(BackendPort):
     def threat_defs_list(self, *, apply_asset_type: str | None = None, category: str | None = None) -> list[dict[str, Any]]:
         return self._catalogs.list_threats(q=None, category=category, apply_asset_type=apply_asset_type)
 
-    # For op="impact.set_level" (name se v graphu mapuje na code; backend pracuje s code)
+    # For op="impact.set_level" (graph maps name→code; backend works with code)
     @accepts_org_id_kw
-    def impact_set_level(self, asset_id: str, *, impact_code: str, impact_level: int, note: str | None = None) -> dict:
-        return self.set_asset_impact_level(asset_id, code=impact_code, level=int(impact_level), note=note)
+    def impact_set_level(self, asset_id: str, *, impact_code: str, impact_level: int, note: str | None = None) -> None:
+        self.set_asset_impact_level(asset_id, code=impact_code, level=int(impact_level), note=note)
 
     # For op="threat.set_probability"
     @accepts_org_id_kw
-    def threat_set_probability(self, asset_id: str, *, threat_code: str, probability: int, note: str | None = None) -> dict:
-        return self.set_asset_threat_level(asset_id, code=threat_code, level=int(probability), note=note)
+    def threat_set_probability(self, asset_id: str, *, threat_code: str, probability: int, note: str | None = None) -> None:
+        self.set_asset_threat_level(asset_id, code=threat_code, level=int(probability), note=note)
 
     @accepts_org_id_kw
     def list_threats(self, apply_asset_type: str | None = None, **kwargs) -> list[dict[str, Any]]:
@@ -993,7 +1013,7 @@ class CsvBackend(BackendPort):
         # Not tracked in CSV MVP
         return []
 
-     # ---- Minimal WRITE API over state/*.csv ---------------------------------
+    # ---- Minimal WRITE API over state/*.csv ---------------------------------
 
     @accepts_org_id_kw
     def create_asset(self, name: str, type: str | None = None, *, org_id: str | None = None,
@@ -1003,6 +1023,7 @@ class CsvBackend(BackendPort):
         - Generates a UUIDv7 for 'id'
         - CIA left empty (None) unless you later update
         - assetType validated only softly (catalogs are advisory; do not block)
+        NOTE: org_id is accepted for future multi-tenancy but ignored by compat in single-tenant.
         """
         if not name:
             raise BackendValidationError("Asset name is required")
@@ -1111,7 +1132,7 @@ class CsvBackend(BackendPort):
         raise BackendConflict("CSV catalogs are read-only; threat definitions cannot be created here.")
 
     @accepts_org_id_kw
-    def set_asset_impact_level(self, asset_id: str, code: str, level: int, note: str | None = None) -> dict:
+    def set_asset_impact_level(self, asset_id: str, code: str, level: int, note: str | None = None) -> None:
         """
         Upsert a single (asset_id, impact_code) record in data/state/asset_impacts.csv.
         Validates that `code` exists in catalogs; otherwise raises BackendNotFound.
@@ -1151,10 +1172,9 @@ class CsvBackend(BackendPort):
             self._assets.asset_impacts.rows = None
         except Exception:
             pass
-        return None
 
     @accepts_org_id_kw
-    def set_asset_threat_level(self, asset_id: str, code: str, level: int, note: str | None = None) -> dict:
+    def set_asset_threat_level(self, asset_id: str, code: str, level: int, note: str | None = None) -> None:
         """
         Upsert a single (asset_id, threat_code) record in data/state/asset_risks.csv.
         Validates that `code` exists in catalogs; otherwise raises BackendNotFound.
@@ -1195,7 +1215,7 @@ class CsvBackend(BackendPort):
             self._assets.asset_risks.rows = None
         except Exception:
             pass
-        return None
+
     # ---- Staging lifecycle (unsupported in CSV MVP) ----
 
     def staging_open_batch(self, org_id: str, tags: list[str], comment: str | None = None) -> str:

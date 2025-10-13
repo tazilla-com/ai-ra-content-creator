@@ -2,11 +2,13 @@
 # Purpose: Centralized policy switches for conversational graphs.
 # - Controls preview/apply vs emit-only, clarify-first behavior, history window, and per-tab timeouts.
 # - Provides safe defaults and helpers to compute an EffectivePolicy per request/tab.
+# - Adds tiny interop helpers (clamp_list, history_tail, should_preview, attach_policy_to_deps)
+#   so graphs can consistently respect policies without duplicating logic.
 
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 
@@ -22,8 +24,8 @@ class TabName(StrEnum):
 # ----------------------------- Policy Data Models ----------------------------- #
 class GlobalPolicy(BaseModel):
     """
-    Global (cross-domain) policy flags. These are merged into an effective
-    per-tab policy for each turn. Keep these minimal and strictly typed.
+    Global (cross-domain) policy flags. Merged into an effective per-tab policy
+    for each turn. Keep minimal and strictly typed.
     """
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -40,7 +42,10 @@ class GlobalPolicy(BaseModel):
     # Conversation behavior:
     clarify_first: StrictBool = Field(
         default=True,
-        description="If true, the agent asks one concise clarifying question instead of falling back to 'list'.",
+        description=(
+            "If true, the agent asks a concise clarifying question before defaulting to list. "
+            "This is 'one question per turn', not 'only one question in total'."
+        ),
     )
     cross_domain_tools_allowed: StrictBool = Field(
         default=True,
@@ -222,13 +227,70 @@ def make_effective_policy(
 def as_prompt_vars(effective: EffectivePolicy) -> dict[str, Any]:
     """
     Minimal variables consumed by the base system prompt. Keep this stable.
+    NOTE: We intentionally do not put language here; the agent decides based on user input,
+    and the graph passes locale/language separately to the LLM prompts.
     """
     return {
         "policy": {
             "emit_changes_enabled": effective.emit_changes_enabled,
             "preview_required": effective.preview_required,
+            # clarify_first is a behavior knob for the decision layer, not a template toggle,
+            # so we do not surface it here unless your prompt explicitly needs it.
         }
     }
+
+
+# ----------------------------- Lightweight Helpers ----------------------------- #
+T = TypeVar("T")
+
+def clamp_list(items: Sequence[T] | Iterable[T], effective: EffectivePolicy) -> Tuple[List[T], int]:
+    """
+    Clamp a list/iterable to the tab's default visible size.
+    Returns (sliced_items, total_count).
+    Use this in read-only list nodes to respect policy.max_list_items while still reporting total.
+    """
+    if not isinstance(items, Sequence):
+        items = list(items)
+    total = len(items)  # evaluate once
+    limit = max(1, int(effective.max_list_items))
+    return list(items[:limit]), total
+
+
+def history_tail(history: Sequence[dict] | None, effective: EffectivePolicy) -> list[dict]:
+    """
+    Return the last N conversation messages according to policy.max_history_messages.
+    Graphs should prefer this over hardcoded lengths, e.g. history_tail(state.history, eff).
+    """
+    if not history:
+        return []
+    n = max(0, int(effective.max_history_messages))
+    return list(history[-n:]) if n > 0 else []
+
+
+def should_preview(effective: EffectivePolicy) -> bool:
+    """
+    Decide whether a write turn should stage instead of submitting right away.
+    - True if preview_required is True.
+    - You can also treat (emit_changes_enabled=False) as a strong hint to stage.
+    """
+    return bool(effective.preview_required or not effective.emit_changes_enabled)
+
+
+def attach_policy_to_deps(deps: Any, effective: EffectivePolicy) -> None:
+    """
+    Best-effort helper to make the effective policy visible to graph nodes without
+    threading it through every function signature. Manager/runner can call:
+
+        eff = make_effective_policy(tab=TabName.ASSETS, ...)
+        attach_policy_to_deps(deps, eff)
+
+    Asset/Impacts graphs then read it via `getattr(deps, "effective_policy", None)`.
+    """
+    try:
+        setattr(deps, "effective_policy", effective)
+    except Exception:
+        # Keep silent; this is a convenience only.
+        pass
 
 
 # ----------------------------- Example (comments) ----------------------------- #
@@ -239,8 +301,13 @@ def as_prompt_vars(effective: EffectivePolicy) -> dict[str, Any]:
 #       staging=request.staging,                        # True → preview only
 #       overrides={"timeout_seconds": 15},              # per-request tweak
 #   )
-#   prompt_vars = as_prompt_vars(eff)
+#   attach_policy_to_deps(deps, eff)                   # <- make available to graph nodes
+#   prompt_vars = as_prompt_vars(eff)                  # <- pass into system prompt templating
 #   # pass `eff.timeout_seconds` to graph invoke timeout
-#   # pass `prompt_vars` into system prompt templating
+#
+# In graphs:
+#   effective = getattr(deps, "effective_policy", None)  # may be None if manager omitted
+#   if effective and should_preview(effective):
+#       # Stage instead of submit; set UIResponse.staging.needs_commit = True, etc.
 #
 # The EffectivePolicy is also safe to serialize into UIResponse.policy if desired.

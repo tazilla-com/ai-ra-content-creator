@@ -11,9 +11,9 @@ from __future__ import annotations
 import logging
 import asyncio
 import atexit
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass, asdict
+from functools import lru_cache
 from typing import Any, Callable, Optional, Protocol, Final
-
 
 # LangGraph type (soft-optional at import-time to avoid hard dependency in tests)
 try:  # pragma: no cover
@@ -31,10 +31,9 @@ from workshops_ai.settings import get_settings, AppSettings
 from workshops_ai.graph.checkpointer import make_checkpointer as _central_make_checkpointer
 
 # Central LLM client + RAG retriever
-# NOTE: We keep the import for consistency, but we no longer use the ad-hoc client maker.
-# OLD: from workshops_ai.llm.client import make_llm_client_from_settings
-# NEW: We force LangChain ChatOpenAI, configured from settings.
-from workshops_ai.llm.client import make_llm_client_from_settings  # nosec B101 (kept for backward compat, not used)
+# NOTE: Keep this import to avoid breaking older code-paths that side-effect at import time.
+from workshops_ai.llm.client import make_llm_client_from_settings  # noqa: F401
+
 from workshops_ai.rag.retriever import make_retriever as _rag_make_retriever
 
 # Enforce LangChain OpenAI chat model
@@ -48,6 +47,9 @@ from workshops_ai.app.services.outbox_writer import (
 
 # Changeset model (type hints for submit callable)
 from workshops_ai.models.changeset import ChangeSet
+
+# Optional: used by GraphDeps.thread_id_for(...) helper
+from workshops_ai.schemas.ui_contract import UIRequest
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,66 @@ class Retriever(Protocol):
 
 MakeRetriever = Callable[[str, str], Optional[Retriever]]
 
+# =============================================================================
+# LRU-cached builders (LLM client, Checkpointer)
+# =============================================================================
+
+@lru_cache(maxsize=8)
+def _get_llm_client_cached(
+    *,
+    model: str,
+    temperature: float,
+    http_timeout_sec: Optional[int],
+    max_retries: Optional[int],
+    api_key: str,
+    base_url: Optional[str],
+) -> Any:
+    """
+    Build a LangChain ChatOpenAI client and cache it by its immutable config.
+    This avoids re-instantiation per request/graph build.
+    """
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "api_key": api_key,
+        "temperature": float(temperature),
+    }
+    if base_url:
+        kwargs["base_url"] = base_url
+    if http_timeout_sec is not None:
+        kwargs["timeout"] = int(http_timeout_sec)
+    if max_retries is not None:
+        kwargs["max_retries"] = int(max_retries)
+
+    return ChatOpenAI(**kwargs)  # type: ignore[call-arg]
+
+
+@lru_cache(maxsize=8)
+def _get_checkpointer_cached(
+    *,
+    kind: str | None,
+    redis_url: str | None,
+    sqlite_path: str | None,
+    namespace: str | None,
+    ttl_sec: int | None,
+) -> Any:
+    """
+    Build the LangGraph checkpointer and cache it by its effective backend config.
+    Supports two signatures of the central builder:
+      - make_checkpointer(settings=AppSettings)
+      - make_checkpointer(kind=..., redis_url=..., sqlite_path=..., namespace=..., ttl_sec=...)
+    """
+    # Try param-based constructor first; if unavailable, fall back to settings-based.
+    try:
+        return _central_make_checkpointer(
+            kind=kind,
+            redis_url=redis_url,
+            sqlite_path=sqlite_path,
+            namespace=namespace,
+            ttl_sec=ttl_sec,
+        )
+    except TypeError:
+        # Fallback if the project's builder expects settings only.
+        return _central_make_checkpointer(settings=get_settings())
 
 # =============================================================================
 # Redis-backed ephemeral memory accessors (per-org/session)
@@ -82,6 +144,12 @@ class MemorySet(Protocol):
     async def __call__(self, key: str, value: str, *, ttl_sec: Optional[int] = None) -> None: ...
     # Runtime adapter also accepts keyword-only args:
     #   memory_set(org_id=..., user_id=..., thread_id=..., namespace=..., key=..., value=..., ttl_sec=...)
+
+
+class MemoryDelete(Protocol):
+    async def __call__(self, key: str) -> None: ...
+    # Runtime adapter also accepts keyword-only args:
+    #   memory_delete(org_id=..., user_id=..., thread_id=..., namespace=..., key=...)
 
 
 # Submit callable protocol (graphs call this to persist mutations)
@@ -124,12 +192,38 @@ class GraphDeps:
     # Ephemeral memory helpers (Redis if configured, no-ops otherwise)
     memory_get: MemoryGet | None = None
     memory_set: MemorySet | None = None
+    memory_delete: MemoryDelete | None = None  # allows graphs to clear per-turn drafts/state
 
     # Mutations: submit changeset (online preferred, fallback to OUTBOX)
     submit_changeset: SubmitChangeSet | None = None
 
+    # Back-compat alias expected by some routers/tools
+    submit_or_outbox: SubmitChangeSet | None = None
+
     # Expose checkpoint namespace so routers/tests can pass it to LangGraph
     checkpoint_ns: str | None = None
+
+    # Optional request-scoped policy snapshot (e.g., TTLs for memory)
+    effective_policy: Any | None = None
+
+    # Stable per-thread key builder (used by graphs for memory key composition)
+    def thread_id_for(self, req: Optional[UIRequest] = None) -> str:
+        """
+        Build a stable 'thread_id' suffix for memory keys. If UIRequest provides an
+        explicit thread_id, use it; otherwise derive from (user_id, tab).
+        """
+        try:
+            if req and getattr(req, "thread_id", None):
+                return str(req.thread_id)
+            if req and isinstance(req.body, dict):
+                t = req.body.get("thread_id")
+                if t:
+                    return str(t)
+        except Exception:
+            pass
+        uid = (getattr(req, "user_id", None) or "anon").strip() or "anon"
+        tab = (getattr(req, "active_tab", None) or self.tab or "assets").strip() or "assets"
+        return f"{uid}:{tab}"
 
 
 # =============================================================================
@@ -168,7 +262,7 @@ def build_graph(tab: str, deps: GraphDeps) -> RunnableGraph:
 
 def _coerce_mem_args(*args, **kwargs) -> dict[str, Any]:
     """
-    Normalize arguments for memory_get/set adapter to support both calling styles.
+    Normalize arguments for memory_get/set/delete adapter to support both calling styles.
 
     Returns a dict:
       {
@@ -227,14 +321,15 @@ def _coerce_mem_args(*args, **kwargs) -> dict[str, Any]:
 
 def make_redis_memory(settings: AppSettings):
     """
-    Return (async) memory_get, memory_set functions.
+    Return (async) memory_get, memory_set, memory_delete functions.
 
     Manager/routers may call with rich kwargs:
       memory_get(org_id=..., user_id=..., thread_id=..., namespace=..., key=...)
       memory_set(org_id=..., user_id=..., thread_id=..., namespace=..., key=..., value=..., ttl_sec=...)
+      memory_delete(org_id=..., user_id=..., thread_id=..., namespace=..., key=...)
 
     Rolling window adapters call with simple positional/keyword:
-      get(key), set(key, value, ttl=?)
+      get(key), set(key, value, ttl=?), delete(key)
 
     We support both. If Redis is unavailable, return no-op coroutines with the same API.
     """
@@ -250,16 +345,18 @@ def make_redis_memory(settings: AppSettings):
     # ------------------------------
     if not redis_url or AsyncRedis is None:
         async def memory_get_noop(*args, **kwargs) -> Optional[str]:
-            # Accept both calling styles; always return None
             _ = _coerce_mem_args(*args, **kwargs)
             return None
 
         async def memory_set_noop(*args, **kwargs) -> None:
-            # Accept both calling styles; do nothing
             _ = _coerce_mem_args(*args, **kwargs)
             return None
 
-        return memory_get_noop, memory_set_noop
+        async def memory_delete_noop(*args, **kwargs) -> None:
+            _ = _coerce_mem_args(*args, **kwargs)
+            return None
+
+        return memory_get_noop, memory_set_noop, memory_delete_noop
 
     # ------------------------------
     # Redis-backed implementation
@@ -274,9 +371,8 @@ def make_redis_memory(settings: AppSettings):
     async def memory_get(*args, **kwargs) -> Optional[str]:
         fields = _coerce_mem_args(*args, **kwargs)
         if fields["mode"] == "simple":
-            # The simple form already passes a fully-composed key (produced by RollingWindowMemory)
+            # The simple form already passes a fully-composed key (e.g., from RollingWindowMemory)
             return await client.get(fields["key"])
-        # Rich form → we compose a deterministic key
         k = _compose_key(
             org_id=fields["org_id"],
             user_id=fields["user_id"],
@@ -309,6 +405,20 @@ def make_redis_memory(settings: AppSettings):
         else:
             await client.set(k, fields["value"])
 
+    async def memory_delete(*args, **kwargs) -> None:
+        fields = _coerce_mem_args(*args, **kwargs)
+        if fields["mode"] == "simple":
+            await client.delete(fields["key"])
+            return
+        k = _compose_key(
+            org_id=fields["org_id"],
+            user_id=fields["user_id"],
+            thread_id=fields["thread_id"],
+            namespace=fields["namespace"],
+            key=fields["key"],
+        )
+        await client.delete(k)
+
     # Close client on interpreter exit (best-effort)
     def _finalizer() -> None:
         try:
@@ -322,7 +432,7 @@ def make_redis_memory(settings: AppSettings):
             pass
 
     atexit.register(_finalizer)
-    return memory_get, memory_set
+    return memory_get, memory_set, memory_delete
 
 
 # =============================================================================
@@ -374,7 +484,7 @@ def make_default_deps(
     ws_hub: Any | None = None,
     make_retriever: Optional[MakeRetriever] = None,
     # --- LLM DI (preferred) ---
-    llm_client: Any | None = None,
+    llm_client: Any | None = None,        # ignored on purpose; we enforce ChatOpenAI below
     llm_temperature: float | None = None,
     # legacy LLM handle (kept to avoid breaking older graphs)
     llm: Any | None = None,
@@ -393,8 +503,22 @@ def make_default_deps(
     # Settings first (manager may pass settings; routers often pass app.state.settings)
     s = settings or get_settings()
 
-    # Central checkpointer (redis/sqlite/memory per settings)
-    saver = _central_make_checkpointer(settings=s)
+    # --- Checkpointer (CACHED) ---
+    # OLD:
+    # saver = _central_make_checkpointer(settings=s)
+    # NEW: derive an immutable fingerprint from settings and use the cached builder
+    kind = getattr(getattr(s, "checkpointer", object()), "kind", None) or getattr(s, "checkpointer_kind", None)
+    redis_url = getattr(getattr(s, "redis", object()), "url", None)
+    sqlite_path = getattr(getattr(getattr(s, "sqlite", object()), "ckpt_path", object()), "__str__", lambda: None)()
+    ns = getattr(s, "checkpoint_ns", None)
+    ttl_sec = getattr(s, "checkpoint_ttl_sec", None)
+    saver = _get_checkpointer_cached(
+        kind=kind,
+        redis_url=redis_url,
+        sqlite_path=sqlite_path,
+        namespace=ns,
+        ttl_sec=ttl_sec,
+    )
 
     # Backend port (prefer provider, fallback to CSV, else None)
     if backend_port is None:
@@ -419,15 +543,28 @@ def make_default_deps(
 
     # Ephemeral memory (Redis if configured; else no-op)
     if memory_get is None or memory_set is None:
-        mget, mset = make_redis_memory(s)
+        mget, mset, mdel = make_redis_memory(s)
         memory_get = memory_get or mget
         memory_set = memory_set or mset
+        memory_delete = mdel
+    else:
+        # Manager may inject its own memory; keep delete unset unless provided elsewhere.
+        memory_delete = None
 
     # Submit callable (online preferred, fallback to OUTBOX)
     if submit_changeset is None:
         submit_changeset = _make_submit_callable(s)
 
-    # Force LangChain ChatOpenAI from settings; do not rely on external clients.
+    # Back-compat alias for routers/tools still calling deps.submit_or_outbox(...)
+    async def _submit_or_outbox(
+        changeset: ChangeSet,
+        *,
+        require_success: bool = False
+    ) -> SubmitOrFallbackResult:
+        # Delegate to the unified submitter; same return type everywhere.
+        return await submit_changeset(changeset, require_success=require_success)
+
+    # --- LLM client (CACHED, forced to ChatOpenAI) ---
     if llm_temperature is None:
         llm_temperature = float(getattr(getattr(s, "llm", object()), "temperature", 0.2))
 
@@ -440,14 +577,16 @@ def make_default_deps(
     if not model or not api_key:
         raise RuntimeError("ChatOpenAI cannot be constructed: missing llm.model or API key in settings.")
 
-    # Construct ChatOpenAI using settings (model, api_key, base_url, temperature, timeout, max_retries)
-    llm_client = ChatOpenAI(  # type: ignore[call-arg]
+    # OLD (uncached):
+    # llm_client = ChatOpenAI(model=model, api_key=api_key, temperature=llm_temperature, timeout=http_timeout, max_retries=max_retries, base_url=base_url)
+    # NEW (cached):
+    llm_client = _get_llm_client_cached(
         model=model,
         api_key=api_key,
-        base_url=base_url,
         temperature=llm_temperature,
-        timeout=http_timeout,
+        http_timeout_sec=http_timeout,
         max_retries=max_retries,
+        base_url=base_url,
     )
 
     # One-time wiring log for the LLM client (best-effort)
@@ -462,7 +601,7 @@ def make_default_deps(
         pass
 
     # Expose checkpoint namespace (helps routers/tests pass it to LangGraph)
-    ns = getattr(s, "checkpoint_ns", None) or getattr(getattr(s, "checkpointer", object()), "namespace", None)
+    ckpt_ns = ns or getattr(getattr(s, "checkpointer", object()), "namespace", None)
 
     return GraphDeps(
         backend_port=backend_port,
@@ -478,8 +617,12 @@ def make_default_deps(
         # --- Memory + submit ---
         memory_get=memory_get,             # rich-kwargs + simple positional adapter (or no-op)
         memory_set=memory_set,             # rich-kwargs + simple positional adapter (or no-op)
+        memory_delete=memory_delete,
         submit_changeset=submit_changeset,
-        checkpoint_ns=ns,
+        submit_or_outbox=_submit_or_outbox,  # <— compatibility alias
+        checkpoint_ns=ckpt_ns,
+        # Optional: manager/routers can set an EffectivePolicy later; default None keeps behavior unchanged
+        effective_policy=None,
     )
 
 
@@ -520,7 +663,7 @@ async def _invoke_async(graph: RunnableGraph, inputs: Any, config: Optional[dict
             None, lambda: graph.invoke(inputs, config=config)  # type: ignore[misc]
         )
     if hasattr(graph, "invoke"):
-        return await loop.run_in_executor(None, lambda: graph.invoke(inputs))  # type: ignore[misc]
+        return await loop.run_in_executor(None, lambda: graph.invoke(inputs))  # type: ignore/misc
     return await loop.run_in_executor(None, lambda: graph(inputs))  # type: ignore[operator]
 
 
@@ -581,11 +724,21 @@ def build_checkpointer(settings: AppSettings | None = None) -> Any:
     Compatibility wrapper.
     - If called as build_checkpointer() -> uses get_settings() internally.
     - If called as build_checkpointer(settings) or build_checkpointer(settings=...),
-      forwards to the centralized builder.
+      forwards to the centralized (CACHED) builder.
     """
-    if settings is None:
-        settings = get_settings()
-    return _central_make_checkpointer(settings=settings)
+    s = settings or get_settings()
+    kind = getattr(getattr(s, "checkpointer", object()), "kind", None) or getattr(s, "checkpointer_kind", None)
+    redis_url = getattr(getattr(s, "redis", object()), "url", None)
+    sqlite_path = getattr(getattr(getattr(s, "sqlite", object()), "ckpt_path", object()), "__str__", lambda: None)()
+    ns = getattr(s, "checkpoint_ns", None)
+    ttl_sec = getattr(s, "checkpoint_ttl_sec", None)
+    return _get_checkpointer_cached(
+        kind=kind,
+        redis_url=redis_url,
+        sqlite_path=sqlite_path,
+        namespace=ns,
+        ttl_sec=ttl_sec,
+    )
 
 
 __all__ = [
@@ -601,4 +754,8 @@ __all__ = [
     "get_graph_deps",
     "make_langgraph_config",
     "build_checkpointer",
+    # Optionally export memory protocol for testing/injection
+    "MemoryGet",
+    "MemorySet",
+    "MemoryDelete",
 ]

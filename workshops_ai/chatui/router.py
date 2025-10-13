@@ -47,7 +47,7 @@ async def demo_page() -> str:
     main { display: grid; grid-template-columns: 1fr 360px; gap: 12px; padding: 12px; height: calc(100vh - 64px); box-sizing: border-box; }
     .chat, .events { background: #0f1730; border: 1px solid #1d2750; border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; }
     .chat-log { flex: 1; overflow: auto; padding: 12px; }
-    .msg { margin: 8px 0; line-height: 1.4; }
+    .msg { margin: 8px 0; line-height: 1.4; white-space: pre-wrap; }
     .msg.me { color: #c8e1ff; }
     .msg.ai { color: #a7f3d0; }
     .msg.sys { color: #facc15; }
@@ -61,6 +61,7 @@ async def demo_page() -> str:
       main { grid-template-columns: 1fr; height: auto; }
       .events { min-height: 200px; }
     }
+    .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#0b1228; border:1px solid #233266; border-radius:6px; padding:1px 6px; }
   </style>
 </head>
 <body>
@@ -110,26 +111,15 @@ async def demo_page() -> str:
 
     let ws = null;
 
-    // Chat lines: text only. Any non-string is hinted and logged to Events.
+    // --- Chat UI helpers ------------------------------------------------------
     function line(kind, content) {
       const wrap = document.createElement('div');
       wrap.className = `msg ${kind}`;
-
-      let text;
-      if (content === null || content === undefined) {
-        text = String(content);
-      } else if (typeof content === 'string') {
-        text = content;
-      } else {
-        text = '[JSON attached → see Events]';
-        // Also mirror the raw object to the right panel for inspection
-        try { ev({ type: 'chat_message_json', payload: content }); } catch {}
-      }
-
       const el = document.createElement('div');
-      el.textContent = text;
+      el.textContent = (content === null || content === undefined)
+        ? String(content)
+        : (typeof content === 'string' ? content : '[JSON attached → see Events]');
       wrap.appendChild(el);
-
       chat.appendChild(wrap);
       chat.scrollTop = chat.scrollHeight;
     }
@@ -141,9 +131,59 @@ async def demo_page() -> str:
       eventsEl.scrollTop = eventsEl.scrollHeight;
     }
 
+    // We don't decide language here — agent does. We just pass a hint.
+    function browserAcceptLanguage() {
+      const nav = navigator.languages && navigator.languages.length
+        ? navigator.languages.join(', ')
+        : (navigator.language || 'en');
+      return nav;
+    }
+
+    // --- Humanizers: show selected JSON as friendly chat lines ----------------
+    function humanizeAssetList(payload) {
+      try {
+        const n = payload.count ?? (payload.assets ? payload.assets.length : 0);
+        const names = (payload.assets || []).map(a => a.name).filter(Boolean);
+        const head = `Assets (${n}):`;
+        if (!names.length) return head;
+        const shown = names.slice(0, 12).join(', ');
+        const more = names.length > 12 ? ` … +${names.length - 12} more` : '';
+        return `${head} ${shown}${more}`;
+      } catch { return null; }
+    }
+    function humanizeChangesetQueued(payload) {
+      const p = payload?.outbox_path || '(outbox)';
+      return `Changeset queued → ${p}`;
+    }
+    function humanizeChangesetSubmitted(payload) {
+      const n = payload?.actions ?? '?';
+      const t = payload?.transport ?? 'unknown';
+      return `Changeset submitted (${n}) via ${t}.`;
+    }
+
+    function renderMessageObject(obj, source = 'http') {
+      const kind = obj?.kind || obj?.type;
+      let text = null;
+
+      if (kind === 'asset.list') {
+        text = humanizeAssetList(obj);
+      } else if (kind === 'changeset.queued') {
+        text = humanizeChangesetQueued(obj);
+      } else if (kind === 'changeset.submitted') {
+        text = humanizeChangesetSubmitted(obj);
+      } else if (kind === 'llm.say' && typeof obj.text === 'string') {
+        text = obj.text;
+      }
+
+      ev({ type: source === 'ws' ? 'ws_message_json' : 'chat_message_json', payload: obj });
+      if (text) line('ai', text);
+    }
+
+    // --- HTTP /api/chat -------------------------------------------------------
     async function sendMessage() {
       const text = msg.value;
       if (!text.trim()) return;
+
       const payload = {
         org_id: org.value.trim(),
         active_tab: tab.value,
@@ -152,15 +192,17 @@ async def demo_page() -> str:
         staging: false,
         user_id: user.value.trim(),
       };
+
       line('me', payload.message || '(empty)');
       msg.value = '';
 
       const headers = { 'Content-Type': 'application/json' };
       const key = apiKey.value.trim();
       if (key) headers['X-API-Key'] = key;
+      // >>> important: pass Accept-Language as HTTP header <<<
+      headers['Accept-Language'] = browserAcceptLanguage();
 
       try {
-        // Add api_key as query param as well (proxies/CORS tolerant)
         const chatUrl = new URL('/api/chat', window.location.origin);
         if (key) chatUrl.searchParams.set('api_key', key);
 
@@ -179,31 +221,21 @@ async def demo_page() -> str:
         }
 
         if (res.ok) {
-          // Chat bubble shows only strings; JSONs go to Events
+          // Strings (LLM text) go straight into chat
           (data.messages || []).forEach(item => {
             if (typeof item === 'string') {
               line('ai', item);
-            } else {
-              ev({ type: 'chat_message_json', payload: item });
-              // Optional short hint in chat:
-              // line('sys', '[JSON attached → see Events]');
+            } else if (item && typeof item === 'object') {
+              // Known JSON payloads → humanize into chat + mirror to Events
+              renderMessageObject(item, 'http');
             }
           });
-          // If server returned a legacy `outbox_path` outside of messages, show it in Events
-          if (data.outbox_path) {
-            ev({ type: 'outbox', path: data.outbox_path });
-          }
-          if (data.proposals) {
-            line('sys', '[proposals attached]');
-            ev({ type: 'proposals', proposals: data.proposals });
-          }
-          if (data.staging) {
-            ev({ type: 'staging', staging: data.staging });
-          }
-          if (data.agent_events) {
-            // Only in the right panel (no JSON in chat)
-            ev({ type: 'agent_events', events: data.agent_events });
-          }
+
+          // Legacy mirrors to Events only
+          if (data.outbox_path) ev({ type: 'outbox', path: data.outbox_path });
+          if (data.proposals) { line('sys', '[proposals attached]'); ev({ type: 'proposals', proposals: data.proposals }); }
+          if (data.staging) ev({ type: 'staging', staging: data.staging });
+          if (data.agent_events) ev({ type: 'agent_events', events: data.agent_events });
         } else {
           line('sys', `ERROR ${res.status}: ${data?.message || 'Request failed'}`);
           ev({ type: 'error', data });
@@ -213,6 +245,7 @@ async def demo_page() -> str:
       }
     }
 
+    // --- WebSocket /ws --------------------------------------------------------
     function connectWs() {
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
         ws.close(1000, 'reconnect');
@@ -220,11 +253,11 @@ async def demo_page() -> str:
       const url = new URL(window.location.href);
       url.protocol = url.protocol.replace('http', 'ws'); // http → ws, https → wss
       url.pathname = '/ws';
-      // Send both for compatibility (server commonly expects `tab`)
       url.searchParams.set('tab', tab.value);
       url.searchParams.set('active_tab', tab.value);
       url.searchParams.set('org_id', org.value.trim());
       url.searchParams.set('user_id', user.value.trim());
+      url.searchParams.set('accept_language', browserAcceptLanguage()); // pass to WS as query param
       const key = apiKey.value.trim();
       if (key) url.searchParams.set('api_key', key);
 
@@ -233,29 +266,34 @@ async def demo_page() -> str:
       ws.onmessage = (evt) => {
         try {
           const data = JSON.parse(evt.data);
-          // AgentEvent frames are raw JSON; chat frames may be wrapped {type, payload}
+
           if (data && typeof data === 'object') {
-            if (data.type && data.payload) {
-              // Structured chat/info frames from server
+            // Our server often wraps WS frames as { type, payload }
+            if (data.type && data.payload !== undefined) {
               ev({ ws_type: data.type, payload: data.payload });
+
+              // Friendly one-liners
               if (data.type === 'info' && data.payload && data.payload.message) {
-                // Only plain text goes into the chat
                 line('sys', data.payload.message);
               }
-              // Friendly one-liner for our changeset events
-              if (data.type === 'changeset.submitted' && data.payload) {
-                const n = data.payload.actions ?? '?';
-                const transport = data.payload.transport ?? 'unknown';
-                line('sys', `Changeset submitted (${n} action(s)) via ${transport}.`);
+              if (data.type === 'changeset.submitted') {
+                line('sys', humanizeChangesetSubmitted(data.payload));
               }
-              if (data.type === 'changeset.queued' && data.payload) {
-                const p = data.payload.outbox_path ?? '(outbox)';
-                line('sys', `Changeset queued to outbox: ${p}`);
+              if (data.type === 'changeset.queued') {
+                line('sys', humanizeChangesetQueued(data.payload));
+              }
+
+              // Server-pushed chat JSON via WS
+              if (data.type === 'chat_message_json' && data.payload) {
+                renderMessageObject(data.payload, 'ws');
+              }
+              // Server-pushed plain chat strings via WS
+              if (data.type === 'chat_message' && typeof data.payload === 'string') {
+                line('ai', data.payload);
               }
             } else {
-              // Raw AgentEvent (asset.created / impact.set / etc.) → Events only
+              // Raw AgentEvent → Events only
               ev(data);
-              // No JSON echo into chat
             }
           }
         } catch (e) {
@@ -266,17 +304,14 @@ async def demo_page() -> str:
       ws.onerror = () => { line('sys', 'WS error'); };
     }
 
-    // Click to send
+    // --- Wire UI --------------------------------------------------------------
     sendBtn.addEventListener('click', sendMessage);
-
-    // ENTER to send, SHIFT+ENTER for newline
     msg.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
       }
     });
-
     wsBtn.addEventListener('click', connectWs);
     window.addEventListener('load', () => {
       const url = new URL(location.href);

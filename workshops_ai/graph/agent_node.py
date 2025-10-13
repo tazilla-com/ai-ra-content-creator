@@ -13,26 +13,33 @@
 #   - No tool execution happens here; this node only decides & validates.
 #   - Supports multiple client shapes: OpenAI Chat Completions, OpenAI Responses, LangChain ChatModel.
 #   - Integrated lightweight debug telemetry (telemetry_debug.DecideSpan).
-
+#   - Language policy: the agent must always respond in the user's language (cs/sk/en) inferred from
+#     `language` or `locale`. We inject a compact **system.md** plus an optional domain prompt
+#     to enforce style, one-tool-per-turn, slot-filling, and **full list** rules.
+#
+# Changes in this version (LLM-first planner):
+#   - Injects `prompts/system.md` (compact) + optional domain prompt for the current `tab`.
+#   - Feeds a compact `{{tools}}` JSON (from ToolRegistry) into the system prompt.
+#   - Removes any notion of pseudo "help/chitchat" actions — reply-only text is used when no tool is chosen.
+#   - Preserves existing client compatibility and telemetry.
+#
 from __future__ import annotations
 
 import json
 import logging
+import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Literal, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from workshops_ai.graph.factory import GraphDeps
 
-from workshops_ai.llm.tools_adapter import sanitize_tools, canonical_name
-
 from pydantic import BaseModel, Field, ConfigDict, ValidationError
 
-logger = logging.getLogger(__name__)
-
-# =============================================================================
-# SSOT: Tool Registry
-# =============================================================================
+from workshops_ai.llm.tools_adapter import sanitize_tools, canonical_name
 from workshops_ai.agents.tools.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 # Optional, best-effort debug telemetry (all calls wrapped in try/except)
 try:
@@ -67,6 +74,150 @@ class AgentDecision(BaseModel):
     @property
     def tool_payload(self) -> Dict[str, Any]:  # pragma: no cover
         return self.args
+
+
+# =============================================================================
+# Prompt loading / rendering helpers
+# =============================================================================
+
+_PROMPTS_DIR = Path("workshops_ai/prompts")
+
+def _read_text_safe(path: Path) -> str:
+    """Read a UTF-8 text file; return '' if missing or unreadable."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+def _minify_markdown(md: str) -> str:
+    """
+    Token-economical minifier for Markdown prompts:
+      - Remove HTML/MD comments.
+      - Collapse excessive blank lines.
+      - Strip trailing spaces.
+    Keeps headings and list formatting intact.
+    """
+    if not md:
+        return ""
+    # Remove <!-- ... --> comments (single line or multi-line)
+    md = re.sub(r"<!--.*?-->", "", md, flags=re.DOTALL)
+    # Remove fenced code comments that are entirely commented out (rare)
+    md = re.sub(r"```(?:.*?)```", lambda m: m.group(0).rstrip(), md, flags=re.DOTALL)
+    # Collapse 3+ blank lines to 2
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    # Strip trailing spaces per line
+    md = "\n".join(line.rstrip() for line in md.splitlines())
+    return md.strip()
+
+def _compact_history(history: List[dict[str, str]] | None, max_chars: int = 1200) -> str:
+    """
+    Produce a compact, language-agnostic history summary suitable for injection into system prompt.
+    Keeps only short 'user'/'assistant' messages; drops 'system'.
+    """
+    if not history:
+        return ""
+    buf: List[str] = []
+    used = 0
+    for m in history:
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        # Keep first 300 chars from each turn to maintain signal
+        snippet = (content[:300] + ("…" if len(content) > 300 else ""))
+        line = f"{role}: {snippet}"
+        if used + len(line) + 1 > max_chars:
+            break
+        buf.append(line)
+        used += len(line) + 1
+    return " | ".join(buf)
+
+def _tools_for_prompt(functions: List[Dict[str, Any]]) -> str:
+    """
+    Convert OpenAI 'tools' (sanitized) into a compact JSON for {{tools}}:
+      [
+        {"name": "...", "description": "...", "required": ["..."], "parameters": {...}},
+        ...
+      ]
+    We keep 'parameters' but leave it compact (no whitespace).
+    """
+    out = []
+    for f in functions:
+        fn = f.get("function") or {}
+        name = fn.get("name")
+        desc = fn.get("description")
+        params = fn.get("parameters") or {}
+        required = []
+        try:
+            required = list((params.get("required") or []))
+        except Exception:
+            required = []
+        out.append({
+            "name": name,
+            "description": desc,
+            "required": required,
+            "parameters": params,  # keep full schema (compact) for validation hints in the model
+        })
+    return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+
+def _render_system_prompt(
+    *,
+    tab: str,
+    language: str,
+    locale: str | None,
+    org_id: str | None,
+    thread_id: str | None,
+    policy: Dict[str, Any] | None,
+    selection: Dict[str, Any] | None,
+    history_compact: str,
+    tools_json: str,
+) -> str:
+    """
+    Load and render the compact system prompt with runtime variables.
+    Attempts to load an optional domain prompt for the given `tab` as well.
+    Returns a single minified Markdown string.
+    """
+    sys_md = _read_text_safe(_PROMPTS_DIR / "system.md")
+    sys_md = _minify_markdown(sys_md)
+
+    # Optional domain prompt (assets.md, impacts.md, threats.md, controls.md)
+    dom_md = _read_text_safe(_PROMPTS_DIR / f"{tab}.md")
+    dom_md = _minify_markdown(dom_md)
+
+    # Best-effort variable map
+    policy = policy or {}
+    selection = selection or {}
+    locale = locale or language
+    org_id = org_id or ""
+    thread_id = thread_id or ""
+
+    def repl(md: str) -> str:
+        return (
+            md.replace("{{tab}}", tab or "")
+              .replace("{{language}}", language or "en")
+              .replace("{{locale}}", locale or "")
+              .replace("{{org_id}}", org_id or "")
+              .replace("{{thread_id}}", thread_id or "")
+              .replace("{{history}}", history_compact or "")
+              .replace("{{tools}}", tools_json or "[]")
+              .replace("{{selection}}", json.dumps(selection, ensure_ascii=False))
+              .replace("{{policy.preview_required}}", json.dumps(policy.get("preview_required"), ensure_ascii=False))
+              .replace("{{policy.emit_changes_enabled}}", json.dumps(policy.get("emit_changes_enabled"), ensure_ascii=False))
+        )
+
+    sys_md = repl(sys_md)
+    dom_md = repl(dom_md) if dom_md else ""
+
+    # Final combined prompt: system first, then domain (if any), then a tiny guardrail.
+    guard = (
+        f"You MUST reply in {language}. Use exactly one tool if needed; "
+        "otherwise reply conversationally. Ask at most one concise question if a required slot is missing."
+    )
+
+    parts = [p for p in [sys_md, dom_md, guard] if p]
+    return "\n\n".join(parts)
 
 
 # =============================================================================
@@ -212,7 +363,7 @@ def _call_llm_with_tools(
     except Exception as e:
         logger.debug("OpenAI Responses path failed or unavailable: %s", e)
 
-       # ---------- LangChain ChatModel .invoke() ----------
+    # ---------- LangChain ChatModel .invoke() ----------
     try:
         if hasattr(client, "invoke"):
             lc_messages = messages
@@ -233,13 +384,13 @@ def _call_llm_with_tools(
             except Exception:
                 pass
 
-            # 🔧 NEW: bind OpenAI-style tools into the LC model if possible
+            # 🔧 Bind OpenAI-style tools into the LC model if possible
             model_to_use = client
             try:
                 bind_tools = getattr(client, "bind_tools", None)
                 if callable(bind_tools):
                     # LangChain expects OpenAI tool schema: [{"type":"function","function":{...}}, ...]
-                    model_to_use = bind_tools(safe_functions)  # type: ignore[arg-type]
+                    model_to_use = bind_tools(sanitize_tools(functions)[0])  # type: ignore[arg-type]
             except Exception:
                 pass
 
@@ -302,7 +453,6 @@ def _call_llm_with_tools(
         logger.debug("LangChain invoke path failed or unavailable: %s", e)
 
 
-
 # =============================================================================
 # Public API
 # =============================================================================
@@ -325,29 +475,29 @@ async def agent_decide(
       - Validate args and resolve registry endpoint/op
       - Emit AgentDecision or a short natural-language reply
       - Emit debug telemetry spans (best-effort, non-fatal)
+
+    ✨ Language & prompt behavior in this version:
+      - Compute `lang` from `language` or `locale` (default 'en').
+      - Inject compact **system.md** with runtime placeholders ({{tools}}, {{language}}, {{history}}, …).
+      - Optionally inject a domain prompt for the current `tab` if present.
+      - Add a tiny guardrail line (reply in lang, one tool if needed, one clarify max).
     """
     lang = (language or locale or "en").strip().lower()
     ToolRegistry.ensure_initialized()
     tab_key = (tab or "").strip().lower()
 
-    # Normalize conversation messages: keep only system/user/assistant
-    msgs = list(history or [])
-    msgs = [m for m in msgs if isinstance(m, dict) and m.get("role") in ("system", "user", "assistant")]
-    msgs.append({"role": "user", "content": message})
-
     # Resolve available tools from registry for the tab
-    registry_functions = ToolRegistry.as_openai_functions(tab_key)
-
-    if not registry_functions:
+    # NOTE: We do NOT add any pseudo "help/chitchat" actions here.
+    registry_functions_all = ToolRegistry.as_openai_functions(tab_key)
+    if not registry_functions_all:
         logger.warning("agent_decide: no tools registered for tab='%s'; reply-only fallback.", tab_key)
         return AgentDecision(reply=_fallback_clarify(lang))
 
     # If Manager provided a whitelist (allowed_actions), filter by function name.
-    # (We expect registry_functions items like {"type": "function", "function": {"name": "...", ...}})
     if allowed_actions:
         allowed = set(a.strip() for a in allowed_actions if a and isinstance(a, str))
         filtered: list[dict[str, Any]] = []
-        for f in registry_functions:
+        for f in registry_functions_all:
             try:
                 fn = f.get("function") or {}
                 name = fn.get("name")
@@ -355,12 +505,11 @@ async def agent_decide(
                     filtered.append(f)
             except Exception:
                 continue
-        allowed_functions = filtered or registry_functions  # if filter empties out, fall back to full set (safer)
+        registry_functions = filtered or registry_functions_all  # fallback to avoid dead-ends
     else:
-        allowed_functions = registry_functions
+        registry_functions = registry_functions_all
 
-    # --- NEW: lightweight, non-regex prioritization of tools based on the user message intent ---
-    # Goal: bias "create" when the user says "vytvoř/přidej/create/add", etc., without forcing a tool.
+    # Lightweight priority bias (does NOT force a specific tool)
     def _fn_name(item: dict[str, Any]) -> str:
         try:
             return str(((item.get("function") or {}).get("name")) or "")
@@ -368,25 +517,19 @@ async def agent_decide(
             return ""
 
     def _score(name: str, user_msg: str) -> int:
-        # NOTE: No regexes. Pure lowercase substring checks.
         msg = user_msg.lower()
         s = 0
-        # General tiny bias: prefer mutations over listing when ambiguous
         if ".create" in name:
             s += 10
         if ".update" in name or ".set" in name:
             s += 5
-
-        # Czech/Slovak/English verbs (extend if needed)
         create_tokens = ["vytvoř", "vytvor", "přidej", "pridaj", "add", "create", "new", "založ", "zaloz"]
         list_tokens   = ["ukaž", "ukaz", "vypiš", "vypis", "seznam", "list", "show"]
         explain_tokens= ["vysvětli", "vysvetli", "explain", "co je", "what is"]
         update_tokens = ["přejmenuj", "premen", "rename", "upravit", "uprav", "update", "nastav", "set"]
-
         if any(t in msg for t in create_tokens):
             if name.endswith(".create"):
                 s += 100
-            # Slightly demote listing in a create-intent turn
             if name.endswith(".list"):
                 s -= 5
         if any(t in msg for t in list_tokens):
@@ -401,18 +544,57 @@ async def agent_decide(
         return s
 
     try:
-        # Stable sort by (-score, original index) to keep registry order as tie-breaker
-        _indexed = list(enumerate(allowed_functions))
-        _indexed.sort(
-            key=lambda pair: (
-                -_score(_fn_name(pair[1]), message),
-                pair[0],
-            )
-        )
-        allowed_functions = [it for _, it in _indexed]
+        _indexed = list(enumerate(registry_functions))
+        _indexed.sort(key=lambda pair: (-_score(_fn_name(pair[1]), message), pair[0]))
+        registry_functions = [it for _, it in _indexed]
     except Exception:
-        # Never fail because of prioritization — just keep original order
-        pass
+        pass  # prioritization must never break the flow
+
+    # ---- Build LLM messages (system + optional domain + history + user) ----
+    # History: keep original chat history for the model AND a compact summary for the system prompt.
+    history = history or []
+    history_compact = _compact_history(history)
+
+    # Compact tools JSON for {{tools}} injection
+    tools_json = _tools_for_prompt(registry_functions)
+
+    # Best-effort org/thread/policy from deps (optional)
+    org_id = getattr(getattr(deps, "context", None), "org_id", None)
+    thread_id = getattr(getattr(deps, "context", None), "thread_id", None)
+    policy = {}
+    try:
+        pol = getattr(getattr(deps, "context", None), "policy", None)
+        if isinstance(pol, dict):
+            policy = pol
+    except Exception:
+        policy = {}
+
+    system_text = _render_system_prompt(
+        tab=tab_key,
+        language=lang,
+        locale=locale or lang,
+        org_id=org_id,
+        thread_id=thread_id,
+        policy=policy,
+        selection=selection or {},
+        history_compact=history_compact,
+        tools_json=tools_json,
+    )
+
+    # Start fresh messages with our unified system prompt
+    msgs: List[Dict[str, Any]] = [{"role": "system", "content": system_text}]
+    # Add a minimal language guardrail as an extra system line (cheap redundancy)
+    msgs.append({
+        "role": "system",
+        "content": f"Always answer in {lang}. Use exactly one tool if needed; otherwise reply concisely in Markdown.",
+    })
+    # Append a trimmed version of prior turns so the model has conversational context
+    for m in history:
+        role = m.get("role")
+        if role in ("user", "assistant"):
+            msgs.append({"role": role, "content": (m.get("content") or "")})
+    # Current user message last
+    msgs.append({"role": "user", "content": message})
 
     # No LLM client available → clarify
     if deps is None or (not getattr(deps, "llm_client", None) and not getattr(deps, "llm", None)):
@@ -433,23 +615,19 @@ async def agent_decide(
             # list of candidate tool names offered to the LLM
             tool_names: list[str] = []
             try:
-                tool_names = [((f.get("function") or {}).get("name")) for f in allowed_functions if isinstance(f, dict)]
+                tool_names = [((f.get("function") or {}).get("name")) for f in registry_functions if isinstance(f, dict)]
                 tool_names = [t for t in tool_names if t]
             except Exception:
                 pass
-            # system prompt length from collected 'system' role messages (content only, do not log content)
-            system_prompt_len = 0
-            try:
-                system_prompt_len = sum(len((m.get("content") or "")) for m in msgs if m.get("role") == "system")
-            except Exception:
-                pass
+            # system prompt length from collected 'system' role messages (content omitted)
+            system_prompt_len = len(system_text)
             _ds = set_decide_span(
                 _trace,
                 tab=tab_key,
                 model=(model_name or "<unknown>"),
                 tool_choice="auto",
                 tools=tool_names,
-                system_prompt=" " * system_prompt_len,  # length only; content intentionally omitted
+                system_prompt=" " * system_prompt_len,
                 user_message=message,
             )
     except Exception:
@@ -467,7 +645,7 @@ async def agent_decide(
         tool_name, tool_args, assistant_text = _call_llm_with_tools(
             deps=deps,
             messages=msgs,
-            functions=allowed_functions,
+            functions=registry_functions,
             temperature=_temp,
         )
     except Exception as e:
@@ -579,8 +757,9 @@ def _fallback_clarify(lang: str) -> str:
 
 def _validation_clarify(lang: str, tool_name: str, ve: ValidationError) -> str:
     # Keep this short; user should be able to fix arguments quickly.
+    errs = ve.errors()
     if lang.startswith("cs"):
-        return f"Nepodařilo se použít nástroj '{tool_name}'. Potřebuji doplnit/opravit argumenty: {ve.errors()}"
+        return f"Nepodařilo se použít nástroj „{tool_name}“. Potřebuji doplnit/opravit argumenty: {errs}"
     if lang.startswith("sk"):
-        return f"Nepodarilo sa použiť nástroj '{tool_name}'. Potrebujem doplniť/upraviť argumenty: {ve.errors()}"
-    return f"Couldn't use tool '{tool_name}'. I need different or additional arguments: {ve.errors()}"
+        return f"Nepodarilo sa použiť nástroj „{tool_name}“. Potrebujem doplniť/upraviť argumenty: {errs}"
+    return f"Couldn't use tool '{tool_name}'. I need different or additional arguments: {errs}"

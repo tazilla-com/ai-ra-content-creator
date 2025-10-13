@@ -2,20 +2,25 @@
 # -----------------------------------------------------------------------------
 # Lightweight i18n utilities for WorkshopsAI agents (assets, impacts, threats).
 #
-# Goals
-# - Single source of truth for short UI/assistant strings used by agents.
-# - Minimal dependencies (stdlib only). No runtime network I/O.
-# - Safe lookups with graceful fallbacks:
-#     • prefer explicit `lang` ("en", "sk", "cs"); if not given, derive from `locale`
-#     • DO NOT map Czech to Slovak (cs/cz → "cs" explicitly)
-#     • domain/key missing → fall back to English; if still missing, return "{domain}.{key}"
-# - Keep catalog codes/names in EN (i18n is for surrounding messages only).
+# What this module provides
+# - `lang_from(...)`: robust language selection from raw Accept-Language / locale.
+# - `t(domain, key, ...)`: tiny string lookup with graceful fallbacks + .format(**kwargs).
+# - `I18N`: short, agent-friendly message catalog (EN/SK/CS).
+#
+# Design goals
+# - Zero external deps (stdlib only). No network I/O.
+# - Safe fallbacks:
+#     • Prefer explicit `language`, then `locale`. Both may be raw HTTP headers.
+#     • Recognize prefixes "en", "sk", "cs" (and map "cz" → "cs").
+#     • If nothing matches, fall back to English ("en").
+# - Catalog codes/names (e.g., impact/threat codes) remain in EN; i18n is for surrounding text.
 #
 # Usage
 #   from workshops_ai.i18n import t, lang_from
 #
 #   lang = lang_from(language=req.language, locale=req.locale)
-#   msg = t("impacts", "set_done", lang=lang, impact_code="AVAILABILITY", level=3, asset_id="asset-123")
+#   msg = t("impacts", "set_done", lang=lang,
+#           impact_code="AVAILABILITY", level=3, asset_id="asset-123")
 #
 # Domains
 #   "common"  – shared phrases
@@ -26,35 +31,75 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-DEFAULT_LANG = "sk"
-SUPPORTED_LANGS = ("en", "sk", "cs")
+# Fallback MUST be English so that unknown/unsupported locales don't drift to SK.
+DEFAULT_LANG = "en"
+SUPPORTED_LANGS: Tuple[str, ...] = ("en", "sk", "cs")
+
+
+def _parse_accept_language(raw: Optional[str]) -> List[str]:
+    """
+    Best-effort parser for HTTP Accept-Language-like inputs.
+
+    Examples:
+      "cs-CZ, cs;q=0.9, en;q=0.8"  → ["cs-cz", "cs", "en"]
+      "EN_us"                      → ["en-us"]
+      "sk"                         → ["sk"]
+      None / ""                    → []
+    """
+    if not raw:
+        return []
+    tokens: List[str] = []
+    for part in raw.split(","):
+        part = part.strip()
+        # Strip optional quality, e.g., ";q=0.9"
+        if ";" in part:
+            part = part.split(";", 1)[0].strip()
+        part = part.replace("_", "-").strip().lower()
+        if part:
+            tokens.append(part)
+    return tokens
+
+
+def _candidates(language: Optional[str], locale: Optional[str]) -> List[str]:
+    """
+    Build a prioritized list of language tokens to evaluate:
+    - Full tags from `language` first, then from `locale`
+    - Also include primary subtags (before '-' if present)
+    """
+    out: List[str] = []
+    for raw in (language, locale):
+        for tok in _parse_accept_language(raw):
+            out.append(tok)
+            # Add primary subtag if available (e.g., "cs" from "cs-cz")
+            if "-" in tok:
+                out.append(tok.split("-", 1)[0])
+    return out
 
 
 def lang_from(*, language: Optional[str] = None, locale: Optional[str] = None) -> str:
     """
-    Decide the output language:
-      - If `language`/`locale` starts with "en" → "en"
-      - If starts with "sk" → "sk"
-      - If starts with "cs" or "cz" → "cs"   (Czech handled explicitly)
-      - Fallback: "en"
-    """
-    def _norm(x: Optional[str]) -> str:
-        return (x or "").strip().lower()
+    Decide the output language from potentially raw Accept-Language / locale strings.
 
-    for token in (_norm(language), _norm(locale)):
+    Rules:
+      - If any token starts with "en" → "en"
+      - If starts with "sk"          → "sk"
+      - If starts with "cs" or "cz"  → "cs"  (Czech handled explicitly; never map to Slovak)
+      - Fallback: DEFAULT_LANG ("en")
+    """
+    for token in _candidates(language, locale):
         if token.startswith("en"):
             return "en"
         if token.startswith("sk"):
             return "sk"
-        if token.startswith(("cs", "cz")):
+        if token.startswith("cs") or token.startswith("cz"):
             return "cs"
     return DEFAULT_LANG
 
 
 def _lookup(lang: str, domain: str, key: str) -> str:
-    # best-effort: given lang → fallback to 'en'
+    """Return translated template for (lang, domain, key) or a safe fallback."""
     payload = I18N.get(lang) or {}
     dom = payload.get(domain) or {}
     if key in dom:
@@ -63,30 +108,34 @@ def _lookup(lang: str, domain: str, key: str) -> str:
     dom_en = (I18N.get("en") or {}).get(domain) or {}
     if key in dom_en:
         return dom_en[key]
-    # ultimate fallback
+    # ultimate fallback: a visible breadcrumb for missing strings
     return f"{domain}.{key}"
 
 
 def t(domain: str, key: str, *, lang: Optional[str] = None, locale: Optional[str] = None, **kwargs: Any) -> str:
     """
     Translate and format a string.
-    - `domain`: one of "common", "assets", "impacts", "threats"
-    - `key`: message key inside the domain dictionary
-    - `lang` or `locale`: language selector (see lang_from); either is optional
-    - `**kwargs`: values for str.format placeholders in the template
+
+    Args:
+      domain: one of "common", "assets", "impacts", "threats"
+      key: message key inside the domain dictionary
+      lang / locale: language selector (see lang_from). Either may be None or raw headers.
+      **kwargs: values for str.format placeholders in the template
+
+    Returns:
+      Interpolated message string with graceful fallback behavior.
     """
     selected = lang_from(language=lang, locale=locale)
     template = _lookup(selected, domain, key)
     try:
         return template.format(**kwargs)
     except Exception:
-        # If formatting fails (missing placeholder), return the raw template.
+        # If formatting fails (e.g., missing placeholder), return the raw template.
         return template
 
 
 # -----------------------------------------------------------------------------
-# Translations
-# NOTE: Keep messages short and agent-friendly. Do not translate catalog codes.
+# Translations (keep them short and assistant-friendly; do not translate catalog codes)
 # -----------------------------------------------------------------------------
 
 I18N: Dict[str, Dict[str, Dict[str, str]]] = {
@@ -97,12 +146,10 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
             "bulk_capped": "Bulk request capped to {n} items for safety.",
             "ok": "OK.",
             "done": "Done.",
-            # Unified short confirmations / clarifications:
             "confirm_done": "✅ Done.",
             "exists_asset": "ℹ️ Asset “{name}” already exists.",
             "clarify_asset": "Which asset?",
         },
-        # --------------------------- AssetAgent --------------------------------
         "assets": {
             "explain_1": "I’m your AssetAgent. Tell me in plain language what you want to do with assets.",
             "explain_2": "• “Create a CRM asset as primary, type Information system …”",
@@ -119,9 +166,7 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
             "invalid_change": "I couldn't build a valid change from that request. Try: “Create an asset …” or “Update asset …”.",
             "seed_intro": "Here are initial asset candidates based on your services/website.",
         },
-        # --------------------------- ImpactAgent -------------------------------
         "impacts": {
-            # both keys provided so older/newer agents never 404 on i18n
             "select_asset": "Please select an asset to show its impacts.",
             "need_asset": "Please select an asset to show its impacts.",
             "no_impacts": "No impacts have been set for the selected asset yet.",
@@ -137,10 +182,9 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
             "bulk_capped": "Bulk request capped to {n} items for safety.",
             "explain_intro": "Rationale for selected impact levels:",
         },
-        # --------------------------- ThreatAgent -------------------------------
         "threats": {
             "select_asset": "Optionally select an asset to tailor risk probability.",
-            "need_asset": "Optionally select an asset to tailor risk probability.",  # alias
+            "need_asset": "Optionally select an asset to tailor risk probability.",
             "list_header": "Threats:",
             "explain_intro": "Relevance rationale:",
             "unknown_threat": "Unknown threat_code: {threat_code}",
@@ -160,7 +204,6 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
             "bulk_capped": "Hromadný príkaz bol z bezpečnostných dôvodov skrátený na {n} položiek.",
             "ok": "OK.",
             "done": "Hotovo.",
-            # Unified short confirmations / clarifications:
             "confirm_done": "✅ Hotovo.",
             "exists_asset": "ℹ️ Aktívum „{name}“ už existuje.",
             "clarify_asset": "Pre ktoré aktívum?",
@@ -183,7 +226,7 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
         },
         "impacts": {
             "select_asset": "Vyberte, prosím, aktívum, pre ktoré mám zobraziť dopady.",
-            "need_asset": "Vyberte, prosím, aktívum, pre ktoré mám zobraziť dopady.",  # alias
+            "need_asset": "Vyberte, prosím, aktívum, pre ktoré mám zobraziť dopady.",
             "no_impacts": "Pre vybrané aktívum zatiaľ nie sú nastavené žiadne dopady.",
             "current_impacts_header": "Aktuálne dopady:",
             "impact_line": "- {impact_code}: {level}",
@@ -199,7 +242,7 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
         },
         "threats": {
             "select_asset": "Voliteľne vyberte aktívum na spresnenie pravdepodobnosti rizika.",
-            "need_asset": "Voliteľne vyberte aktívum na spresnenie pravdepodobnosti rizika.",  # alias
+            "need_asset": "Voliteľne vyberte aktívum na spresnenie pravdepodobnosti rizika.",
             "list_header": "Hrozby:",
             "explain_intro": "Odôvodnenie relevancie:",
             "unknown_threat": "Neznámy threat_code: {threat_code}",
@@ -219,7 +262,6 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
             "bulk_capped": "Hromadná akce byla z bezpečnostních důvodů zkrácena na {n} položek.",
             "ok": "OK.",
             "done": "Hotovo.",
-            # Unified short confirmations / clarifications:
             "confirm_done": "✅ Hotovo.",
             "exists_asset": "ℹ️ Aktivum „{name}“ už existuje.",
             "clarify_asset": "Pro které aktivum?",
@@ -242,7 +284,7 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
         },
         "impacts": {
             "select_asset": "Vyber prosím aktivum, u kterého mám zobrazit dopady.",
-            "need_asset": "Vyber prosím aktivum, u kterého mám zobrazit dopady.",  # alias
+            "need_asset": "Vyber prosím aktivum, u kterého mám zobrazit dopady.",
             "no_impacts": "U vybraného aktiva zatím nejsou nastaveny žádné dopady.",
             "current_impacts_header": "Aktuální dopady:",
             "impact_line": "- {impact_code}: {level}",
@@ -258,7 +300,7 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
         },
         "threats": {
             "select_asset": "Volitelně vyber aktivum pro upřesnění pravděpodobnosti rizika.",
-            "need_asset": "Volitelně vyber aktivum pro upřesnění pravděpodobnosti rizika.",  # alias
+            "need_asset": "Volitelně vyber aktivum pro upřesnění pravděpodobnosti rizika.",
             "list_header": "Hrozby:",
             "explain_intro": "Odůvodnění relevance:",
             "unknown_threat": "Neznámý threat_code: {threat_code}",

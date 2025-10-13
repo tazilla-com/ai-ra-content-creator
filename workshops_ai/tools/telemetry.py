@@ -15,6 +15,10 @@
 #   - Never raise exceptions; failures are swallowed (best-effort telemetry).
 #   - request_id is auto-fetched if available via main app; can also be passed in payload.
 #   - This module aims to be import-safe (no heavy side effects).
+#
+# Change log:
+#   - Added optional integration with central mask_secrets() (workshops_ai.telemetry) before local redaction.
+#   - Kept everything best-effort and dependency-free if mask_secrets import fails.
 
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ import queue
 import re
 import socket
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass, asdict
 from datetime import datetime, timezone
 from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from typing import Any, Iterable, Mapping, Optional
@@ -36,6 +40,12 @@ try:
     _SETTINGS = get_settings()
 except Exception:  # pragma: no cover
     _SETTINGS = None  # graceful fallback below
+
+# Optional central secret masker (added as best-effort)
+try:
+    from workshops_ai.telemetry import mask_secrets as _mask_secrets  # type: ignore
+except Exception:  # pragma: no cover
+    _mask_secrets = None  # optional, used if available
 
 # --------------------------------------------------------------------------------------
 # Redaction utilities (dependency-free)
@@ -137,6 +147,12 @@ def safe_model_dump(obj: Any, *, max_len: int = 2048) -> Any:
         if hasattr(obj, "model_dump"):
             try:
                 return obj.model_dump(mode="json")
+            except Exception:
+                pass
+        # dataclass?
+        if is_dataclass(obj):
+            try:
+                return asdict(obj)
             except Exception:
                 pass
         # Try generic 'dict()'
@@ -299,7 +315,7 @@ def telemetry_log(
 
     Args:
         event: Short event code (e.g., "chat.request", "manager.route_in").
-        payload: Arbitrary mapping (will be redacted & size-capped).
+        payload: Arbitrary mapping (will be masked, redacted & size-capped).
         level: "DEBUG"|"INFO"|"WARN"|"ERROR" or logging level int.
         user_id: Optional user identifier.
         org_id: Optional tenant/org identifier.
@@ -308,7 +324,8 @@ def telemetry_log(
 
     Behavior:
         - Adds ts, service, version, env, host, pid, request_id.
-        - Redacts sensitive fields in payload, caps snapshot length.
+        - Applies central mask_secrets() if available, then local redaction.
+        - Caps snapshot length for very large strings/objects.
         - Respects global enable flag; becomes a no-op if disabled.
     """
     if not _CFG.enabled:
@@ -347,9 +364,15 @@ def telemetry_log(
                     tags_norm.append(s)
             record["batch_tags"] = tags_norm
 
-        # Payload (redacted, size-capped)
+        # Payload (mask secrets → redact PII/keys → safe dump)
         if payload is not None:
             shaped = _coerce_mapping(payload) or {}
+            # Optional central masking (e.g., if someone passes Settings or env-like dict)
+            if _mask_secrets is not None:
+                try:
+                    shaped = _mask_secrets(shaped)
+                except Exception:
+                    pass
             shaped = redact_for_log(shaped)
             snapshot = safe_model_dump(shaped, max_len=_CFG.max_payload_len)
             record["payload"] = snapshot

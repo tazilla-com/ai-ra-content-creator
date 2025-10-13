@@ -3,18 +3,22 @@
 # Purpose
 # Pydantic v2 models for the UI ↔ Agent chat contract.
 #
-# Design
-# - Fail-closed (extra fields are forbidden).
-# - Canonical EN codes for tabs; selection is per-tab (extensible).
-# - Response staging object mirrors the global “staging → diff → explicit commit” rule.
-# - Strings are stripped; messages can be strings OR JSON DTO dumps.
-# - `policy.emit_changes_enabled` is preserved end-to-end.
-# - `locale` is accepted (alongside `language`) to align with telemetry/manager usage.
-# - Optional `history_token` allows clients to resume a LangGraph thread (checkpoint).
+# Design Principles
+# - Fail-closed: extra fields are rejected to prevent accidental drift.
+# - Canonical tab codes (EN) to keep routing simple and stable.
+# - Per-tab selection (extensible) to capture the currently focused item.
+# - Response supports:
+#     * human-facing messages (strings or JSON DTO "message items"),
+#     * structured "proposals" payload for rich UI widgets (tables/cards/forms),
+#     * optional synchronous agent_events echo for live progress rendering,
+#     * staging state (diff/commit UX),
+#     * policy hints (e.g., whether emitting changes is enabled).
+# - Request accepts both `language` and `locale` (aligned with telemetry/manager).
+# - Optional `history_token` lets clients resume a LangGraph thread (checkpoint).
 #
 # Notes
-# - Legacy local OrganizationProfile/ServiceItem models were removed to prevent drift.
-#   We import canonical DTOs from `workshops_ai.api.schema` instead.
+# - Legacy local OrganizationProfile/ServiceItem models were removed to prevent
+#   duplication; canonical DTOs are imported from workshops_ai.api.schema.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -33,20 +37,24 @@ from pydantic import (
     ConfigDict,
 )
 
-# Agent event model used for optional synchronous event echo in UIResponse
+# Optional synchronous event echo (lets UI show tool progress inline with the reply)
 from workshops_ai.models.agent_event import AgentEvent
 
-# Canonical DTOs (deduplicate vs. local copies)
+# Canonical DTOs (single source of truth)
 from workshops_ai.api.schema.organization import Organization as OrganizationProfile
 from workshops_ai.api.schema.service import Service as ServiceItem
 
 # ---------------------------------------------------------------------------
-# Shared / aliases
+# Shared aliases
 # ---------------------------------------------------------------------------
 
 ActiveTab = Literal["assets", "impacts", "threats", "controls"]
 JSONDict = Dict[str, Any]
-MessageItem = Union[StrictStr, JSONDict]  # <-- allow text or DTO dumps
+
+# A message to render in the chat stream:
+# - string for plain assistant text
+# - JSON object for DTO-like items (e.g., "kind":"asset.list", ...), which the UI may render specially
+MessageItem = Union[StrictStr, JSONDict]
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +62,10 @@ MessageItem = Union[StrictStr, JSONDict]  # <-- allow text or DTO dumps
 # ---------------------------------------------------------------------------
 
 class Selection(BaseModel):
-    """Per-tab selection. For `assets` we may get `asset_id`."""
+    """
+    Per-tab selection coming from the UI.
+    Keep minimal and make it easy to extend per tab.
+    """
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     asset_id: Optional[StrictStr] = Field(
@@ -64,19 +75,24 @@ class Selection(BaseModel):
 
 
 class PolicyConfig(BaseModel):
-    """Policy switches for runtime behavior."""
+    """
+    Policy switches affecting runtime behavior of the agent.
+    """
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     emit_changes_enabled: StrictBool = Field(
         default=True,
-        description="If false, the agent must not emit WS events nor submit changesets (dry-run).",
+        description=(
+            "If false, the agent must not emit WS events nor submit changesets. "
+            "Useful for dry-run/local-preview modes."
+        ),
     )
 
 
 class ExistingAssetIn(BaseModel):
     """
-    Pre-existing asset snippet coming from the wizard/back-end, used as context
-    for AssetAgent reasoning or deduplication checks.
+    Pre-existing asset snippet forwarded from a wizard or backend to help the agent
+    with grounding, deduplication, or contextual reasoning.
     """
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -92,14 +108,16 @@ class ExistingAssetIn(BaseModel):
 
 
 class WebsitePage(BaseModel):
+    """Single crawled page (if UI/wizard pre-fetched website content)."""
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     url: HttpUrl
     content: Optional[StrictStr] = None
-    page_type: Optional[StrictStr] = None  # e.g. "home", "services", "contact"
+    page_type: Optional[StrictStr] = None  # e.g., "home", "services", "contact"
 
 
 class WebsiteContent(BaseModel):
+    """Aggregate of crawled pages for the organization's website."""
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     base_url: HttpUrl
@@ -109,9 +127,9 @@ class WebsiteContent(BaseModel):
 
 class UIRequest(BaseModel):
     """
-    Chat input contract from UI / wizard. Minimal required: org_id, active_tab.
-    Everything else is optional here to keep backward compatibility; upstream
-    wizard may require session_id/language on its side.
+    Chat input contract from UI/wizard. Only `org_id` and `active_tab` are strictly
+    required; the rest is optional to ease rollouts and integration. The upstream
+    wizard can enforce stricter input rules if needed.
     """
     model_config = ConfigDict(
         extra="forbid",
@@ -119,80 +137,95 @@ class UIRequest(BaseModel):
         validate_assignment=True,
     )
 
-    org_id: StrictStr = Field(..., min_length=1, description="Organization identifier (tenant).")
-    active_tab: ActiveTab = Field(..., description="Current UI tab guiding tool-gating.")
-    selection: Selection = Field(default_factory=Selection, description="Tab-specific selection.")
+    # Core context
+    org_id: StrictStr = Field(..., min_length=1, description="Tenant/organization identifier.")
+    active_tab: ActiveTab = Field(..., description="Current UI tab guiding tool-gating and routing.")
+    selection: Selection = Field(default_factory=Selection, description="Tab-specific selection (e.g., asset_id).")
+
+    # User input message (can be empty for pure selection-driven actions)
     message: StrictStr = Field(
         default="",
-        description="User message; can contain token filters like 'search:', 'type:', etc.",
+        description="User message; may include token-like filters ('search:', 'type:', ...).",
     )
+
+    # Staging hint for non-asset agents (assets rely on explicit changesets)
     staging: StrictBool = Field(
         default=False,
-        description="If true, user expects staging semantics (used by non-asset agents).",
+        description="If true, user expects staging semantics (used by some non-asset flows).",
     )
+
     user_id: Optional[StrictStr] = Field(default=None, description="Authenticated user identifier.")
 
-    # Wizard / context enrichment (all optional)
+    # Wizard / enrichment (optional, tolerated to keep the contract flexible)
     session_id: Optional[StrictStr] = Field(default=None, description="Client session identifier.")
     language: Optional[StrictStr] = Field(
         default=None,
-        description="IETF language tag like 'cs', 'sk', 'en-US'.",
+        description="IETF language tag, e.g., 'cs', 'sk', 'en-US'.",
     )
-    # Added to align with telemetry/manager which already read `locale`
+    # Accept `locale` because telemetry/manager already handle it; UI may send either
     locale: Optional[StrictStr] = Field(
         default=None,
-        description="Locale hint similar to `language` (e.g., 'cs_CZ'); UI may send either.",
+        description="Locale hint similar to `language` (e.g., 'cs_CZ').",
     )
     number_of_assets: Optional[StrictInt] = Field(
         default=None, ge=1, le=1000,
-        description="Agent hint for list/summary limits.",
+        description="Agent hint for list/summary sizing.",
     )
     user_instructions: Optional[StrictStr] = Field(
         default=None,
-        description="Free-form user guidance for the agent.",
+        description="Free-form guidance for the agent (persistent within the session).",
     )
     organization_profile: Optional[OrganizationProfile] = Field(
         default=None,
-        description="Organization profile (canonical DTO).",
+        description="Canonical Organization DTO to ground reasoning.",
     )
     services: Optional[list[ServiceItem]] = Field(
         default=None,
-        description="List of company services to inform asset proposals (canonical DTO).",
+        description="List of services (canonical DTO) to inform asset proposals.",
     )
     existing_assets: Optional[list[ExistingAssetIn]] = Field(
         default=None,
-        description="Already known assets; used for deduplication/context.",
+        description="Known assets to aid deduplication and context.",
     )
     url: Optional[HttpUrl] = Field(default=None, description="Primary organization URL.")
     website_content: Optional[WebsiteContent] = Field(
         default=None,
-        description="Fetched website content (pages, errors).",
+        description="Pre-fetched site content (pages & errors).",
     )
     policy: Optional[PolicyConfig] = Field(
         default=None,
-        description="Runtime policy switches (e.g., dry-run emission gate).",
+        description="Runtime switches (e.g., disable changes emission for dry-runs).",
     )
 
-    # Optional cursor for LangGraph history/checkpoint resume (thread id / token)
+    # Optional cursor for LangGraph history/checkpoint resume
     history_token: Optional[StrictStr] = Field(
         default=None,
-        description="Opaque token to resume a conversation thread/history (checkpointer).",
+        description="Opaque token used by the checkpointer to resume conversation threads.",
     )
+
+    # -------------------------
+    # Validators (Pydantic v2)
+    # -------------------------
 
     @field_validator("message", mode="before")
     @classmethod
     def _message_not_none(cls, v: Any) -> str:
-        # Allow empty string (e.g., pure selection-driven actions), but never None
+        """
+        Normalize `message`:
+        - allow empty string (selection-only actions),
+        - never allow None (enforce string semantics),
+        - hard-fail for non-string types to keep the contract strict.
+        """
         if v is None:
             return ""
         if isinstance(v, str):
             return v
-        # Hard fail for non-string inputs to preserve StrictStr semantics
         raise TypeError("message must be a string")
 
     @field_validator("language", "locale", mode="before")
     @classmethod
     def _normalize_lang(cls, v: Any) -> Optional[str]:
+        """Trim language/locale if present; otherwise pass through."""
         return v.strip() if isinstance(v, str) else v
 
 
@@ -202,63 +235,86 @@ class UIRequest(BaseModel):
 
 class StagingState(BaseModel):
     """
-    Staging state returned to the UI.
-    - `needs_commit`: whether the UI should offer an explicit commit action
-    - `batch_id`: identifier of an open staging batch (if any)
-    - `diff`: a machine/human-friendly diff preview (backend-defined shape)
+    Staging state returned to the UI:
+    - needs_commit: should the UI display an explicit commit action?
+    - batch_id: identifier of the current staging batch (if any)
+    - diff: backend-defined diff preview (machine/human friendly)
     """
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    needs_commit: StrictBool = Field(..., description="True if there are staged changes requiring commit.")
-    batch_id: Optional[StrictStr] = Field(default=None, description="Open staging batch identifier.")
-    diff: Optional[JSONDict] = Field(default=None, description="Staged diff preview.")
+    needs_commit: StrictBool = Field(..., description="True if there are changes waiting for commit.")
+    batch_id: Optional[StrictStr] = Field(default=None, description="Open staging batch identifier (if any).")
+    diff: Optional[JSONDict] = Field(default=None, description="Staged diff preview (shape defined by backend).")
 
 
 class UIResponsePolicy(BaseModel):
-    """Policy hints for UI rendering/behavior on the response channel."""
+    """
+    Policy hints flowing back to the UI alongside the response.
+    Useful when the backend derives policy state dynamically and the UI should adapt.
+    """
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     emit_changes_enabled: StrictBool = Field(
         default=True,
-        description="If true, UI may assume the agent emits WS events / submits changesets.",
+        description="If true, the UI may assume WS events/changeset submission are active.",
     )
 
 
 class UIResponse(BaseModel):
     """
-    Chat output contract to UI.
+    Chat output contract delivered to the UI.
+    The UI should:
+      - Always render `messages` (strings or JSON DTOs).
+      - Prefer `proposals` for structured widgets (tables/cards/forms).
+      - Optionally show `agent_events` as a live activity log when present.
+      - Use `staging` to display commit/diff UX where applicable.
     """
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, validate_assignment=True)
 
+    # 1) Human-facing stream:
     messages: list[MessageItem] = Field(
         ...,
         min_length=1,
-        description="Assistant lines to render: either strings or JSON DTO dumps.",
+        description="Assistant lines to render: strings or JSON DTO dumps.",
     )
+
+    # 2) Structured payload for widgets (tables/cards/forms)
+    #    NOTE: This is the canonical place where list/detail data for the UI lives.
     proposals: Optional[JSONDict] = Field(
         default=None,
-        description="Structured payload for UI widgets (tables/cards/forms).",
+        description="Structured payload for UI widgets; if present, the UI should render it."
     )
+
+    # 3) Staging state (commit/diff UX)
     staging: StagingState = Field(
         default_factory=lambda: StagingState(needs_commit=False),
-        description="Staging state for commit/diff UX.",
+        description="Staging state for commit/diff UX."
     )
+
+    # 4) Optional synchronous echo of agent events (progress transparency)
     agent_events: Optional[list[AgentEvent]] = Field(
         default=None,
-        description="Optional synchronous echo of agent events returned with the response.",
+        description="Agent tool events echoed with the response for live progress rendering."
     )
+
+    # 5) Response-side policy hints
     policy: Optional[UIResponsePolicy] = Field(
         default=None,
-        description="Response-side policy switches and hints for the UI.",
+        description="Response policy hints for the UI (e.g., whether changes emission is enabled)."
     )
+
+    # -------------------------
+    # Validators & helpers
+    # -------------------------
 
     @field_validator("messages")
     @classmethod
     def _validate_messages(cls, v: list[MessageItem]) -> list[MessageItem]:
         """
-        - For strings: strip and ensure non-empty.
-        - For dicts: accept as-is (DTO dumps).
-        - Ensure at least one item remains after trimming.
+        Messages clean-up:
+        - Strip strings and drop empty ones.
+        - Accept dicts (DTOs) as-is.
+        - Ensure at least one non-empty item remains.
         """
         cleaned: list[MessageItem] = []
         for item in v:
@@ -269,34 +325,59 @@ class UIResponse(BaseModel):
             elif isinstance(item, dict):
                 cleaned.append(item)
             else:
-                # Should not happen given the union, but be defensive.
+                # Defensive guard: union should already guarantee str|dict.
                 raise ValueError("messages items must be string or JSON object")
         if not cleaned:
             raise ValueError("messages must contain at least one non-empty item")
         return cleaned
 
+    # Factory helpers used by graphs/routers to produce consistent envelopes.
     @staticmethod
     def ok(tab: str, op: str, result: dict) -> "UIResponse":
-        """Create a successful UIResponse."""
+        """
+        Build a success response:
+        - `messages` carry a compact DTO announcing the operation.
+        - `proposals` carry the same structured payload for widget rendering.
+        """
         return UIResponse(
             messages=[{"kind": "success", "tab": tab, "op": op, "result": result}],
-            proposals={"tab": tab, "op": op, "result": result}
+            proposals={"tab": tab, "op": op, "result": result},
         )
 
     @staticmethod
     def error(tab: str, op: str, error: str, details: Optional[list] = None) -> "UIResponse":
-        """Create an error UIResponse."""
+        """
+        Build an error response:
+        - Provide both a message-item and `proposals` with the error shape so the UI can render either.
+        """
         return UIResponse(
             messages=[{"kind": "error", "tab": tab, "op": op, "error": error, "details": details}],
-            proposals={"tab": tab, "op": op, "error": error, "details": details}
+            proposals={"tab": tab, "op": op, "error": error, "details": details},
         )
 
     @staticmethod
     def submitted(tab: str, op: str, changeset: dict, submit: dict, result: dict) -> "UIResponse":
-        """Create a submitted UIResponse."""
+        """
+        Build a 'submitted' response:
+        - Include changeset echo + submission outcome.
+        - Mirror the same structure in `proposals` for widget consumption.
+        """
         return UIResponse(
-            messages=[{"kind": "submitted", "tab": tab, "op": op, "changeset": changeset, "submit": submit, "result": result}],
-            proposals={"tab": tab, "op": op, "changeset": changeset, "submit": submit, "result": result}
+            messages=[{
+                "kind": "submitted",
+                "tab": tab,
+                "op": op,
+                "changeset": changeset,
+                "submit": submit,
+                "result": result
+            }],
+            proposals={
+                "tab": tab,
+                "op": op,
+                "changeset": changeset,
+                "submit": submit,
+                "result": result
+            },
         )
 
 

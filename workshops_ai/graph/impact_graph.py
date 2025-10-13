@@ -2,18 +2,21 @@
 # -----------------------------------------------------------------------------
 # LangGraph: IMPACTS tab — LLM-first assistant (clarify-first, one-call-per-turn)
 #
-# Design goals
-# - Planner/Router uses deps.llm_client (no local LLM instantiation, no regex heuristics).
-# - Clarify-first: ask at most one concise follow-up when required data is missing.
-# - Exactly one external effect per turn (writes → single submit).
-# - Unified tool naming with registry (incl. alias: `impact.levels.for_asset` → get).
-# - Explain uses RAG→LLM fallback (retriever first; if no context → concise LLM).
+# What changed vs. the old version
+# - Removed hardcoded greet/help/chitchat i18n texts & nodes. Any "non-tool" reply
+#   now goes through a dedicated agent-only reply node (agent.reply) powered by the LLM.
+# - Kept a minimal "clarify" path that asks ONE concise follow-up question when
+#   required slots are missing (e.g., asset_id or items for set/bulk_set).
+# - Lists/summaries are formatted via ui/formatting.py (title/bullets/table capable)
+#   with NO hidden truncation for catalog outputs; long messages are chunked.
+# - Explain still uses RAG→LLM fallback, but wraps the output nicely
+#   (title + short bullet points) and surfaces sources in `extra`.
+# - Writes submit exactly once per turn; confirmation is short and neutral.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import asyncio
-import datetime as dt
 import json
 import logging
 import time
@@ -26,11 +29,45 @@ from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 from workshops_ai.graph.factory import GraphDeps
 from workshops_ai.graph.agent_node import agent_decide, AgentDecision
 
-# ChangeSet (typed source of truth)
+# Changeset model (single source of truth for write ops)
 from workshops_ai.models.changeset import (
     ChangeSet,
     build_changeset,
 )
+
+# UI formatting helpers (preferred). Provide safe fallbacks if unavailable.
+try:
+    from workshops_ai.ui.formatting import title, bullet_list, chunk, table  # type: ignore
+except Exception:  # pragma: no cover
+    def title(text: str) -> str:
+        return f"# {text}".strip()
+
+    def bullet_list(items: List[str]) -> str:
+        return "\n".join(f"- {x}" for x in items)
+
+    def chunk(text: str, *, max_chars: int = 1800) -> List[str]:
+        if len(text) <= max_chars:
+            return [text]
+        parts, buf, size = [], [], 0
+        for line in text.splitlines():
+            add = len(line) + 1
+            if size + add > max_chars and buf:
+                parts.append("\n".join(buf))
+                buf, size = [line], add
+            else:
+                buf.append(line)
+                size += add
+        if buf:
+            parts.append("\n".join(buf))
+        return parts
+
+    def table(headers: List[str], rows: List[List[str]]) -> str:
+        if not headers:
+            return bullet_list([" | ".join(r) for r in rows])
+        sep = "| " + " | ".join(["---"] * len(headers)) + " |"
+        head = "| " + " | ".join(headers) + " |"
+        body = "\n".join("| " + " | ".join(r) + " |" for r in rows)
+        return "\n".join([head, sep, body]) if rows else head + "\n" + sep
 
 # LangGraph
 try:
@@ -41,19 +78,11 @@ except Exception as e:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
-# Optional payload guard (best-effort, tolerant)
+# Types & State (LLM-first planner; clarify-first for missing slots)
 # -----------------------------------------------------------------------------
-try:
-    from workshops_ai.tools.guard import guard_validate_payload as _guard_validate  # type: ignore
-except Exception:  # pragma: no cover
-    def _guard_validate(model_cls, payload):  # type: ignore
-        return payload
-
-
-# -----------------------------------------------------------------------------
-# Types & State (Pydantic-validated tool args)
-# -----------------------------------------------------------------------------
-Intent = Literal["help", "clarify", "chitchat", "list", "get", "set", "bulk_set", "create_impact", "explain"]
+Intent = Literal[
+    "clarify", "list", "get", "set", "bulk_set", "create_impact", "explain", "agent_reply"
+]
 
 
 class ImpactItem(BaseModel):
@@ -94,7 +123,7 @@ class ImpactState(BaseModel):
     message: Optional[str] = None
     selection: Optional[dict] = None   # {"asset_id": "..."} | ...
     user_id: Optional[str] = None
-    locale: Optional[str] = None       # "sk" | "cs" | "en"
+    locale: Optional[str] = None       # "cs" | "sk" | "en" | ...
     language: Optional[str] = None
     history: Optional[List[dict]] = None  # short rolling window
 
@@ -116,86 +145,28 @@ class ImpactState(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# i18n helpers (short)
+# Utilities: localization, telemetry, UI payload
 # -----------------------------------------------------------------------------
 def _lang(locale: Optional[str], fallback: str = "en") -> str:
     if not locale:
         return fallback
     l = locale.lower()
-    if l.startswith("sk"):
-        return "sk"
     if l.startswith(("cs", "cz")):
         return "cs"
+    if l.startswith("sk"):
+        return "sk"
     if l.startswith("en"):
         return "en"
     return fallback
 
 
-def _t(loc: str, key: str, **kw) -> str:
-    M = {
-        "greet": {
-            "sk": "Ahoj! Môžem: „zoznam dopadov“, „dopady pre aktívum“, „nastaviť úroveň“, „hromadne nastaviť“, „pridať dopad“. 😉",
-            "cs": "Ahoj! Umím: „seznam dopadů“, „dopady pro aktivum“, „nastavit úroveň“, „hromadně nastavit“, „přidat dopad“. 😉",
-            "en": "Hi! I can: “list impacts”, “asset impacts”, “set level”, “bulk set”, or “create impact”. 😉",
-        },
-        "catalog_fail": {
-            "sk": "Katalóg dopadov sa nepodarilo načítať: {err}",
-            "cs": "Katalog dopadů se nepodařilo načíst: {err}",
-            "en": "Failed to load impact catalog: {err}",
-        },
-        "catalog_found": {
-            "sk": "Katalóg dopadov ({n}):",
-            "cs": "Katalog dopadů ({n}):",
-            "en": "Impact catalog ({n}):",
-        },
-        "select_prompt": {
-            "sk": "Vyber prosím aktívum. Tu je pár možností:",
-            "cs": "Vyber prosím aktivum. Tady je pár možností:",
-            "en": "Please select an asset. Here are a few options:",
-        },
-        "asset_impacts_fail": {
-            "sk": "Čítanie dopadov pre „{id}“ zlyhalo: {err}",
-            "cs": "Čtení dopadů pro „{id}“ selhalo: {err}",
-            "en": "Failed to read impacts for “{id}”: {err}",
-        },
-        "nothing_to_set": {
-            "sk": "Nie je čo nastaviť. Potrebujem asset_id a items[{impact_code, level}].",
-            "cs": "Není co nastavit. Potřebuji asset_id a items[{impact_code, level}].",
-            "en": "Nothing to set. Need asset_id and items[{impact_code, level}].",
-        },
-        "bulk_missing": {
-            "sk": "Chýbajú entries pre hromadné nastavenie.",
-            "cs": "Chybí entries pro hromadné nastavení.",
-            "en": "Missing entries for bulk update.",
-        },
-        "create_missing": {
-            "sk": "Zadaj aspoň jeden dopad {code,name,...}.",
-            "cs": "Zadej alespoň jeden dopad {code,name,...}.",
-            "en": "Provide at least one impact {code,name,...}.",
-        },
-        "validation_error": {
-            "sk": "Chyba validácie: {err}",
-            "cs": "Chyba validace: {err}",
-            "en": "Validation error: {err}",
-        },
-        "submitted_summary": {
-            "sk": "{set} nastavení úrovní, {created} nových dopadov.",
-            "cs": "{set} nastavení úrovní, {created} nových dopadů.",
-            "en": "{set} level updates, {created} new impacts created.",
-        },
-        "submitted_generic": {
-            "sk": "{count} akcií odoslaných.",
-            "cs": "{count} akcí odesláno.",
-            "en": "{count} actions submitted.",
-        },
-    }
-    s = M.get(key, {}).get(loc, M.get(key, {}).get("en", key))
-    return s.format(**kw)
-
-
-def _ui_response(text: str, *, extra: Optional[dict] = None) -> dict:
+def _ui_response(content: str | dict, *, extra: Optional[dict] = None) -> dict:
+    """
+    Standard UIResponse payload (messages + optional structured data).
+    - content: string (chat bubble) or dict (UI side panel/event)
+    """
     base = {
-        "messages": [text],
+        "messages": [content] if isinstance(content, str) else [content],
         "proposals": None,
         "staging": {"needs_commit": False, "batch_id": None, "diff": None},
         "policy": {"emit_changes_enabled": True},
@@ -205,15 +176,13 @@ def _ui_response(text: str, *, extra: Optional[dict] = None) -> dict:
     return base
 
 
-# -----------------------------------------------------------------------------
-# Utilities + telemetry
-# -----------------------------------------------------------------------------
 def _now_iso() -> str:
+    import datetime as dt
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
 def _event(state: ImpactState, *, kind: str, tool: str, ok: bool = True, meta: dict | None = None) -> float:
-    """Start a tool event and return the high-precision start time."""
+    """Start a tool event and return high-precision start time."""
     t0 = time.perf_counter()
     state.agent_events.append({"event_type": kind, "tool": tool, "ok": ok, "meta": meta or {}})
     return t0
@@ -228,68 +197,24 @@ def _finish(state: ImpactState, t0: float, *, tool: str, ok: bool, meta: dict | 
 
 
 # -----------------------------------------------------------------------------
-# Backend access helpers (align with routers; prefer deps.backend)
+# Backend access helper (align with routers; prefer deps.backend)
 # -----------------------------------------------------------------------------
 def _backend(deps: GraphDeps):
-    """
-    Access the backend port. Prefer deps.backend (same as routers) and
-    fall back to deps.backend_port for older wiring.
-    """
     return getattr(deps, "backend", None) or getattr(deps, "backend_port", None)
 
 
 # -----------------------------------------------------------------------------
-# RAG→LLM explain helpers
+# LLM bridges
 # -----------------------------------------------------------------------------
-EXPLAIN_SYSTEM = (
-    "You are an Impact domain assistant. Explain impact definitions clearly and concisely. "
-    "Always prioritize the organization's catalog definitions when provided in context."
-)
-
-def _get_impacts_retriever(deps: GraphDeps, org_id: Optional[str] = None):
-    """
-    Prefer factory.make_retriever(org_id, 'impacts') as provided by factory.py.
-    Fall back to older access patterns if present.
-    """
-    mk = getattr(deps, "make_retriever", None)
-    if callable(mk) and org_id:
-        try:
-            r = mk(org_id, "impacts")
-            if r:
-                return r
-        except Exception:  # pragma: no cover
-            logger.debug("make_retriever(org_id, 'impacts') failed", exc_info=True)
-
-    factory = getattr(deps, "retriever_factory", None)
-    if callable(factory):
-        try:
-            r = factory("impacts")
-            if r:
-                return r
-        except Exception:  # pragma: no cover
-            logger.debug("retriever_factory('impacts') failed", exc_info=True)
-
-    getter = getattr(deps, "get_retriever", None)
-    if callable(getter):
-        try:
-            r = getter("impacts")
-            if r:
-                return r
-        except Exception:  # pragma: no cover
-            logger.debug("get_retriever('impacts') failed", exc_info=True)
-
-    return getattr(deps, "impacts_retriever", None)
-
-
 def _llm_text(
     *,
     deps: GraphDeps,
-    messages: list[dict[str, str]],
+    messages: List[dict],
     temperature: float | None = 0.2,
     model: Optional[str] = None,
 ) -> str:
     """
-    Minimal, robust bridge for LangChain ChatModel clients (e.g., langchain_openai.ChatOpenAI).
+    Minimal robust bridge for LangChain ChatModel clients (e.g., langchain_openai.ChatOpenAI).
     """
     client = getattr(deps, "llm_client", None) or getattr(deps, "llm", None)
     if client is None:
@@ -297,7 +222,7 @@ def _llm_text(
 
     temp = temperature if temperature is not None else getattr(deps, "llm_temperature", None) or 0.2
 
-    # LangChain ChatModel via .invoke([...BaseMessage...]) — PRIORITY
+    # LangChain ChatModel via .invoke([...BaseMessage...]) — preferred
     try:
         invoke = getattr(client, "invoke", None)
         if callable(invoke):
@@ -312,8 +237,6 @@ def _llm_text(
                 content = m.get("content") or ""
                 if role == "system":
                     lc_messages.append(SystemMessage(content=content))
-                elif role in ("user", "human", ""):
-                    lc_messages.append(HumanMessage(content=content))
                 elif role in ("assistant", "ai"):
                     lc_messages.append(AIMessage(content=content))
                 else:
@@ -323,14 +246,13 @@ def _llm_text(
                 resp = client.invoke(lc_messages, temperature=temp)  # type: ignore[misc]
             except TypeError:
                 resp = client.invoke(lc_messages)  # type: ignore[misc]
-
             txt = (getattr(resp, "content", None) or "").strip()
             if txt:
                 return txt
     except Exception:
         pass
 
-    # Generic fallback
+    # Generic callable fallback
     try:
         obj = client(messages=messages, temperature=temp, model=model)  # type: ignore[misc]
         if isinstance(obj, str):
@@ -343,60 +265,47 @@ def _llm_text(
 
     raise RuntimeError("LLM bridge failed: unsupported client shape or empty content.")
 
-async def run_explain(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
-    from workshops_ai.graph.manager import route_chat
-    return await route_chat(ui_req)
-
-async def run_explain_impacts(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
-    return await run_explain(deps=deps, ui_req=ui_req)
 
 async def _llm_text_async(*, deps: GraphDeps, messages: List[dict], temperature: float = 0.2) -> str:
-    """
-    Async bridge that executes the sync _llm_text in a thread, avoiding improper awaits.
-    """
+    """Async wrapper around _llm_text for environments that expect awaits."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: _llm_text(deps=deps, messages=messages, temperature=temperature))
 
 
 # -----------------------------------------------------------------------------
-# Planner (agent_decide → slot-filling; no regex heuristics)
+# Planner (agent_decide → one intent per turn; no hardcoded help/greet)
 # -----------------------------------------------------------------------------
 def _history_tail(state: ImpactState, k: int = 5) -> List[dict]:
-    """Return the last k turns of the conversational history (best-effort)."""
     try:
-        h = state.history or []
-        return h[-k:]
+        return (state.history or [])[-k:]
     except Exception:
         return []
 
 
 async def _nlu(deps: GraphDeps, state: ImpactState) -> ImpactState:
-    """NLU step: choose intent via agent_decide and parse tool args into typed payloads."""
+    """
+    Choose a single intent using planner (agent_decide).
+    - Honors explicit 'action' if provided.
+    - LLM-first: if planner picks no actionable tool, fall back to agent_reply.
+    - Slot payloads are parsed into Pydantic models where applicable.
+    """
     raw = (state.message or "").strip()
 
-    # Explicit passthrough (API-driven)
-    if state.action in ("help", "clarify", "chitchat", "list", "get", "set", "bulk_set", "create_impact", "explain"):
+    # Explicit passthrough
+    if state.action in ("clarify", "list", "get", "set", "bulk_set", "create_impact", "explain", "agent_reply"):
         state.intent = cast(Intent, state.action)
-        return state
-
-    if not raw:
-        state.intent = "help"
         return state
 
     sel = state.selection or {}
 
-    # Allowed tool names that the planner may emit for this tab (registry-aligned)
     allowed = [
         "impact.list",
-        "impact.asset_get",            # internal legacy (maps to 'get')
-        "impact.levels.for_asset",     # registry alias (also maps to 'get')
+        "impact.asset_get",
+        "impact.levels.for_asset",   # alias of get
         "impact.set_level",
         "impact.bulk_set",
         "impact.create_impact",
         "impact.explain",
-        "help",
-        "clarify",
-        "chitchat",
     ]
 
     decision: AgentDecision = await agent_decide(
@@ -410,28 +319,22 @@ async def _nlu(deps: GraphDeps, state: ImpactState) -> ImpactState:
         one_action_only=True,
     )
 
-    logger.debug("impacts.decide -> action=%s args=%s", getattr(decision, "action", None), getattr(decision, "args", None))
-
-    # Tool → intent mapping (registry names normalized to internal intents)
+    # Map tool → internal intent
     tool_to_intent = {
         "impact.list": "list",
         "impact.asset_get": "get",
-        "impact.levels.for_asset": "get",   # alias to 'get'
+        "impact.levels.for_asset": "get",
         "impact.set_level": "set",
         "impact.bulk_set": "bulk_set",
         "impact.create_impact": "create_impact",
         "impact.explain": "explain",
-        "help": "help",
-        "clarify": "clarify",
-        "chitchat": "chitchat",
     }
-    state.intent = cast(Intent, tool_to_intent.get((getattr(decision, "action", "") or "").strip(), "help"))
+    state.intent = cast(Intent, tool_to_intent.get((decision.action or "").strip(), "agent_reply"))
 
-    # ---- slot filling (strict Pydantic validation) ----
+    # Strict args harvesting into Pydantic payloads
     if getattr(decision, "args", None):
         args = decision.args or {}
 
-        # set payload
         if state.intent == "set":
             asset_id = args.get("asset_id") or sel.get("asset_id")
             items = args.get("items")
@@ -442,7 +345,6 @@ async def _nlu(deps: GraphDeps, state: ImpactState) -> ImpactState:
                 except Exception:
                     state.set_payload = None
 
-        # bulk payload
         if state.intent == "bulk_set" and isinstance(args.get("entries"), list):
             try:
                 entries: List[ImpactSetPayload] = []
@@ -458,7 +360,6 @@ async def _nlu(deps: GraphDeps, state: ImpactState) -> ImpactState:
             except Exception:
                 state.bulk_payload = None
 
-        # create impact (catalog)
         if state.intent == "create_impact":
             items_src = []
             if isinstance(args.get("item"), dict):
@@ -471,7 +372,6 @@ async def _nlu(deps: GraphDeps, state: ImpactState) -> ImpactState:
                 except Exception:
                     state.create_items = None
 
-        # explain question
         if state.intent == "explain":
             q = args.get("q") or args.get("impactCode") or args.get("impactName")
             if isinstance(q, str) and q.strip():
@@ -481,142 +381,179 @@ async def _nlu(deps: GraphDeps, state: ImpactState) -> ImpactState:
 
 
 # -----------------------------------------------------------------------------
-# Clarify-first helpers (at most one concise follow-up)
+# Clarify (ask ONE concise question when a required slot is missing)
 # -----------------------------------------------------------------------------
-def _suggest_select(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
-    """If no asset is selected, show a short preview list to help user pick one."""
+def _clarify_once(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
     def _inner(state: ImpactState) -> ImpactState:
-        loc = _lang(state.locale)
-        t0 = _event(state, kind="tool.call.start", tool="suggest_select")
-        try:
-            # Prefer deps.backend (router-consistent), fallback to backend_port
-            backend = _backend(deps)
-            items = (backend.assets_list(org_id=state.org_id) if backend else []) or []
-            preview = []
-            for a in items[:8]:
-                try:
-                    d = a.model_dump() if hasattr(a, "model_dump") else dict(a)
-                except Exception:
-                    d = dict(a)
-                aid = d.get("id") or d.get("asset_id") or "?"
-                name = d.get("name") or "Unnamed"
-                a_type = d.get("assetType") or d.get("type") or "-"
-                preview.append(f"- {aid}: {name} [{a_type}]")
-            msg = "\n".join([_t(loc, "select_prompt")] + preview) if preview else _t(loc, "catalog_found", n=0)
-            state.result = _ui_response(msg, extra={"agent_events": state.agent_events, "assets_preview": preview})
-            _finish(state, t0, tool="suggest_select", ok=True, meta={"count": len(preview)})
-        except Exception as e:
-            _finish(state, t0, tool="suggest_select", ok=False, meta={"error": str(e)})
-            state.result = _ui_response(_t(loc, "catalog_fail", err=e), extra={"agent_events": state.agent_events})
-        return state
-    return _inner
+        l = _lang(state.locale)
 
+        def _ask(txt_cs: str, txt_sk: str, txt_en: str) -> str:
+            return {"cs": txt_cs, "sk": txt_sk}.get(l, txt_en)
 
-def _clarify_once() -> Callable[[ImpactState], ImpactState]:
-    """Produce one short follow-up question based on what’s missing (never loops)."""
-    def _inner(state: ImpactState) -> ImpactState:
-        loc = _lang(state.locale)
-        sel_id = (state.selection or {}).get("asset_id")
         if state.intent == "set":
             if not (state.set_payload and state.set_payload.asset_id):
-                if not sel_id:
-                    return _suggest_select(None)(state)  # type: ignore[arg-type]
-                # ask for items only
-                txt = {"cs": "Uveď prosím items[{impact_code, level}].",
-                       "sk": "Uveď prosím items[{impact_code, level}].",
-                       "en": "Please provide items[{impact_code, level}]."}.get(loc, "Please provide items.")
-                state.result = _ui_response(txt, extra={"agent_events": state.agent_events})
+                # If no selection, suggest a small pick-list; otherwise ask for asset_id.
+                if not (state.selection and state.selection.get("asset_id")):
+                    return _suggest_select(deps)(state)
+                state.result = _ui_response(_ask("Uveď prosím asset_id.", "Uveď prosím asset_id.", "Please specify asset_id."))
                 return state
-        if state.intent == "bulk_set" and not (state.bulk_payload and state.bulk_payload.entries):
-            txt = {"cs": "Pošli prosím entries[{asset_id, items[{impact_code, level}]}].",
-                   "sk": "Pošli prosím entries[{asset_id, items[{impact_code, level}]}].",
-                   "en": "Please send entries[{asset_id, items[{impact_code, level}]}]."}.get(loc)
-            state.result = _ui_response(txt, extra={"agent_events": state.agent_events})
-            return state
-        if state.intent == "create_impact" and not (state.create_items and len(state.create_items) > 0):
-            txt = {"cs": "Zadej alespoň jeden dopad {code,name[,category,description,weight]}.",
-                   "sk": "Zadaj aspoň jeden dopad {code,name[,category,description,weight]}.",
-                   "en": "Provide at least one impact {code,name[,category,description,weight]}."}.get(loc)
-            state.result = _ui_response(txt, extra={"agent_events": state.agent_events})
-            return state
-        # default greet/help
-        state.result = _ui_response(_t(loc, "greet"), extra={"agent_events": state.agent_events})
+            if not state.set_payload.items:
+                state.result = _ui_response(_ask("Uveď items[{impact_code, level}].", "Uveď items[{impact_code, level}].", "Please provide items[{impact_code, level}]."))
+                return state
+
+        if state.intent == "bulk_set":
+            if not (state.bulk_payload and state.bulk_payload.entries):
+                state.result = _ui_response(_ask(
+                    "Pošli prosím entries[{asset_id, items[{impact_code, level}]}].",
+                    "Pošli prosím entries[{asset_id, items[{impact_code, level}]}].",
+                    "Please send entries[{asset_id, items[{impact_code, level}]}].",
+                ))
+                return state
+
+        if state.intent == "create_impact":
+            if not (state.create_items and len(state.create_items) > 0):
+                state.result = _ui_response(_ask(
+                    "Zadej alespoň jeden dopad {code,name[,category,description,weight]}.",
+                    "Zadaj aspoň jeden dopad {code,name[,category,description,weight]}.",
+                    "Provide at least one impact {code,name[,category,description,weight]}.",
+                ))
+                return state
+
+        # If nothing to clarify, just do an agent-style reply (no tools).
+        return _agent_reply(deps)(state)
+    return _inner
+
+
+def _suggest_select(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
+    """If no asset is selected, render a compact preview to help the user pick one."""
+    def _inner(state: ImpactState) -> ImpactState:
+        t0 = _event(state, kind="tool.call.start", tool="suggest_select")
+        try:
+            backend = _backend(deps)
+            items = (backend.assets_list(org_id=state.org_id) if backend else []) or []
+            rows: List[List[str]] = []
+            for a in items[:10]:  # preview only; not a catalog list
+                d = a.model_dump() if hasattr(a, "model_dump") else dict(a)
+                rows.append([d.get("id") or "?", d.get("name") or "-", d.get("assetType") or "-"])
+            heading = {"cs": "Vyber prosím aktivum", "sk": "Vyber prosím aktívum", "en": "Please select an asset"}[_lang(state.locale)]
+            text = "\n\n".join([title(heading), table(["ID", "Name", "Type"], rows)]) if rows else title(heading)
+            state.result = _ui_response(text, extra={"agent_events": state.agent_events})
+            _finish(state, t0, tool="suggest_select", ok=True, meta={"count": len(rows)})
+        except Exception as e:
+            _finish(state, t0, tool="suggest_select", ok=False, meta={"error": str(e)})
+            msg = {"cs": f"Nepodařilo se načíst seznam aktiv: {e}", "sk": f"Nepodarilo sa načítať zoznam aktív: {e}", "en": f"Failed to load assets: {e}"}[_lang(state.locale)]
+            state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
         return state
     return _inner
 
 
 # -----------------------------------------------------------------------------
-# Read-only nodes
+# Read-only nodes (list/get)
 # -----------------------------------------------------------------------------
 def _list_impacts(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
-    """List the impact catalog in a compact, localized form."""
+    """
+    List the entire impact CATALOG (no hidden truncation).
+    Uses ui/formatting (title + bullets). Chunks long outputs.
+    """
     def _inner(state: ImpactState) -> ImpactState:
-        loc = _lang(state.locale)
         t0 = _event(state, kind="tool.call.start", tool="impact.list")
         try:
             backend = _backend(deps)
-            # Align with routers: prefer impact_defs_list(org_id)
             defs = (backend.impact_defs_list(org_id=state.org_id) if backend else []) or []
-            lines = [_t(loc, "catalog_found", n=len(defs))]
-            for row in defs[:30]:
+            # Build bullet lines "CODE — Name [Category?]"
+            lines: List[str] = []
+            for row in defs:
                 d = row.model_dump() if hasattr(row, "model_dump") else dict(row)
-                code = d.get("code") or d.get("impact_code") or "?"
-                name = d.get("name") or ""
-                lines.append(f"- {code}: {name}")
-            state.result = _ui_response(
-                "\n".join(lines),
-                extra={
-                    "impacts": [getattr(i, "model_dump", lambda: dict(i))() for i in defs[:50]],
-                    "agent_events": state.agent_events,
-                },
-            )
-            _finish(state, t0, tool="impact.list", ok=True, meta={"count": len(defs)})
+                code = str(d.get("code") or d.get("impact_code") or "").strip()
+                name = str(d.get("name") or "").strip()
+                cat = str(d.get("category") or "").strip()
+                line = f"{code} — {name}" if name else code
+                if cat:
+                    line += f" [{cat}]"
+                lines.append(line)
+
+            heading = {"cs": "Katalog dopadů", "sk": "Katalóg dopadov", "en": "Impact catalog"}[_lang(state.locale)]
+            text = "\n\n".join([title(f"{heading} ({len(lines)})"), bullet_list(lines) if lines else "_empty_"])
+            parts = chunk(text, max_chars=1800)
+
+            state.result = _ui_response(parts[0], extra={"agent_events": state.agent_events, "impacts_count": len(lines)})
+            if len(parts) > 1:
+                state.result["messages"].extend(parts[1:])  # type: ignore[index]
+            _finish(state, t0, tool="impact.list", ok=True, meta={"count": len(lines)})
         except Exception as e:
             _finish(state, t0, tool="impact.list", ok=False, meta={"error": str(e)})
-            state.result = _ui_response(_t(loc, "catalog_fail", err=e), extra={"agent_events": state.agent_events})
+            msg = {"cs": f"Katalog dopadů se nepodařilo načíst: {e}", "sk": f"Katalóg dopadov sa nepodarilo načítať: {e}", "en": f"Failed to load impact catalog: {e}"}[_lang(state.locale)]
+            state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
         return state
     return _inner
 
 
 def _asset_get_impacts_or_suggest(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
-    """Show impacts for the selected asset, or suggest an asset if none is selected."""
+    """
+    Show impacts for the selected asset (state/asset_impacts.csv via backend).
+    If none is selected, suggest an asset to pick.
+    """
     def _inner(state: ImpactState) -> ImpactState:
-        loc = _lang(state.locale)
-        backend = _backend(deps)
         asset_id = (state.selection or {}).get("asset_id")
         if not asset_id:
             return _suggest_select(deps)(state)
 
         t0 = _event(state, kind="tool.call.start", tool="impact.asset_get", meta={"asset_id": asset_id})
         try:
-            levels = backend.asset_get_impacts(asset_id) if backend else []  # [{code/impact_code, level}, ...]
-            summary = [f"Impacts for {asset_id} ({len(levels)}):"]
-            for it in levels[:30]:
-                code = it.get("impact_code") or it.get("code")
+            backend = _backend(deps)
+            levels = backend.asset_get_impacts(asset_id) if backend else []  # [{impact_code, level, note?}, ...]
+            # Render as bullets: "CODE: level — note?"
+            lines = []
+            for it in levels:
+                code = str(it.get("impact_code") or it.get("code") or "").strip()
                 lvl = it.get("level")
-                summary.append(f"- {code}: {lvl}")
-            state.result = _ui_response(
-                "\n".join(summary),
-                extra={"asset_id": asset_id, "impacts": levels, "agent_events": state.agent_events},
-            )
-            _finish(state, t0, tool="impact.asset_get", ok=True, meta={"count": len(levels)})
+                note = str(it.get("note") or "").strip()
+                s = f"{code}: {lvl if lvl is not None else '-'}"
+                if note:
+                    s += f" — {note}"
+                lines.append(s)
+
+            heading = {"cs": "Dopady pro aktivum", "sk": "Dopady pre aktívum", "en": "Impacts for asset"}[_lang(state.locale)]
+            text = "\n\n".join([title(f"{heading} {asset_id} ({len(lines)})"), bullet_list(lines) if lines else "_none_"])
+            parts = chunk(text, max_chars=1800)
+
+            state.result = _ui_response(parts[0], extra={"agent_events": state.agent_events, "asset_id": asset_id, "impacts_count": len(lines)})
+            if len(parts) > 1:
+                state.result["messages"].extend(parts[1:])  # type: ignore[index]
+            _finish(state, t0, tool="impact.asset_get", ok=True, meta={"count": len(lines)})
         except Exception as e:
             _finish(state, t0, tool="impact.asset_get", ok=False, meta={"error": str(e)})
-            state.result = _ui_response(_t(loc, "asset_impacts_fail", id=asset_id, err=e), extra={"agent_events": state.agent_events})
+            msg = {"cs": f"Čtení dopadů pro „{asset_id}“ selhalo: {e}", "sk": f"Čítanie dopadov pre „{asset_id}“ zlyhalo: {e}", "en": f"Failed to read impacts for “{asset_id}”: {e}"}[_lang(state.locale)]
+            state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
         return state
     return _inner
 
 
 # -----------------------------------------------------------------------------
-# Explain node (RAG→LLM fallback)
+# Explain (RAG→LLM; output as title + short bullet points)
 # -----------------------------------------------------------------------------
+EXPLAIN_SYSTEM = (
+    "You are an Impact-domain assistant. Explain impact definitions clearly and concisely. "
+    "Prefer the organization's catalog/context when provided."
+)
+
+def _get_impacts_retriever(deps: GraphDeps, org_id: Optional[str] = None):
+    mk = getattr(deps, "make_retriever", None)
+    if callable(mk) and org_id:
+        try:
+            return mk(org_id, "impacts")
+        except Exception:  # pragma: no cover
+            logger.debug("make_retriever(org_id, 'impacts') failed", exc_info=True)
+    return getattr(deps, "impacts_retriever", None)
+
+
 async def _explain_node_async(deps: GraphDeps, state: ImpactState) -> ImpactState:
-    """Explain impacts via RAG→LLM fallback; writes a user-facing message into state.result."""
+    """Explain impacts via RAG→LLM fallback; wrap as title + short bullet list."""
     query = (state.question or state.message or "").strip() or "impacts overview"
     retriever = _get_impacts_retriever(deps, state.org_id)
-    chunks: List[Dict[str, Any]] = []
-    rag_used = False
 
+    snippets: List[str] = []
+    rag_used = False
     if retriever:
         try:
             docs = []
@@ -628,86 +565,78 @@ async def _explain_node_async(deps: GraphDeps, state: ImpactState) -> ImpactStat
                 maybe = retriever(query)
                 docs = await maybe if hasattr(maybe, "__await__") else maybe
             for d in docs or []:
-                chunks.append({
-                    "text": getattr(d, "page_content", None) or getattr(d, "text", "") or str(d),
-                    "meta": getattr(d, "metadata", {}) or {},
-                })
-            rag_used = len(chunks) > 0
+                txt = getattr(d, "page_content", None) or getattr(d, "text", "") or str(d)
+                if txt:
+                    snippets.append(str(txt))
+            rag_used = len(snippets) > 0
         except Exception:
             logger.debug("impacts retriever failed; falling back to LLM-only", exc_info=True)
 
-    messages: List[dict] = [{"role": "system", "content": EXPLAIN_SYSTEM}]
+    sys = EXPLAIN_SYSTEM
+    msgs: List[dict] = [{"role": "system", "content": sys}]
     if rag_used:
-        ctx = "\n\n---\n".join([c["text"] for c in chunks[:5] if c.get("text")])
-        messages.append({"role": "system", "content": f"Catalog/context snippets:\n{ctx}"})
-    messages.append({"role": "user", "content": f"Explain: {query}"})
+        ctx = "\n\n---\n".join(snippets[:5])
+        msgs.append({"role": "system", "content": f"Context snippets:\n{ctx}"})
+    # Ask the model to produce ≤6 crisp bullets, no fluff.
+    msgs.append({
+        "role": "user",
+        "content": json.dumps({
+            "task": "Summarize in <=6 short bullets for end users; avoid repetition; be concrete.",
+            "query": query,
+            "locale": _lang(state.locale),
+        }, ensure_ascii=False)
+    })
+    answer = await _llm_text_async(deps=deps, messages=msgs, temperature=0.2)
+    bullets = [ln.strip("-• ").strip() for ln in answer.splitlines() if ln.strip()]
+    bullets = bullets if bullets else [answer.strip()]
 
-    answer = await _llm_text_async(deps=deps, messages=messages, temperature=0.2)
-    state.result = _ui_response(
-        answer.strip(),
-        extra={
-            "rag_used": rag_used,
-            "sources": chunks[:5] if rag_used else [],
-            "agent_events": state.agent_events,
-        },
-    )
+    heading = {"cs": "Vysvětlení dopadů", "sk": "Vysvetlenie dopadov", "en": "Impacts — explanation"}[_lang(state.locale)]
+    text = "\n\n".join([title(f"{heading}: {query}"), bullet_list(bullets)])
+    parts = chunk(text, max_chars=1800)
+
+    state.result = _ui_response(parts[0], extra={
+        "agent_events": state.agent_events,
+        "rag_used": rag_used,
+        "sources_count": min(5, len(snippets)) if rag_used else 0,
+    })
+    if len(parts) > 1:
+        state.result["messages"].extend(parts[1:])  # type: ignore[index]
     return state
 
-async def run_explain(*, deps: GraphDeps, text: str, locale: Optional[str] = None, org_id: Optional[str] = None) -> dict:
-    """
-    Router-facing explain for IMPACTS. Reuses internal async explain node and returns UI payload.
-    """
-    state = ImpactState(
-        org_id=org_id or getattr(getattr(deps, "settings", object()), "org_id", "demo-org"),
-        active_tab="impacts",
-        message=text,
-        question=text,
-        locale=locale or "en",
-        agent_events=[],
-    )
-    state = await _explain_node_async(deps, state)
-    return state.result or {"ok": False, "error": "no_result"}
 
 # -----------------------------------------------------------------------------
-# Write nodes (no regex; strictly use provided codes/levels)
+# Write nodes (strictly use provided codes/levels; no guessing)
 # -----------------------------------------------------------------------------
 def _set_impact_level(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
     """Set one or more impact levels for a single asset (merge mode)."""
     def _inner(state: ImpactState) -> ImpactState:
-        loc = _lang(state.locale)
+        l = _lang(state.locale)
         payload = state.set_payload
 
         if not payload or not payload.items:
+            # If no selection, propose asset list; otherwise ask for items only
             if not (state.selection and state.selection.get("asset_id")):
                 return _suggest_select(deps)(state)
-            state.result = _ui_response(_t(loc, "nothing_to_set"), extra={"agent_events": state.agent_events})
+            msg = {"cs": "Není co nastavit. Potřebuji items[{impact_code, level}].",
+                   "sk": "Nie je čo nastaviť. Potrebujem items[{impact_code, level}].",
+                   "en": "Nothing to set. Need items[{impact_code, level}]."}[l]
+            state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
             return state
 
-        # Guard + build action (registry validates "ActionSetImpacts")
         action = {
             "op": "set_impacts",
             "mode": "merge",
             "asset_id": payload.asset_id,
             "items": [it.model_dump() for it in payload.items],
         }
-        try:
-            _guard_validate("ActionSetImpacts", action)  # type: ignore[arg-type]
-        except Exception as e:
-            state.result = _ui_response(_t(loc, "validation_error", err=e), extra={"agent_events": state.agent_events})
-            return state
-
         state.actions = [action]
 
-        # Short confirmation (echo last item)
+        # Short pre-submit echo; final confirmation is after submit
         last = payload.items[-1]
-        lvl_i = max(0, min(4, int(last.level)))
-        if loc == "cs":
-            txt = f"✅ Nastaven dopad {last.impact_code}={lvl_i} pro aktivum „{payload.asset_id}“."
-        elif loc == "sk":
-            txt = f"✅ Nastavený dopad {last.impact_code}={lvl_i} pre aktívum „{payload.asset_id}“."
-        else:
-            txt = f"✅ Set impact {last.impact_code}={lvl_i} for asset “{payload.asset_id}”."
-        state.result = _ui_response(txt, extra={"agent_events": state.agent_events})
+        echo = {"cs": f"✅ Připraveno nastavit {last.impact_code}={int(last.level)} pro aktivum „{payload.asset_id}“.",
+                "sk": f"✅ Pripravené nastaviť {last.impact_code}={int(last.level)} pre aktívum „{payload.asset_id}“.",
+                "en": f"✅ Ready to set {last.impact_code}={int(last.level)} for asset “{payload.asset_id}”."}[l]
+        state.result = _ui_response(echo, extra={"agent_events": state.agent_events})
         return state
     return _inner
 
@@ -715,38 +644,38 @@ def _set_impact_level(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
 def _bulk_set_impact_levels(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
     """Bulk set impact levels across multiple assets (merge mode)."""
     def _inner(state: ImpactState) -> ImpactState:
-        loc = _lang(state.locale)
+        l = _lang(state.locale)
         bulk = state.bulk_payload
         if not bulk or not bulk.entries:
-            state.result = _ui_response(_t(loc, "bulk_missing"), extra={"agent_events": state.agent_events})
+            msg = {"cs": "Chybí entries pro hromadné nastavení.",
+                   "sk": "Chýbajú entries pre hromadné nastavenie.",
+                   "en": "Missing entries for bulk update."}[l]
+            state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
             return state
 
         actions: List[dict] = []
         for e in bulk.entries:
             if not e.asset_id or not e.items:
                 continue
-            a = {
+            actions.append({
                 "op": "set_impacts",
                 "mode": "merge",
                 "asset_id": e.asset_id,
                 "items": [it.model_dump() for it in e.items],
-            }
-            try:
-                _guard_validate("ActionSetImpacts", a)  # type: ignore[arg-type]
-            except Exception as ex:
-                state.result = _ui_response(_t(loc, "validation_error", err=ex), extra={"agent_events": state.agent_events})
-                return state
-            actions.append(a)
+            })
 
         if not actions:
-            state.result = _ui_response(_t(loc, "bulk_missing"), extra={"agent_events": state.agent_events})
+            msg = {"cs": "Chybí entries pro hromadné nastavení.",
+                   "sk": "Chýbajú entries pre hromadné nastavenie.",
+                   "en": "Missing entries for bulk update."}[l]
+            state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
             return state
 
         state.actions = actions
-        text = {"cs": "✅ Připraveno k aplikaci (hromadné nastavení).",
-                "sk": "✅ Pripravené na aplikáciu (hromadné nastavenie).",
-                "en": "✅ Ready to apply (bulk set)."}[_lang(state.locale)]
-        state.result = _ui_response(text, extra={"agent_events": state.agent_events})
+        ready = {"cs": "✅ Připraveno k aplikaci (hromadné nastavení).",
+                 "sk": "✅ Pripravené na aplikáciu (hromadné nastavenie).",
+                 "en": "✅ Ready to apply (bulk set)."}[l]
+        state.result = _ui_response(ready, extra={"agent_events": state.agent_events})
         return state
     return _inner
 
@@ -754,10 +683,10 @@ def _bulk_set_impact_levels(deps: GraphDeps) -> Callable[[ImpactState], ImpactSt
 def _create_impact(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
     """Create or update impact catalog entries (upsert semantics)."""
     def _inner(state: ImpactState) -> ImpactState:
-        loc = _lang(state.locale)
+        l = _lang(state.locale)
         items = state.create_items or []
         if not items:
-            # Optional tiny JSON fallback: {"items":[{code,name,...}]}
+            # Optional JSON fallback {"items":[{code,name,...}]}
             try:
                 raw = json.loads(state.message or "{}")
                 src = raw.get("items") or []
@@ -766,53 +695,31 @@ def _create_impact(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
                 pass
 
         if not items:
-            state.result = _ui_response(_t(loc, "create_missing"), extra={"agent_events": state.agent_events})
+            msg = {"cs": "Zadej alespoň jeden dopad {code,name[,category,description,weight]}.",
+                   "sk": "Zadaj aspoň jeden dopad {code,name[,category,description,weight]}.",
+                   "en": "Provide at least one impact {code,name[,category,description,weight]}."}[l]
+            state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
             return state
 
-        action = {"op": "upsert_impacts", "items": [it.model_dump() for it in items]}  # keep compatible via upsert op
-        try:
-            _guard_validate("ActionUpsertImpacts", action)  # type: ignore[arg-type]
-        except Exception as e:
-            state.result = _ui_response(_t(loc, "validation_error", err=e), extra={"agent_events": state.agent_events})
-            return state
-
+        action = {"op": "upsert_impacts", "items": [it.model_dump() for it in items]}
         state.actions = [action]
 
-        # Short confirmation (echo first)
-        first = items[0]
-        text = {"cs": f"✅ Přidán dopad „{first.name}“ ({first.code}).",
-                "sk": f"✅ Pridaný dopad „{first.name}“ ({first.code}).",
-                "en": f"✅ Impact “{first.name}” ({first.code}) queued."}[_lang(state.locale)]
-        state.result = _ui_response(text, extra={"agent_events": state.agent_events})
+        echo = {"cs": f"✅ Připraveno přidat/aktualizovat {len(items)} dopadů.",
+                "sk": f"✅ Pripravené pridať/aktualizovať {len(items)} dopadov.",
+                "en": f"✅ Ready to add/update {len(items)} impact(s)."}[l]
+        state.result = _ui_response(echo, extra={"agent_events": state.agent_events})
         return state
     return _inner
 
 
 # -----------------------------------------------------------------------------
-# Submit (single submit per turn) — unified with routers (submit_or_outbox)
+# Submit (single submit per turn) — routers handle on-line vs outbox fallback
 # -----------------------------------------------------------------------------
 async def _submit_changeset_async(deps: GraphDeps, state: ImpactState) -> ImpactState:
-    """Submit accumulated actions as a typed ChangeSet via deps.submit_or_outbox."""
-    loc = _lang(state.locale)
+    l = _lang(state.locale)
     acts = state.actions or []
     if not acts:
-        state.result = _ui_response(_t(loc, "submitted_generic", count=0), extra={"agent_events": state.agent_events})
-        return state
-
-    cs: ChangeSet | dict = build_changeset(
-        org_id=state.org_id,
-        user_id=state.user_id or "unknown",
-        actions=acts,
-        intent="apply",
-    )
-    state.change = cs
-
-async def _submit_changeset_async(deps: GraphDeps, state: ImpactState) -> ImpactState:
-    """Submit accumulated actions as a typed ChangeSet via deps.submit_changeset (with OUTBOX fallback handled inside)."""
-    loc = _lang(state.locale)
-    acts = state.actions or []
-    if not acts:
-        state.result = _ui_response(_t(loc, "submitted_generic", count=0), extra={"agent_events": state.agent_events})
+        state.result = _ui_response({"cs": "Žádné změny k uložení.", "sk": "Žiadne zmeny na uloženie.", "en": "No actions to apply."}[l], extra={"agent_events": state.agent_events})
         return state
 
     cs: ChangeSet | dict = build_changeset(
@@ -825,50 +732,79 @@ async def _submit_changeset_async(deps: GraphDeps, state: ImpactState) -> Impact
 
     submit_fn = getattr(deps, "submit_changeset", None)
     if not callable(submit_fn):
-        state.result = _ui_response(_t(loc, "validation_error", err="submit_changeset not available"), extra={"agent_events": state.agent_events})
+        msg = {"cs": "submit_changeset není k dispozici.", "sk": "submit_changeset nie je k dispozícii.", "en": "submit_changeset not available."}[l]
+        state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
         return state
 
     t0 = _event(state, kind="tool.call.start", tool="submit_changeset", meta={"actions": len(acts)})
     try:
         cs_typed = cs if hasattr(cs, "model_dump") else ChangeSet.model_validate(cs)
         submit_result = await submit_fn(cs_typed, require_success=False)  # factory handles online→OUTBOX fallback
-
         ok = bool(getattr(submit_result, "submitted", False))
-        if not ok:
-            fallback_path = getattr(submit_result, "fallback_path", None)
-            _finish(state, t0, tool="submit_changeset", ok=False, meta={"fallback_path": str(fallback_path) if fallback_path else None})
-            state.result = _ui_response(
-                {"cs": "Odeslání selhalo, změny uloženy lokálně.", "sk": "Odoslanie zlyhalo, zmeny uložené lokálne.", "en": "Submission failed; queued locally."}[_lang(state.locale)],
-                extra={"agent_events": state.agent_events, "outbox_path": str(fallback_path) if fallback_path else None},
-            )
-            return state
+        fallback_path = getattr(submit_result, "fallback_path", None)
+        _finish(state, t0, tool="submit_changeset", ok=ok, meta={"actions": len(acts), "fallback_path": str(fallback_path) if fallback_path else None})
 
-        _finish(state, t0, tool="submit_changeset", ok=True, meta={"actions": len(acts)})
-    except Exception as e:
-        _finish(state, t0, tool="submit_changeset", ok=False, meta={"error": str(e)})
-        state.result = _ui_response(_t(loc, "validation_error", err=e), extra={"agent_events": state.agent_events})
+        # Short, neutral confirmation
+        n_set = sum(1 for a in acts if a.get("op") == "set_impacts")
+        n_upsert = sum(1 for a in acts if a.get("op") == "upsert_impacts")
+        if ok:
+            text = {"cs": f"Hotovo: {n_set} změn úrovní, {n_upsert} upsertů.",
+                    "sk": f"Hotovo: {n_set} zmien úrovní, {n_upsert} upsertov.",
+                    "en": f"Done: {n_set} level updates, {n_upsert} upserts."}[l]
+        else:
+            text = {"cs": "Odeslání se nezdařilo; změny byly zařazeny do fronty.",
+                    "sk": "Odoslanie zlyhalo; zmeny boli zaradené do fronty.",
+                    "en": "Submission failed; changes were queued."}[l]
+
+        try:
+            cs_dump = cs_typed.model_dump(mode="json") if hasattr(cs_typed, "model_dump") else dict(cs_typed)  # type: ignore[arg-type]
+        except Exception:
+            cs_dump = {"_error": "cannot_dump_changeset"}
+
+        state.result = _ui_response(
+            text,
+            extra={
+                "changeset_actions": len(acts),
+                "agent_events": state.agent_events,
+                "messages": [text, {"kind": "changeset", "changeset": cs_dump, "ts": _now_iso()}],
+            },
+        )
+        state.actions = None
+        state.change = None
         return state
 
-    n_set = sum(1 for a in acts if a.get("op") == "set_impacts")
-    n_created = sum(1 for a in acts if a.get("op") == "upsert_impacts")
-    text = _t(loc, "submitted_summary", set=n_set, created=n_created) if (n_set or n_created) else _t(loc, "submitted_generic", count=len(acts))
+    except Exception as e:
+        _finish(state, t0, tool="submit_changeset", ok=False, meta={"error": str(e)})
+        msg = {"cs": f"Odeslání selhalo: {e}", "sk": f"Odoslanie zlyhalo: {e}", "en": f"Submission failed: {e}"}[l]
+        state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
+        return state
 
-    try:
-        cs_dump = cs.model_dump(mode="json") if hasattr(cs, "model_dump") else dict(cs)  # type: ignore[arg-type]
-    except Exception:
-        cs_dump = {"_error": "cannot_dump_changeset"}
 
-    state.result = _ui_response(
-        text,
-        extra={
-            "changeset_actions": len(acts),
-            "agent_events": state.agent_events,
-            "messages": [text, {"kind": "changeset", "changeset": cs_dump, "ts": _now_iso()}],
-        },
-    )
-    state.actions = None
-    state.change = None
-    return state
+# -----------------------------------------------------------------------------
+# Agent-only reply (no tools) — concise, friendly, domain-aware
+# -----------------------------------------------------------------------------
+def _agent_reply(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
+    """
+    Produce a concise assistant reply with no tool usage.
+    Catches greetings/chitchat/generic questions and keeps the conversation natural.
+    """
+    def _inner(state: ImpactState) -> ImpactState:
+        l = _lang(state.locale)
+        system = (
+            "You are a helpful assistant for an 'Impacts' tab (risk management). "
+            "Be concise (≤80 words), neutral, and specific. "
+            "Mention you can list the impact catalog, show impacts for an asset, "
+            "set levels (single or bulk), or explain impact concepts—only if relevant. "
+            "Do not claim actions were taken."
+        )
+        user = state.message or ""
+        try:
+            ans = _llm_text(deps=deps, messages=[{"role": "system", "content": system}, {"role": "user", "content": user}], temperature=0.3)
+        except Exception:
+            ans = {"cs": "Jak mohu s dopady pomoci?", "sk": "Ako môžem s dopadmi pomôcť?", "en": "How can I help with impacts?"}[l]
+        state.result = _ui_response(ans, extra={"agent_events": state.agent_events})
+        return state
+    return _inner
 
 
 # -----------------------------------------------------------------------------
@@ -877,15 +813,15 @@ async def _submit_changeset_async(deps: GraphDeps, state: ImpactState) -> Impact
 def create_graph(deps: GraphDeps):
     """
     Flow:
-      start → nlu → route → {help|clarify|list|get|set|bulk_set|create_impact|explain} → (submit?) → END
+      start → nlu → route → {agent.reply | clarify | list | get | set | bulk_set | create_impact | explain} → (submit?) → END
 
-    - Clarify-first guarantees at most one short follow-up when data is missing.
-    - Exactly one external effect per turn (writes → single submit).
-    - Registry-aligned tool names with alias: `impact.levels.for_asset` → internal "get".
+    - One decisive step per turn; writes always go through a single submit.
+    - No hardcoded greet/help/chitchat nodes; agent.reply handles non-tool answers.
+    - Catalog lists are not truncated (only chunked for UI size).
     """
     graph = StateGraph(ImpactState)
 
-    # Async nodes
+    # Async node wrappers
     async def _nlu_node(state: ImpactState) -> ImpactState:
         return await _nlu(deps, state)
 
@@ -899,25 +835,23 @@ def create_graph(deps: GraphDeps):
     graph.add_node("nlu", _nlu_node)
     graph.add_node("route", lambda s: s)
 
-    # clarify/help
-    graph.add_node("help", lambda s: _ui_response(_t(_lang(s.locale), "greet"), extra={"agent_events": s.agent_events}) or s)  # type: ignore[arg-type]
-    graph.add_node("clarify", _clarify_once())
-    graph.add_node("suggest_select", _suggest_select(deps))
+    graph.add_node("agent.reply", _agent_reply(deps))
+    graph.add_node("clarify", _clarify_once(deps))
 
-    # read
+    # Read
     graph.add_node("impact.list", _list_impacts(deps))
     graph.add_node("impact.asset_get", _asset_get_impacts_or_suggest(deps))
-    graph.add_node("impact.levels.for_asset", _asset_get_impacts_or_suggest(deps))  # registry alias to 'get'
+    graph.add_node("impact.levels.for_asset", _asset_get_impacts_or_suggest(deps))  # alias to 'get'
 
-    # write
+    # Write
     graph.add_node("impact.set_level", _set_impact_level(deps))
     graph.add_node("impact.bulk_set", _bulk_set_impact_levels(deps))
     graph.add_node("impact.create_impact", _create_impact(deps))
 
-    # explain
+    # Explain
     graph.add_node("impact.explain", _explain_node)
 
-    # submit
+    # Submit
     graph.add_node("submit_changeset", _submit_node)
 
     # Entry
@@ -926,15 +860,12 @@ def create_graph(deps: GraphDeps):
 
     # Router
     def _route(state: ImpactState) -> str:
-        intent = state.intent or "clarify"
-        if intent in ("help", "chitchat"):
-            return "help"
+        intent = state.intent or "agent_reply"
         if intent == "clarify":
             return "clarify"
         if intent == "list":
             return "impact.list"
         if intent == "get":
-            # Keep internal semantic node; registry alias is mapped separately
             return "impact.asset_get"
         if intent == "set":
             return "impact.set_level"
@@ -944,17 +875,17 @@ def create_graph(deps: GraphDeps):
             return "impact.create_impact"
         if intent == "explain":
             return "impact.explain"
-        return "help"
+        return "agent.reply"
 
     graph.add_conditional_edges(
         "route",
         _route,
         {
-            "help": "help",
+            "agent.reply": "agent.reply",
             "clarify": "clarify",
             "impact.list": "impact.list",
             "impact.asset_get": "impact.asset_get",
-            "impact.levels.for_asset": "impact.levels.for_asset",  # reachable if planner emits alias directly
+            "impact.levels.for_asset": "impact.levels.for_asset",
             "impact.set_level": "impact.set_level",
             "impact.bulk_set": "impact.bulk_set",
             "impact.create_impact": "impact.create_impact",
@@ -967,9 +898,9 @@ def create_graph(deps: GraphDeps):
     graph.add_edge("impact.bulk_set", "submit_changeset")
     graph.add_edge("impact.create_impact", "submit_changeset")
 
-    # Terminal
+    # Terminal nodes
     for node in (
-        "help",
+        "agent.reply",
         "clarify",
         "impact.list",
         "impact.asset_get",
@@ -982,4 +913,15 @@ def create_graph(deps: GraphDeps):
     return graph.compile(checkpointer=deps.checkpointer)
 
 
-__all__ = ["router", "graph_router", "run_explain", "run_explain_impacts"]
+# -----------------------------------------------------------------------------
+# Thin runners used by routers (compat)
+# -----------------------------------------------------------------------------
+async def run_explain(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
+    from workshops_ai.graph.manager import route_chat
+    return await route_chat(ui_req)
+
+async def run_explain_impacts(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
+    return await run_explain(deps=deps, ui_req=ui_req)
+
+
+__all__ = ["ImpactState", "create_graph", "run_explain", "run_explain_impacts"]

@@ -1,4 +1,5 @@
 # File: workshops_ai/routers/chat_router.py
+
 from __future__ import annotations
 
 """
@@ -30,7 +31,7 @@ try:
     _AUTH_DEPS = [Depends(require_auth)]
 except Exception:  # pragma: no cover
     try:
-        # optional legacy fallback
+        # Optional legacy fallback
         from workshops_ai.app.deps.auth import require_auth  # type: ignore
         _AUTH_DEPS = [Depends(require_auth)]
     except Exception:  # pragma: no cover
@@ -49,6 +50,7 @@ from workshops_ai.graph.factory import make_default_deps
 settings = get_settings()
 router = APIRouter(prefix="/api", dependencies=_AUTH_DEPS)
 
+# Router runtime limits (single source of truth from settings)
 CHAT_TIMEOUT_SEC: float = float(getattr(getattr(settings, "chat", object()), "timeout_sec", 60))
 MAX_MESSAGE_LEN: int = int(getattr(getattr(settings, "chat", object()), "max_message_len", 4000))
 
@@ -57,9 +59,24 @@ MAX_MESSAGE_LEN: int = int(getattr(getattr(settings, "chat", object()), "max_mes
 # Helpers
 # ----------------------------------------------------------------------
 def _truncate_for_log(text: str | None, limit: int = 512) -> str | None:
+    """Compact long strings for telemetry to avoid PII/log bloat."""
     if text is None:
         return None
     return text if len(text) <= limit else (text[:limit] + "…")
+
+
+def _normalize_language(payload: dict[str, Any]) -> None:
+    """
+    Accept `accept_language` (from UI/browser) and map it to UIRequest.language.
+    Drop unknown key to satisfy UIRequest(extra='forbid').
+    """
+    al = payload.get("accept_language")
+    if al and isinstance(al, str) and al.strip():
+        # Do not overwrite explicit `language` if client provided it already
+        payload.setdefault("language", al.strip()[:256])
+    # Remove unrecognized key to avoid 422
+    if "accept_language" in payload:
+        payload.pop("accept_language", None)
 
 
 async def _run_with_timeout(awaitable_or_result: Any, timeout_sec: float) -> Any:
@@ -77,7 +94,11 @@ async def _run_with_timeout(awaitable_or_result: Any, timeout_sec: float) -> Any
 def _to_ui_request(payload: dict[str, Any]) -> UIRequest:
     """
     Prefer the new UIRequest; if that fails, try legacy ChatIn and bridge.
+    Also normalize language hints before validation.
     """
+    # Normalize language hint (accept_language → language)
+    _normalize_language(payload)
+
     try:
         return UIRequest.model_validate(payload)
     except ValidationError:
@@ -87,7 +108,7 @@ def _to_ui_request(payload: dict[str, Any]) -> UIRequest:
             legacy = ChatIn.model_validate(payload)
             return legacy.to_ui()
         except Exception as e2:
-            # Re-raise a unified 422 with both contexts lost (we keep it simple for clients)
+            # Re-raise a unified 422 so clients get a consistent error shape
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail={"message": "Invalid UIRequest (and legacy ChatIn fallback failed)"},
@@ -108,7 +129,7 @@ def _to_ui_request(payload: dict[str, Any]) -> UIRequest:
 )
 async def chat_endpoint(
     request: Request,
-    payload: dict[str, Any] = Body(...)
+    payload: dict[str, Any] = Body(...),
 ) -> UIResponse:
     """
     Contract:
@@ -121,7 +142,7 @@ async def chat_endpoint(
     - Backward-compatible acceptance of legacy ChatIn (auto-bridged).
     - DI: manager receives GraphDeps via make_default_deps() with a centralized llm_client.
     """
-    # 1) Validate inbound payload (UIRequest or legacy)
+    # 1) Validate inbound payload (UIRequest or legacy), with language normalization
     ui_req = _to_ui_request(payload)
 
     # 2) Message-length guard
@@ -189,7 +210,6 @@ async def chat_endpoint(
             detail={"message": "Response validation failed", "errors": ve.errors()},
         ) from ve
     except HTTPException:
-        # already mapped with appropriate status code
         raise
     except Exception as ex:
         raise HTTPException(

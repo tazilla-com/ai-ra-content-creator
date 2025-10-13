@@ -1,23 +1,34 @@
 # File: workshops_ai/app/services/ws_hub.py
 # -----------------------------------------------------------------------------
 # WebSocket Hub (WsHub)
-# - Minimal, FastAPI-friendly broadcast hub with async registration.
-# - Per-connection metadata (org_id/user_id/tab) for targeted fan-out.
-# - App-level keepalive to prevent idle disconnects.
-# - Schema-aware emitters for impacts and risks (single + batch/list shapes).
 #
-# Public API
-# - register(ws, *, org_id=None, user_id=None, tab=None)
-# - unregister(ws)
-# - update_client_meta(ws, *, org_id=None, user_id=None, tab=None)
+# Purpose
+# - Minimal in-memory broadcast hub for FastAPI WebSocket connections.
+# - Tracks per-connection metadata (org_id/user_id/tab) to route events.
+# - Provides schema-validated emitters for impacts/risks domain events.
+# - Adds lightweight emitters for asset create/update events.
+# - Sends periodic JSON keepalives to prevent idle disconnects.
+#
+# Public API (class methods)
+# - register(ws, *, org_id=None, user_id=None, tab=None) -> None
+# - unregister(ws) -> None
+# - update_client_meta(ws, *, org_id=None, user_id=None, tab=None) -> None
 # - connected_count() -> int
-# - broadcast(event: str, payload: dict)         # sync wrapper; infers target tab
-# - emit(event: str, payload: dict)              # alias of broadcast
-# - broadcast_json(payload: dict)                # async; expects "event" in payload
-# - aemit_impact_set_level(payload: dict)        # validates WSImpactSetEvent
-# - aemit_impact_set_event(payload: dict)        # validates WSImpactSetListEvent
-# - aemit_risk_set_probability(payload: dict)    # validates WSRiskSetEvent (or wraps item)
-# - aemit_risk_set_event(payload: dict)          # validates WSRiskSetListEvent
+# - broadcast(event: str, payload: dict) -> None         # sync wrapper
+# - emit(event: str, payload: dict) -> None              # alias of broadcast
+# - broadcast_json(payload: dict) -> Awaitable[None]     # expects "event"
+# - aemit_impact_set_level(payload: dict) -> Awaitable[None]
+# - aemit_impact_set_event(payload: dict) -> Awaitable[None]
+# - aemit_risk_set_probability(payload: dict) -> Awaitable[None]
+# - aemit_risk_set_event(payload: dict) -> Awaitable[None]
+# - aemit_asset_event(payload: dict) -> Awaitable[None]            # NEW
+# - aemit_asset_created(item: dict) -> Awaitable[None]             # NEW
+# - aemit_asset_updated(item: dict) -> Awaitable[None]             # NEW
+#
+# Notes
+# - This hub is intentionally simple: no persistence, no external broker.
+# - Failures while sending to a client result in silent unregistration.
+# - Routing is best-effort: if client metadata is missing, it receives events.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -46,9 +57,7 @@ from workshops_ai.schemas.risk_models import (
     RiskChangeItem,
 )
 
-__all__ = [
-    "WsHub",
-]
+__all__ = ["WsHub"]
 
 
 # ---- Internal structures -----------------------------------------------------
@@ -71,11 +80,9 @@ class WsHub:
     """
     In-memory WebSocket hub for broadcasting JSON events.
 
-    Notes
-    - Best-effort: a failing client is unregistered silently.
     - Filtering: events are routed to clients with matching tab/org_id.
       Legacy clients without metadata still receive all events.
-    - Keepalive: app-level JSON ping prevents idle disconnects on some stacks.
+    - Keepalive: a lightweight JSON ping prevents idle disconnects.
     """
 
     _clients: Dict[WebSocket, _Client] = {}
@@ -97,7 +104,7 @@ class WsHub:
         IMPORTANT: call websocket.accept() in your router before registering.
         """
         client = _Client(ws=ws, org_id=org_id, user_id=user_id, tab=tab)
-        # Start keepalive ticker (JSON-level ping; ~25s is a good compromise)
+        # Start keepalive ticker (JSON-level ping; ~25s is a reasonable compromise)
         client.keepalive = asyncio.create_task(cls._keepalive_task(client))
 
         async with cls._lock:
@@ -105,9 +112,7 @@ class WsHub:
 
     @classmethod
     async def unregister(cls, ws: WebSocket) -> None:
-        """
-        Unregister a WebSocket connection (idempotent) and stop keepalive ticker.
-        """
+        """Unregister a WebSocket connection (idempotent) and stop keepalive."""
         async with cls._lock:
             client = cls._clients.pop(ws, None)
 
@@ -116,7 +121,7 @@ class WsHub:
             try:
                 await client.keepalive
             except Exception:
-                # swallow cancellation exceptions
+                # Swallow cancellation/transport exceptions during shutdown
                 pass
 
     @classmethod
@@ -128,9 +133,7 @@ class WsHub:
         user_id: str | None = None,
         tab: str | None = None,
     ) -> None:
-        """
-        Update routing metadata for a registered client (no-op if missing).
-        """
+        """Update routing metadata for a registered client (no-op if missing)."""
         async with cls._lock:
             client = cls._clients.get(ws)
             if not client:
@@ -152,15 +155,16 @@ class WsHub:
     @classmethod
     def broadcast(cls, event: str, payload: dict[str, Any]) -> None:
         """
-        Fire-and-forget broadcast of a JSON message, adding the 'event' field.
+        Fire-and-forget broadcast of a JSON message, adding/overriding the 'event' field.
         Safe to call from non-async code (graphs use this in SEND-NOW paths).
         """
-        message = {"event": event, **payload}
+        # Ensure the provided event name wins over any accidental 'event' in payload
+        message = {**payload, "event": event}
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(cls.broadcast_json(message))
         except RuntimeError:
-            # No running loop (unlikely in FastAPI) – run a short-lived loop.
+            # No running loop (unlikely under FastAPI/Uvicorn) – run a short-lived loop.
             asyncio.run(cls.broadcast_json(message))
 
     @classmethod
@@ -185,7 +189,7 @@ class WsHub:
         target_tab = cls._infer_tab_from_event(event)
         target_org = cls._extract_org_id(payload)
 
-        # Snapshot outside the lock to avoid holding it during I/O
+        # Snapshot targets outside the lock to avoid holding it during I/O
         async with cls._lock:
             targets = list(cls._clients.values())
 
@@ -221,7 +225,7 @@ class WsHub:
           - payload: {
               org_id, asset_id, asset_name?,
               impact_code, impact_name?,
-              level, note?, ts, idempotency_key?
+              level, note?, ts?, idempotency_key?
             }
         """
         evt = WSImpactSetEvent.model_validate(payload)
@@ -251,7 +255,7 @@ class WsHub:
           1) Full event envelope:
              {"event": "risk.set_probability", "payload": {...RiskChangeItem...}}
           2) Plain item (auto-wrapped):
-             {"org_id":"...", "asset_id":"...", "threat_code":"...", "probability": 0..4, "note": "...?"}
+             {"org_id":"...", "asset_id":"...", "threat_code":"...", "probability": 0..4, "note":"...?"}
 
         Plain items are normalized into a RiskChangeItem, then wrapped with 'event'.
         """
@@ -281,13 +285,112 @@ class WsHub:
         evt = WSRiskSetListEvent.model_validate(payload)
         await cls.broadcast_json(evt.model_dump(mode="json"))
 
+    # -- Assets emitters (lightweight validation) -------------------------------
+
+    _ALLOWED_ASSET_EVENTS = {"asset.created", "asset.updated"}
+
+    @classmethod
+    async def aemit_asset_event(cls, payload: dict[str, Any]) -> None:
+        """
+        Validate and emit an asset event (single-item) to the *assets* tab.
+
+        Supported event names:
+          - "asset.created"
+          - "asset.updated"
+
+        Accepted inputs:
+          1) Full envelope:
+             {
+               "event": "asset.created" | "asset.updated",
+               "payload": {
+                  "org_id": "...",            # REQUIRED
+                  "asset_id": "...",          # REQUIRED
+                  "name": "CRM",              # OPTIONAL
+                  "assetType": "APPLICATION", # OPTIONAL
+                  "isPrimary": true,          # OPTIONAL
+                  "description": "...",       # OPTIONAL
+                  "ts": "...", "idempotency_key": "..."  # OPTIONAL
+               }
+             }
+          2) Plain item with "op":
+             {
+               "op": "created" | "updated",
+               "org_id": "...",
+               "asset_id": "...",
+               ...
+             }
+             (Will be wrapped into the envelope above.)
+
+        Raises:
+          ValueError if the shape is invalid or required keys are missing.
+        """
+        # Case 1: already an envelope with an explicit event
+        if isinstance(payload, dict) and "event" in payload and "payload" in payload:
+            event = str(payload["event"])
+            if event not in cls._ALLOWED_ASSET_EVENTS:
+                raise ValueError(f"Unsupported asset event: {event!r}")
+            inner = payload["payload"]
+            if not isinstance(inner, dict):
+                raise ValueError("Asset event 'payload' must be an object.")
+            if not isinstance(inner.get("org_id"), str) or not inner.get("org_id"):
+                raise ValueError("Asset event requires non-empty payload.org_id.")
+            if not isinstance(inner.get("asset_id"), str) or not inner.get("asset_id"):
+                raise ValueError("Asset event requires non-empty payload.asset_id.")
+            # Broadcast as-is (already normalized)
+            await cls.broadcast_json({"event": event, "payload": inner})
+            return
+
+        # Case 2: plain item with 'op'
+        if isinstance(payload, dict) and "op" in payload:
+            op = str(payload.get("op") or "").strip().lower()
+            if op not in ("created", "updated"):
+                raise ValueError(f"Unsupported asset op: {op!r}")
+            event = f"asset.{op}"
+            if not isinstance(payload.get("org_id"), str) or not payload.get("org_id"):
+                raise ValueError("Asset item requires non-empty org_id.")
+            if not isinstance(payload.get("asset_id"), str) or not payload.get("asset_id"):
+                raise ValueError("Asset item requires non-empty asset_id.")
+            # Remove helper key 'op' and wrap
+            item = dict(payload)
+            item.pop("op", None)
+            await cls.broadcast_json({"event": event, "payload": item})
+            return
+
+        raise ValueError("Unsupported asset event payload shape. Provide an envelope with 'event' and 'payload', or a plain item with 'op'.")
+
+    @classmethod
+    async def aemit_asset_created(cls, item: dict[str, Any]) -> None:
+        """
+        Convenience wrapper: emit 'asset.created' for a single item.
+
+        Example 'item':
+          {
+            "org_id": "...", "asset_id": "...",
+            "name": "CRM", "assetType": "APPLICATION", "isPrimary": true, "description": "...?",
+            "ts": "...?", "idempotency_key": "...?"
+          }
+        """
+        await cls.aemit_asset_event({"event": "asset.created", "payload": item})
+
+    @classmethod
+    async def aemit_asset_updated(cls, item: dict[str, Any]) -> None:
+        """
+        Convenience wrapper: emit 'asset.updated' for a single item.
+
+        Example 'item':
+          {
+            "org_id": "...", "asset_id": "...",
+            "name": "CRM", "assetType": "APPLICATION", "isPrimary": true, "description": "...?",
+            "ts": "...?", "idempotency_key": "...?"
+          }
+        """
+        await cls.aemit_asset_event({"event": "asset.updated", "payload": item})
+
     # -- Internals --------------------------------------------------------------
 
     @staticmethod
     def _infer_tab_from_event(event: str) -> Optional[str]:
-        """
-        Map event names to UI tabs.
-        """
+        """Map event names to UI tabs."""
         if not event:
             return None
         if event.startswith("impact.") or event.startswith("impacts."):
@@ -301,9 +404,7 @@ class WsHub:
 
     @staticmethod
     def _extract_org_id(payload: dict[str, Any]) -> Optional[str]:
-        """
-        Extract org_id from either the top-level payload or the inner 'payload' field.
-        """
+        """Extract org_id from either the top-level payload or the inner 'payload' field."""
         org_top = payload.get("org_id")
         if isinstance(org_top, str) and org_top:
             return org_top
@@ -316,9 +417,7 @@ class WsHub:
 
     @classmethod
     async def _keepalive_task(cls, client: _Client) -> None:
-        """
-        Periodically send a lightweight JSON ping to keep the connection alive.
-        """
+        """Periodically send a lightweight JSON ping to keep the connection alive."""
         try:
             while True:
                 await asyncio.sleep(25)  # 20–30s is a good compromise

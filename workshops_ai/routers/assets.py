@@ -1,25 +1,17 @@
 # File: workshops_ai/routers/assets.py
 # -----------------------------------------------------------------------------
-# REST (read-only) for Assets state:
-#   - GET /api/assets?org_id=&search=&type=&is_primary=
-#   - GET /api/assets/{asset_id}?org_id=
-#   - GET /api/assets/{asset_id}/impacts
-#   - GET /api/assets/{asset_id}/risks
+# Assets Router
 #
-# Tool-first endpoint for agent use (SSOT-aligned):
-#   - POST /graph/assets
-#       body: {"op": "<asset.list|asset.create|asset.update_meta|asset.explain>", "args": {...}}
-#       - asset.list        → {items,total}
-#       - asset.create      → graph runner (ChangeSet/outbox aware) → UIResponse
-#       - asset.update_meta → {asset_id, changed}
-#       - asset.explain     → graph runner (RAG→LLM fallback) → UIResponse
+# Responsibilities
+# - Public, read-only REST for assets (client apps, dashboards).
+# - Unified tool-first endpoint (/graph/assets) for the LLM agent to call.
 #
-# Principles
-# - Returns the canonical API DTO `workshops_ai.api.schema.asset.Asset` for assets.
-# - Per-asset impacts/risks return lightweight DTOs defined here (state is source of truth).
-# - Read-only; writes flow via the unified /graph/assets tool endpoint using SSOT schemas.
-# - Non-blocking: sync CSV backend wrapped via asyncio.to_thread where needed.
-# - Auth via centralized `require_auth`.
+# Design
+# - Read-only REST: returns canonical API DTOs (workshops_ai.api.schema.asset.Asset).
+# - Tool-first (/graph/assets): validates strictly against ToolRegistry (SSOT) and
+#   dispatches to the asset graph runners for create/update/explain. One tool per call.
+# - No hardcoded conversational strings here — the LLM + graph handle slot-asking
+#   and confirmations. This router only validates, routes, and shapes responses.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -45,21 +37,21 @@ from workshops_ai.graph.factory import GraphDeps
 # Canonical public DTOs for assets (client contracts)
 from workshops_ai.api.schema.asset import Asset
 
-# SSOT (tool args) come from the registry
+# SSOT (tool args) from the canonical registry
 from workshops_ai.agents.tools.registry import (
     ToolRegistry,
     AssetListArgs,
-    AssetCreateArgs,
+    AssetCreateArgs,        # imported for Literal parity & potential future use
     AssetUpdateMetaArgs,
     AssetExplainArgs,
 )
 
-# UI contract (used when calling graph runners)
+# UI contract (used when delegating to graph runners)
 from workshops_ai.schemas.ui_contract import UIRequest
 
 # Routers:
-# - `router` stays on /api/assets (read-only public API)
-# - `graph_router` mounts /graph/assets (LLM tool-first, unified endpoint)
+# - `router`        → /api/assets (public read-only)
+# - `graph_router`  → /graph/assets (tool-first SSOT endpoint for the agent)
 router = APIRouter(prefix="/api/assets", tags=["assets"])
 graph_router = APIRouter(prefix="/graph/assets", tags=["graph:assets"])
 
@@ -84,7 +76,7 @@ class AssetRiskItem(BaseModel):
     note: Optional[str] = Field(None, description="Optional note from state")
 
 # -----------------------------------------------------------------------------
-# Tool-first (graph) response models (minimalistic for LLM tools)
+# Tool-first (graph) lightweight models (agent-oriented)
 # -----------------------------------------------------------------------------
 
 class ToolAssetLite(BaseModel):
@@ -102,13 +94,14 @@ class ToolAssetUpdateResponse(BaseModel):
     asset_id: str
     changed: dict = Field(default_factory=dict)
 
-# Unified tool call request/response wrapper
+
+# Unified tool call request/response wrapper for /graph/assets
 class GraphToolCall(BaseModel):
     op: Literal["asset.list", "asset.create", "asset.update_meta", "asset.explain"]
     args: dict = Field(default_factory=dict)
 
 # -----------------------------------------------------------------------------
-# DI helper
+# DI helpers
 # -----------------------------------------------------------------------------
 
 def get_backend(request: Request) -> BackendPort:
@@ -121,6 +114,15 @@ def get_backend(request: Request) -> BackendPort:
     if prebuilt is not None:
         return cast(BackendPort, prebuilt)
     return CsvBackend()  # safe fallback for local/dev usage
+
+
+def get_deps(request: Request) -> GraphDeps:
+    """Obtain the shared GraphDeps instance (required for graph runners)."""
+    app_state = getattr(request.app, "state", None)
+    deps: GraphDeps | None = getattr(app_state, "deps", None) or getattr(request.state, "deps", None)
+    if deps is None:
+        raise HTTPException(status_code=500, detail={"message": "GraphDeps (app.state.deps) is not configured"})
+    return deps
 
 # -----------------------------------------------------------------------------
 # Utilities (robust normalization to canonical Asset DTO)
@@ -158,7 +160,7 @@ def _first_nonempty(*vals: Any) -> Any | None:
 def _as_uuid_str_or_none(v: Any) -> str | None:
     """
     Try to coerce to UUID string; return None if not a valid UUID.
-    NOTE: The public Asset DTO must tolerate Optional id for non-UUID states.
+    The public Asset DTO tolerates Optional id for non-UUID states.
     """
     if v is None:
         return None
@@ -198,8 +200,8 @@ def _to_asset(item: Any) -> Asset:
     """
     Convert backend item (dict or Pydantic model) into canonical Asset DTO.
     - Never inject non-UUID strings into `id`; invalid UUIDs become None.
-    - Do not include isPrimary if unknown → let client's default (True) apply.
-    - Do not pass empty assetType → raise 500 with clear diagnostics (or fallback if agreed).
+    - Do not include isPrimary if unknown → let client's default apply.
+    - Raise a 500 if name/assetType are missing (data contract violation).
     """
     data = item.model_dump() if hasattr(item, "model_dump") else dict(item)
 
@@ -255,11 +257,13 @@ def _to_asset(item: Any) -> Asset:
         ) from ve
 
 async def _run_async(func, *args, **kwargs):
+    """Run sync backends on a worker thread; await coroutines directly."""
     if inspect.iscoroutinefunction(func):
         return await func(*args, **kwargs)
     return await asyncio.to_thread(func, *args, **kwargs)
 
 def _shape_tool_asset(item: Any) -> ToolAssetLite:
+    """Compress backend item into an agent-friendly lite shape."""
     data = item.model_dump() if hasattr(item, "model_dump") else dict(item)
     asset_id = str(_first_nonempty(data.get("id"), data.get("asset_id")))
     name = str(_first_nonempty(data.get("name"), data.get("title"), ""))
@@ -422,15 +426,16 @@ async def graph_assets_entrypoint(
     call: GraphToolCall,
     org_id: str = Query(..., description="Organization identifier"),
     backend: BackendPort = Depends(get_backend),
+    deps: GraphDeps = Depends(get_deps),
     _auth=Depends(require_auth),
 ):
     """
     Single SSOT-aligned endpoint for all asset tools.
     Strictly validates arguments via ToolRegistry to ensure schema parity.
-    - asset.list        → handled here (CSV backend)
-    - asset.update_meta → handled here (CSV backend)
-    - asset.create      → delegated to graph runner (ChangeSet/outbox aware)
-    - asset.explain     → delegated to graph runner (RAG→LLM fallback)
+      - asset.list        → handled here (backend list)
+      - asset.update_meta → delegated to graph runner (slot-driven + ChangeSet)
+      - asset.create      → delegated to graph runner (slot-driven + ChangeSet)
+      - asset.explain     → delegated to graph runner (RAG/LLM)
     """
     op = call.op
     args = call.args or {}
@@ -449,30 +454,17 @@ async def graph_assets_entrypoint(
             detail={"message": f"Invalid payload for {op}", "errors": ve.errors()},
         ) from ve
 
-    # Ensure deps (GraphDeps) and UIRequest for graph runners
-    app_state = getattr(request.app, "state", None)
-    deps: GraphDeps | None = getattr(app_state, "deps", None) or getattr(request.state, "deps", None)
-    if deps is None:
-        raise HTTPException(status_code=500, detail={"message": "GraphDeps (app.state.deps) is not configured"})
-
+    # Common request metadata for graph runners
     headers = dict(request.headers)
     user_id = headers.get("x-user-id") or "demo-user"
 
-    ui_req = UIRequest(
-        org_id=org_id,
-        user_id=user_id,
-        active_tab="assets",
-        body={"op": op, "args": validated_model.model_dump(mode="json")},
-        agent_events={"subscribed": False, "mode": "raw_json"},
-        emit_changes_enabled=True,
-    )
-
-    # Dispatch
+    # Dispatch per op
     if op == "asset.list":
         v: AssetListArgs = cast(AssetListArgs, validated_model)
         return await _handle_asset_list(org_id=org_id, q=(v.query or None), backend=backend)
 
     if op == "asset.update_meta":
+        # Delegate to slot-driven graph runner (the graph will ask questions if needed)
         v: AssetUpdateMetaArgs = cast(AssetUpdateMetaArgs, validated_model)
         ui_resp = await run_update_meta(
             deps=deps,
@@ -488,16 +480,35 @@ async def graph_assets_entrypoint(
         return JSONResponse(ui_resp.model_dump(mode="json"), status_code=200)
 
     if op == "asset.create":
-        # Delegate to graph runner (ensures ChangeSet/outbox & future backends)
-        ui_resp = await run_create(deps=deps, ui_req=ui_req)
+        # Delegate to slot-driven graph runner (the graph will iterate questions and then apply)
+        v: AssetCreateArgs = cast(AssetCreateArgs, validated_model)  # type: ignore[assignment]
+        ui_resp = await run_create(
+            deps=deps,
+            ui_req=UIRequest(
+                org_id=org_id,
+                user_id=user_id,
+                active_tab="assets",
+                body={"op": op, "args": v.model_dump(mode="json") if hasattr(v, "model_dump") else args},
+                agent_events={"subscribed": False, "mode": "raw_json"},
+                emit_changes_enabled=True,
+            ),
+        )
         return JSONResponse(ui_resp.model_dump(mode="json"), status_code=200)
 
     if op == "asset.explain":
-        # Delegate to graph runner (RAG→LLM fallback)
-        ui_resp = await run_explain(deps=deps, ui_req=ui_req)
-        return JSONResponse(ui_resp.model_dump(mode="json"), status_code=200)
+        # Our asset graph exposes run_explain(deps, text, locale) returning a dict UI payload.
+        # AssetExplainArgs = AssetSelector (assetId | assetName). Build a natural question.
+        v: AssetExplainArgs = cast(AssetExplainArgs, validated_model)
+        asset_id = getattr(v, "assetId", None)
+        asset_name = getattr(v, "assetName", None)
+        # Prefer name when available; otherwise use the id
+        question = f"Explain asset '{asset_name}'." if asset_name else f"Explain asset with id '{asset_id}'."
+        # Locale: take Accept-Language best-effort; otherwise EN
+        accept_lang = headers.get("accept-language") or "en"
+        payload = await run_explain(deps=deps, text=question, locale=accept_lang)
+        return JSONResponse(payload, status_code=200)
 
-    # Should never happen thanks to Literal in GraphToolCall + registry validation
+    # Should never happen (Literal + registry validation)
     raise HTTPException(status_code=400, detail={"message": f"Unknown op '{op}'"})
 
 # -----------------------------------------------------------------------------
@@ -510,7 +521,6 @@ async def _handle_asset_list(*, org_id: str, q: Optional[str], backend: BackendP
     except Exception as ex:
         raise HTTPException(status_code=500, detail={"message": "Failed to list assets", "error": str(ex)}) from ex
     return ToolListAssetsResponse(items=[_shape_tool_asset(a) for a in (items or [])], total=len(items or []))
-
 
 # -----------------------------------------------------------------------------
 # Export both routers; app/main.py should mount them separately:

@@ -9,6 +9,10 @@
 #   - LangChain/LangSmith tracing env export via centralized settings (no getenv reads)
 #   - Canonical router imports (fail-fast in prod; no legacy fallbacks)
 #   - Chat UI is provided by workshops_ai/chatui/router.py
+#
+# Change:
+#   - Use central `mask_secrets()` to redact config in the startup log (replaces settings.redacted_dict()).
+#   - Kept the project's patch style: old code commented above new code.
 
 from __future__ import annotations
 
@@ -44,6 +48,9 @@ except Exception:
 # Centralized settings
 from workshops_ai.settings import get_settings
 settings = get_settings()
+
+# Central secret masking (for startup log redaction)
+from workshops_ai.tools.telemetry import redact_for_log as mask_secrets
 
 # Optional HTTP auth dependency (used for HTTP routers, NOT for WebSocket)
 try:
@@ -161,8 +168,9 @@ class SecurityHeadersMiddleware:
     async def __call__(self, scope, receive, send):
         # >>> Only handle HTTP responses; skip websockets <<<
         if scope.get("type") != "http":
-           await self.app(scope, receive, send)
-           return
+            await self.app(scope, receive, send)
+            return
+
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
                 headers = dict(message.get("headers", []))
@@ -179,6 +187,7 @@ class SecurityHeadersMiddleware:
 
                 message["headers"] = list(headers.items())
             await send(message)
+
         await self.app(scope, receive, send_wrapper)
 
 
@@ -242,7 +251,10 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
 
     # Log redacted settings (no secrets)
     try:
-        logger.info("startup.begin %s", settings.redacted_dict())
+        # OLD:
+        # logger.info("startup.begin %s", settings.redacted_dict())
+        # NEW (centralized masking):
+        logger.info("startup.begin %s", mask_secrets(settings))
     except Exception:
         logger.info("startup.begin")
 
