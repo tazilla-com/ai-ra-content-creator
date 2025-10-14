@@ -2,16 +2,23 @@
 # -----------------------------------------------------------------------------
 # LangGraph: IMPACTS tab — LLM-first assistant (clarify-first, one-call-per-turn)
 #
-# What changed vs. the old version
-# - Removed hardcoded greet/help/chitchat i18n texts & nodes. Any "non-tool" reply
-#   now goes through a dedicated agent-only reply node (agent.reply) powered by the LLM.
-# - Kept a minimal "clarify" path that asks ONE concise follow-up question when
-#   required slots are missing (e.g., asset_id or items for set/bulk_set).
-# - Lists/summaries are formatted via ui/formatting.py (title/bullets/table capable)
-#   with NO hidden truncation for catalog outputs; long messages are chunked.
-# - Explain still uses RAG→LLM fallback, but wraps the output nicely
-#   (title + short bullet points) and surfaces sources in `extra`.
-# - Writes submit exactly once per turn; confirmation is short and neutral.
+# This version aligns behavior and UX with the Asset graph:
+#   1) GET intent is routed to node "impact.levels.for_asset" (canonical),
+#      while keeping "impact.asset_get" as an internal alias node.
+#   2) Writes submit exactly once per turn via deps.submit_changeset(...).
+#      After submit, we return a unified, short LLM-generated confirmation
+#      and attach two structured UI side-messages:
+#        • {"kind":"changeset", ...}
+#        • {"kind":"submit_result", ...}  (with queued/submitted semantics)
+#   3) Provides thin graph "runners" so routers can call graph the same way
+#      as in Assets without constructing confirmations themselves:
+#        • run_set_level(...)
+#        • run_bulk_set(...)
+#
+# Other principles preserved:
+#   - Clarify-first: ask ONE concise follow-up when required slots are missing.
+#   - Lists/summaries formatted via ui/formatting.py (title/bullets/chunk/table).
+#   - Explain uses RAG→LLM fallback and renders concise, chunked output.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -301,7 +308,7 @@ async def _nlu(deps: GraphDeps, state: ImpactState) -> ImpactState:
     allowed = [
         "impact.list",
         "impact.asset_get",
-        "impact.levels.for_asset",   # alias of get
+        "impact.levels.for_asset",   # canonical GET
         "impact.set_level",
         "impact.bulk_set",
         "impact.create_impact",
@@ -498,7 +505,7 @@ def _asset_get_impacts_or_suggest(deps: GraphDeps) -> Callable[[ImpactState], Im
         if not asset_id:
             return _suggest_select(deps)(state)
 
-        t0 = _event(state, kind="tool.call.start", tool="impact.asset_get", meta={"asset_id": asset_id})
+        t0 = _event(state, kind="tool.call.start", tool="impact.levels.for_asset", meta={"asset_id": asset_id})
         try:
             backend = _backend(deps)
             levels = backend.asset_get_impacts(asset_id) if backend else []  # [{impact_code, level, note?}, ...]
@@ -520,9 +527,9 @@ def _asset_get_impacts_or_suggest(deps: GraphDeps) -> Callable[[ImpactState], Im
             state.result = _ui_response(parts[0], extra={"agent_events": state.agent_events, "asset_id": asset_id, "impacts_count": len(lines)})
             if len(parts) > 1:
                 state.result["messages"].extend(parts[1:])  # type: ignore[index]
-            _finish(state, t0, tool="impact.asset_get", ok=True, meta={"count": len(lines)})
+            _finish(state, t0, tool="impact.levels.for_asset", ok=True, meta={"count": len(lines)})
         except Exception as e:
-            _finish(state, t0, tool="impact.asset_get", ok=False, meta={"error": str(e)})
+            _finish(state, t0, tool="impact.levels.for_asset", ok=False, meta={"error": str(e)})
             msg = {"cs": f"Čtení dopadů pro „{asset_id}“ selhalo: {e}", "sk": f"Čítanie dopadov pre „{asset_id}“ zlyhalo: {e}", "en": f"Failed to read impacts for “{asset_id}”: {e}"}[_lang(state.locale)]
             state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
         return state
@@ -713,6 +720,60 @@ def _create_impact(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
 
 
 # -----------------------------------------------------------------------------
+# LLM-confirmation (short, localized) + unified submit result messages
+# -----------------------------------------------------------------------------
+async def _llm_confirm_async(
+    deps: GraphDeps,
+    *,
+    locale: Optional[str],
+    actions: List[dict],
+    submitted: bool,
+    fallback_path: Optional[str],
+) -> str:
+    """
+    Ask the LLM to produce a single short confirmation sentence (<= 20 words),
+    localized to locale ("cs"/"sk"/"en"). If LLM bridge fails, return a safe fallback.
+    """
+    l = _lang(locale)
+    n_set = sum(1 for a in actions if a.get("op") == "set_impacts")
+    n_upsert = sum(1 for a in actions if a.get("op") == "upsert_impacts")
+    payload = {
+        "locale": l,
+        "submitted": bool(submitted),
+        "queued": not bool(submitted),
+        "counts": {"set": n_set, "upsert": n_upsert},
+        "hint": "If queued, mention it briefly; otherwise confirm saved. One sentence; <=20 words.",
+    }
+
+    sys = (
+        "You generate a single, very short confirmation sentence for end users. "
+        "No extra punctuation, no emojis, no technical jargon."
+    )
+    user = json.dumps(payload, ensure_ascii=False)
+
+    try:
+        txt = await _llm_text_async(
+            deps=deps,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            temperature=0.1,
+        )
+        if txt:
+            return txt.strip()
+    except Exception:
+        pass
+
+    # Localized fallback (deterministic)
+    if submitted:
+        return {"cs": f"Uloženo ({n_set} změn úrovní, {n_upsert} upsertů).",
+                "sk": f"Uložené ({n_set} zmien úrovní, {n_upsert} upsertov).",
+                "en": f"Saved ({n_set} level updates, {n_upsert} upserts)."}[l]
+    else:
+        return {"cs": f"Zařazeno do fronty ({n_set} změn, {n_upsert} upsertů).",
+                "sk": f"Zaradené do fronty ({n_set} zmien, {n_upsert} upsertov).",
+                "en": f"Queued ({n_set} updates, {n_upsert} upserts)."}[l]
+
+
+# -----------------------------------------------------------------------------
 # Submit (single submit per turn) — routers handle on-line vs outbox fallback
 # -----------------------------------------------------------------------------
 async def _submit_changeset_async(deps: GraphDeps, state: ImpactState) -> ImpactState:
@@ -744,31 +805,32 @@ async def _submit_changeset_async(deps: GraphDeps, state: ImpactState) -> Impact
         fallback_path = getattr(submit_result, "fallback_path", None)
         _finish(state, t0, tool="submit_changeset", ok=ok, meta={"actions": len(acts), "fallback_path": str(fallback_path) if fallback_path else None})
 
-        # Short, neutral confirmation
-        n_set = sum(1 for a in acts if a.get("op") == "set_impacts")
-        n_upsert = sum(1 for a in acts if a.get("op") == "upsert_impacts")
-        if ok:
-            text = {"cs": f"Hotovo: {n_set} změn úrovní, {n_upsert} upsertů.",
-                    "sk": f"Hotovo: {n_set} zmien úrovní, {n_upsert} upsertov.",
-                    "en": f"Done: {n_set} level updates, {n_upsert} upserts."}[l]
-        else:
-            text = {"cs": "Odeslání se nezdařilo; změny byly zařazeny do fronty.",
-                    "sk": "Odoslanie zlyhalo; zmeny boli zaradené do fronty.",
-                    "en": "Submission failed; changes were queued."}[l]
+        # LLM-powered short confirmation
+        confirm = await _llm_confirm_async(
+            deps,
+            locale=state.locale,
+            actions=acts,
+            submitted=ok,
+            fallback_path=str(fallback_path) if fallback_path else None,
+        )
 
         try:
             cs_dump = cs_typed.model_dump(mode="json") if hasattr(cs_typed, "model_dump") else dict(cs_typed)  # type: ignore[arg-type]
         except Exception:
             cs_dump = {"_error": "cannot_dump_changeset"}
 
-        state.result = _ui_response(
-            text,
-            extra={
-                "changeset_actions": len(acts),
-                "agent_events": state.agent_events,
-                "messages": [text, {"kind": "changeset", "changeset": cs_dump, "ts": _now_iso()}],
-            },
-        )
+        # Unified messages: confirm + structured changeset + structured submit_result
+        messages: List[Any] = [
+            confirm,
+            {"kind": "changeset", "changeset": cs_dump, "ts": _now_iso()},
+            {"kind": "submit_result", "submitted": ok, "queued": (not ok), "fallback_path": str(fallback_path) if fallback_path else None},
+        ]
+
+        state.result = _ui_response(confirm, extra={
+            "changeset_actions": len(acts),
+            "agent_events": state.agent_events,
+            "messages": messages,  # override with the complete messages list for UI
+        })
         state.actions = None
         state.change = None
         return state
@@ -840,8 +902,8 @@ def create_graph(deps: GraphDeps):
 
     # Read
     graph.add_node("impact.list", _list_impacts(deps))
-    graph.add_node("impact.asset_get", _asset_get_impacts_or_suggest(deps))
-    graph.add_node("impact.levels.for_asset", _asset_get_impacts_or_suggest(deps))  # alias to 'get'
+    graph.add_node("impact.asset_get", _asset_get_impacts_or_suggest(deps))          # alias node (kept for compatibility)
+    graph.add_node("impact.levels.for_asset", _asset_get_impacts_or_suggest(deps))  # canonical GET
 
     # Write
     graph.add_node("impact.set_level", _set_impact_level(deps))
@@ -866,7 +928,8 @@ def create_graph(deps: GraphDeps):
         if intent == "list":
             return "impact.list"
         if intent == "get":
-            return "impact.asset_get"
+            # Canonical mapping: GET → "impact.levels.for_asset"
+            return "impact.levels.for_asset"
         if intent == "set":
             return "impact.set_level"
         if intent == "bulk_set":
@@ -884,8 +947,8 @@ def create_graph(deps: GraphDeps):
             "agent.reply": "agent.reply",
             "clarify": "clarify",
             "impact.list": "impact.list",
-            "impact.asset_get": "impact.asset_get",
-            "impact.levels.for_asset": "impact.levels.for_asset",
+            "impact.asset_get": "impact.asset_get",                # still routable if explicitly requested
+            "impact.levels.for_asset": "impact.levels.for_asset",  # canonical GET path
             "impact.set_level": "impact.set_level",
             "impact.bulk_set": "impact.bulk_set",
             "impact.create_impact": "impact.create_impact",
@@ -898,7 +961,7 @@ def create_graph(deps: GraphDeps):
     graph.add_edge("impact.bulk_set", "submit_changeset")
     graph.add_edge("impact.create_impact", "submit_changeset")
 
-    # Terminal nodes
+    # Terminal nodes (include both GET names for compatibility; canonical is levels.for_asset)
     for node in (
         "agent.reply",
         "clarify",
@@ -914,7 +977,7 @@ def create_graph(deps: GraphDeps):
 
 
 # -----------------------------------------------------------------------------
-# Thin runners used by routers (compat)
+# Thin runners used by routers (compat with Asset graph style)
 # -----------------------------------------------------------------------------
 async def run_explain(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
     from workshops_ai.graph.manager import route_chat
@@ -923,5 +986,22 @@ async def run_explain(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
 async def run_explain_impacts(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
     return await run_explain(deps=deps, ui_req=ui_req)
 
+async def run_set_level(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
+    """Thin runner so the router doesn't assemble confirmations itself."""
+    from workshops_ai.graph.manager import route_chat
+    return await route_chat(ui_req)
 
-__all__ = ["ImpactState", "create_graph", "run_explain", "run_explain_impacts"]
+async def run_bulk_set(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
+    """Thin runner so the router doesn't assemble confirmations itself."""
+    from workshops_ai.graph.manager import route_chat
+    return await route_chat(ui_req)
+
+
+__all__ = [
+    "ImpactState",
+    "create_graph",
+    "run_explain",
+    "run_explain_impacts",
+    "run_set_level",
+    "run_bulk_set",
+]

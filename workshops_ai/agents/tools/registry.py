@@ -1,16 +1,21 @@
 # File: workshops_ai/agents/tools/registry.py
 # Purpose:
-#   Canonical tool registry (SSOT) with strict Pydantic v2 argument schemas,
-#   aligned to backend DTOs and graph ops. Produces OpenAI-style tool specs
-#   (a.k.a. "functions") for prompting and validates payloads.
+#   Canonical tool registry (single source of truth) with strict Pydantic v2
+#   argument schemas aligned to backend DTOs and graph operations. It exposes
+#   OpenAI-style "functions/tools" for prompting and validates payloads before
+#   routing to graph endpoints.
 #
-# What changed in this version:
-#   - Added **slot metadata** (`slots`) and **ask_order** to tools that need it,
-#     so the LLM can drive slot-filling with one concise follow-up question.
-#   - Kept tool names/ops as-is (do NOT rename) to avoid breaking routers/WS.
-#   - No pseudo “help/chitchat” tools; only concrete, callable tools live here.
+# Scope of this version:
+#   - Keeps existing Assets/Impacts/Threats/Controls tools intact.
+#   - Adds two Threat tools:
+#       • threat.asset_get  (read risks for an asset)
+#       • threat.upsert     (ensure presence/remove presence of a threat on an asset)
+#   - Adds Impact alias:
+#       • impact.asset_get  (alias of impact.levels.for_asset, same op)
+#   - Provides slot metadata + ask_order for newly added tools to support
+#     slot-driven, one-follow-up-question UX in the planner.
 #
-# Exposed domains and ops (must match your routers/graphs):
+# Exposed domains and ops (must match routers/graphs):
 #   Assets:
 #     - asset.list
 #     - asset.list_types
@@ -23,13 +28,16 @@
 #   Impacts:
 #     - impact.list
 #     - impact.levels.for_asset
+#     - impact.asset_get         (alias of impact.levels.for_asset)
 #     - impact.set_level
 #     - impact.bulk_set
 #     - impact.explain
 #   Threats:
 #     - threat.list
+#     - threat.asset_get
 #     - threat.set_probability
 #     - threat.bulk_set
+#     - threat.upsert
 #     - threat.explain
 #   Controls:
 #     - control.list
@@ -39,7 +47,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, ClassVar, Dict, Literal, Optional, List, get_args
+from typing import Any, ClassVar, Literal, Optional, get_args
 
 from pydantic import (
     BaseModel,
@@ -66,7 +74,7 @@ def _is_uuid_v7_like(s: str) -> bool:
     return bool(_UUID_V7_RX.match(s or ""))
 
 
-# Enumerations (kept in EN; do not translate canonical codes)
+# Enumerations (canonical EN codes; do not localize)
 ConfidentialityLevel = Literal['PUBLIC', 'INTERNAL', 'PROTECTED', 'STRICTLY_PROTECTED']
 TriadLevel           = Literal['LOW', 'MEDIUM', 'HIGH']
 
@@ -93,7 +101,7 @@ ThreatCategory = Literal[
 
 
 # =============================================================================
-# Slot metadata (declarative; used only in prompts for better LLM UX)
+# Slot metadata (declarative; used only for prompts to guide LLM UX)
 # =============================================================================
 
 class SlotDef(BaseModel):
@@ -104,9 +112,9 @@ class SlotDef(BaseModel):
     autofill: bool = Field(False, description="Whether the model may infer/default this slot.")
     label: StrictStr = Field(..., description="Human-readable label (EN).")
     hint: Optional[StrictStr] = Field(None, description="Short guidance or example value.")
-    enum: Optional[List[StrictStr]] = Field(None, description="Optional guidance enum (not enforced at runtime).")
+    enum: Optional[list[StrictStr]] = Field(None, description="Optional guidance enum (not enforced at runtime).")
 
-SlotsMap = Dict[str, SlotDef]
+SlotsMap = dict[str, SlotDef]
 
 
 # =============================================================================
@@ -291,9 +299,7 @@ class ImpactLevelsForAssetArgs(AssetSelector):
     pass
 
 class ImpactSetLevelArgs(AssetSelector):
-    """
-    Set impact level (0..4) for a specific impact on an asset.
-    """
+    """Set impact level (0..4) for a specific impact on an asset."""
     model_config = ConfigDict(extra="forbid")
     impactName: StrictStr = Field(..., description="Exact impact name as defined in catalog.")
     impactLevel: StrictInt = Field(..., ge=0, le=4, description="Impact level 0..4")
@@ -321,7 +327,7 @@ class ImpactBulkItem(BaseModel):
 
 class ImpactBulkSetArgs(AssetSelector):
     model_config = ConfigDict(extra="forbid")
-    items: List[ImpactBulkItem] = Field(..., min_length=1, description="One or more impact updates.")
+    items: list[ImpactBulkItem] = Field(..., min_length=1, description="One or more impact updates.")
 
 class ImpactExplainArgs(BaseModel):
     """Explain an impact concept by its exact name (not category)."""
@@ -372,7 +378,7 @@ class ThreatBulkItem(BaseModel):
 
 class ThreatBulkSetArgs(AssetSelector):
     model_config = ConfigDict(extra="forbid")
-    items: List[ThreatBulkItem] = Field(..., min_length=1, description="One or more threat probability updates.")
+    items: list[ThreatBulkItem] = Field(..., min_length=1, description="One or more threat probability updates.")
 
 class ThreatExplainArgs(BaseModel):
     """Explain a threat concept by its exact name."""
@@ -387,10 +393,39 @@ class ThreatExplainArgs(BaseModel):
             raise ValueError("threatName must be a non-empty string")
         return v2
 
+class ThreatUpsertArgs(AssetSelector):
+    """
+    Upsert (add or remove) the presence of a threat on an asset.
+    - Uses AssetSelector: either assetId or assetName must be provided.
+    - 'present' determines add(True) / remove(False).
+    - Optional 'note' is trimmed to None if empty.
+    """
+    model_config = ConfigDict(extra="forbid")
+    threatName: StrictStr = Field(..., description="Exact threat name as defined in catalog.")
+    present: StrictBool = Field(..., description="True to ensure presence, False to remove presence.")
+    note: Optional[StrictStr] = Field(None, description="Optional note for audit context.")
+
+    @field_validator("threatName")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        v2 = v.strip()
+        if not v2:
+            raise ValueError("threatName must be a non-empty string")
+        return v2
+
+    @field_validator("note")
+    @classmethod
+    def _note_trim(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v2 = v.strip()
+        return v2 or None
+
 
 # ---------- Controls ----------
 
 class ControlListArgs(BaseModel):
+    """List controls from catalog."""
     model_config = ConfigDict(extra="forbid")
 
 class ControlExplainArgs(BaseModel):
@@ -424,7 +459,7 @@ class ToolSpec(BaseModel):
 
     # Slot-driven guidance for LLM (prompt-only; ignored by runtime validation)
     slots: Optional[SlotsMap] = Field(default=None, description="Declarative slot metadata for prompts.")
-    ask_order: Optional[List[StrictStr]] = Field(default=None, description="Preferred order of slot questions.")
+    ask_order: Optional[list[StrictStr]] = Field(default=None, description="Preferred order of slot questions.")
 
     def json_schema(self) -> dict[str, Any]:
         schema = self.args_model.model_json_schema()
@@ -436,7 +471,7 @@ class ToolSpec(BaseModel):
         Produce OpenAI-style tool spec:
           {"type":"function","function":{"name", "description", "parameters", "x-slots"?, "x-ask-order"?}}
         """
-        fn = {
+        fn: dict[str, Any] = {
             "type": "function",
             "function": {
                 "name": self.name,
@@ -456,13 +491,13 @@ class ToolSpec(BaseModel):
 
 class ToolRegistry:
     """In-memory registry for all tools across tabs (SSOT)."""
-    _tools: ClassVar[List[ToolSpec]] = []
+    _tools: ClassVar[list[ToolSpec]] = []
 
     # --------------------------- Construction -------------------------------
 
     @classmethod
-    def _build_default(cls) -> List[ToolSpec]:
-        tools: List[ToolSpec] = []
+    def _build_default(cls) -> list[ToolSpec]:
+        tools: list[ToolSpec] = []
 
         # ===== Assets =====
         tools.append(ToolSpec(
@@ -472,7 +507,6 @@ class ToolRegistry:
             tab="assets",
             endpoint="/graph/assets",
             op="asset.list",
-            # Listing needs no slots.
         ))
         tools.append(ToolSpec(
             name="asset.list_types",
@@ -590,6 +624,20 @@ class ToolRegistry:
             },
             ask_order=["assetId", "assetName"],
         ))
+        # Alias that maps to the same op as 'impact.levels.for_asset'
+        tools.append(ToolSpec(
+            name="impact.asset_get",
+            description="Alias of 'impact.levels.for_asset'; shows current impact levels for a specific asset.",
+            args_model=ImpactLevelsForAssetArgs,
+            tab="impacts",
+            endpoint="/graph/impacts",
+            op="impact.levels.for_asset",
+            slots={
+                "assetId":   SlotDef(required=True,  autofill=False, label="Asset ID",   hint="UUID v7 or provide name"),
+                "assetName": SlotDef(required=False, autofill=False, label="Asset name", hint="Exact name if ID unknown"),
+            },
+            ask_order=["assetId", "assetName"],
+        ))
         tools.append(ToolSpec(
             name="impact.set_level",
             description="Set a single impact level (0..4) for an asset (by impactName).",
@@ -642,6 +690,19 @@ class ToolRegistry:
             op="threat.list",
         ))
         tools.append(ToolSpec(
+            name="threat.asset_get",
+            description="Show current threats (and probabilities/presence) for a specific asset.",
+            args_model=AssetSelector,
+            tab="threats",
+            endpoint="/graph/threats",
+            op="threat.asset_get",
+            slots={
+                "assetId":   SlotDef(required=True,  autofill=False, label="Asset ID",   hint="UUID v7 or provide name"),
+                "assetName": SlotDef(required=False, autofill=False, label="Asset name", hint="Exact name if ID unknown"),
+            },
+            ask_order=["assetId", "assetName"],
+        ))
+        tools.append(ToolSpec(
             name="threat.set_probability",
             description="Set threat probability (0..4) for an asset's threat (by threatName).",
             args_model=ThreatSetProbabilityArgs,
@@ -669,6 +730,22 @@ class ToolRegistry:
                 "items":     SlotDef(required=True,  autofill=False, label="Threat items", hint="List of {threatName, probability}"),
             },
             ask_order=["assetId", "assetName", "items"],
+        ))
+        tools.append(ToolSpec(
+            name="threat.upsert",
+            description="Ensure presence (present=true) or remove presence (present=false) of a threat on an asset.",
+            args_model=ThreatUpsertArgs,
+            tab="threats",
+            endpoint="/graph/threats",
+            op="threat.upsert",
+            slots={
+                "assetId":    SlotDef(required=False, autofill=False, label="Asset ID",    hint="UUID v7"),
+                "assetName":  SlotDef(required=False, autofill=False, label="Asset name",  hint="Exact name if ID unknown"),
+                "threatName": SlotDef(required=True,  autofill=False, label="Threat name", hint="Exact catalog name (e.g., Phishing)"),
+                "present":    SlotDef(required=True,  autofill=True,  label="Present",     hint="true to add, false to remove"),
+                "note":       SlotDef(required=False, autofill=True,  label="Note",        hint="Short reasoning for audit"),
+            },
+            ask_order=["assetId", "assetName", "threatName", "present", "note"],
         ))
         tools.append(ToolSpec(
             name="threat.explain",
@@ -715,12 +792,12 @@ class ToolRegistry:
             cls._tools = cls._build_default()
 
     @classmethod
-    def all(cls) -> List[ToolSpec]:
+    def all(cls) -> list[ToolSpec]:
         cls.ensure_initialized()
         return list(cls._tools)
 
     @classmethod
-    def by_tab(cls, tab: Literal["assets", "impacts", "threats", "controls"]) -> List[ToolSpec]:
+    def by_tab(cls, tab: Literal["assets", "impacts", "threats", "controls"]) -> list[ToolSpec]:
         cls.ensure_initialized()
         return [t for t in cls._tools if t.tab == tab]
 

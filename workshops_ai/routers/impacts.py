@@ -1,28 +1,20 @@
 # File: workshops_ai/routers/impacts.py
 # -----------------------------------------------------------------------------
 # Impacts Router (SSOT-aligned)
-# - Public read-only:
-#     GET  /api/impacts/defs         → catalog (tenant-aware if backend needs it)
-# - LLM tool-first (single dispatcher):
-#     POST /graph/impacts
-#       body: {"op": "<impact.*>", "args": {...}}
-#         impact.list              → {items,total}
-#         impact.levels.for_asset  → {asset_id, items:[{impactName, impactLevel}]}
-#         impact.set_level         → {results:[{asset_id, impactName, level, previous}]}
-#         impact.bulk_set          → {results:[...]} (same item shape as set_level)
-#         impact.explain           → 501 (not implemented yet)
 #
-# Notes
-# - All tool payloads validated via ToolRegistry (single source of truth).
-# - No LLM is instantiated here; this is a pure HTTP adapter to backend state.
-# - CSV backend semantics: impact levels are stored on per-asset rows, 0..4 scale.
+# What changed in this version
+# - ✅ Still validates tool payloads strictly against the central ToolRegistry.
+# - ✅ READ endpoints remain local (catalog + levels.for_asset).
+# - 🔁 WRITE paths (impact.set_level, impact.bulk_set) no longer handcraft
+#   confirmations / submit flows. Instead, they delegate to thin graph runners
+#   (run_set_level / run_bulk_set) that go through the Impact LangGraph and
+#   produce Asset-like confirmations (short LLM confirm + {"kind":"changeset"}
+#   + {"kind":"submit_result"}). This unifies UX/telemetry with the Asset graph.
+# - ℹ️  impact.explain already uses a graph runner — kept as-is.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
-# ---------------------------
-# Unified like assets; ChangeSet + outbox; RAG→LLM explain
-# ---------------------------
 import asyncio
 import inspect
 import logging
@@ -31,7 +23,6 @@ from typing import Any, Dict, List, Optional, Literal, cast
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status, Body
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
-from workshops_ai.graph.impact_graph import run_explain
 
 from workshops_ai.app.security import require_auth
 from workshops_ai.tools.telemetry import telemetry_log
@@ -41,9 +32,8 @@ from workshops_ai.backend.port import BackendPort
 from workshops_ai.backend.csv_backend import CsvBackend
 from workshops_ai.graph.factory import GraphDeps
 from workshops_ai.graph.factory import get_graph_deps  # same helper used by assets/threats
-from workshops_ai.graph.impact_graph import run_explain_impacts  # RAG→LLM fallback
 
-# UI contract (same as assets/threats)
+# UI contract
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 
 # SSOT: central registry + strict args
@@ -56,6 +46,13 @@ from workshops_ai.agents.tools.registry import (
     ImpactExplainArgs,
 )
 
+# Thin graph runners (Impact graph) — single source of submit/confirm behavior
+from workshops_ai.graph.impact_graph import (
+    run_explain_impacts,
+    run_set_level,
+    run_bulk_set,
+)
+
 logger = logging.getLogger(__name__)
 
 # Public read-only catalog router
@@ -64,9 +61,9 @@ router = APIRouter(prefix="/api/impacts", tags=["impacts"])
 graph_router = APIRouter(prefix="/graph/impacts", tags=["graph:impacts"])
 
 
-# ---------------------------
-# Helpers (kept from old; reused)
-# ---------------------------
+# -----------------------------------------------------------------------------
+# Helpers (kept; reused)
+# -----------------------------------------------------------------------------
 def _clamp_0_4(v: int) -> int:
     return max(0, min(4, v))
 
@@ -129,9 +126,9 @@ def _current_level_from_rows(rows: List[Dict[str, Any]], impact_name: str) -> Op
     return None
 
 
-# ---------------------------
+# -----------------------------------------------------------------------------
 # Public read-only route (catalog)
-# ---------------------------
+# -----------------------------------------------------------------------------
 class ImpactLite(BaseModel):
     name: str
     description: Optional[str] = None
@@ -186,9 +183,9 @@ async def list_impact_defs(
     return ImpactDefsListResponse(items=sliced, total=len(items))
 
 
-# ---------------------------
+# -----------------------------------------------------------------------------
 # Tool-first DTOs (for responses)
-# ---------------------------
+# -----------------------------------------------------------------------------
 class ToolImpactLevelItem(BaseModel):
     impactName: str
     impactLevel: int = Field(..., ge=0, le=4)
@@ -222,13 +219,13 @@ class GraphToolCall(BaseModel):
     ui: dict = Field(default_factory=dict)  # passthrough org_id/user_id/session if provided
 
 
-# ---------------------------
+# -----------------------------------------------------------------------------
 # Unified tool-first dispatcher (SSOT; mirrors assets/threats)
-# ---------------------------
+# -----------------------------------------------------------------------------
 @graph_router.post(
     "",
     response_class=JSONResponse,
-    summary="[tool] Unified impacts tools (SSOT): list/levels.for_asset/set_level/bulk_set/explain (RAG→LLM)",
+    summary="[tool] Unified impacts tools (SSOT): list/levels.for_asset/set_level/bulk_set/explain",
 )
 async def graph_impacts_entrypoint(
     call: GraphToolCall = Body(...),
@@ -244,9 +241,8 @@ async def graph_impacts_entrypoint(
     except Exception:
         pass
 
-    # Strict SSOT validation
+    # Strict SSOT validation (single source of truth)
     try:
-        # If your registry wants tab scoping, use: ToolRegistry.validate_call(tab="impacts", op=op, args=args)
         validated = ToolRegistry.validate_call(op, args)
     except ValidationError as ve:
         return UIResponse.error(tab="impacts", op=op, error=f"Invalid payload for {op}", details=ve.errors())
@@ -254,6 +250,7 @@ async def graph_impacts_entrypoint(
     backend: BackendPort = deps.backend
     org_id: str = ui.get("org_id") or "demo-org"
     user_id: str = ui.get("user_id") or "demo-user"
+    locale: Optional[str] = ui.get("locale")
 
     # ---------------------------
     # READ-ONLY: impact.list
@@ -306,7 +303,7 @@ async def graph_impacts_entrypoint(
         return UIResponse.ok(tab="impacts", op=op, result={"asset_id": str(asset_id), "items": items})
 
     # ---------------------------
-    # WRITE (ChangeSet→submit_or_outbox): impact.set_level
+    # WRITE (delegate to graph runner): impact.set_level
     # ---------------------------
     if op == "impact.set_level":
         v = cast(ImpactSetLevelArgs, validated)
@@ -314,33 +311,26 @@ async def graph_impacts_entrypoint(
             backend, org_id=org_id, asset_id=v.assetId, asset_name=v.assetName
         )
 
-        # Best-effort previous
-        try:
-            prev_rows = await _run_async(getattr(backend, "asset_get_impacts"), asset_id)  # type: ignore[misc]
-        except Exception:
-            prev_rows = []
-        previous = _current_level_from_rows(prev_rows, v.impactName)
-
-        # Build and submit ChangeSet (consistent with assets/threats)
-        changeset = deps.changes.build_set_impact_level(
+        # Build a UIRequest that tells the Impact graph to run the 'set' path directly.
+        ui_req = UIRequest(
+            tab="impacts",
             org_id=org_id,
             user_id=user_id,
-            asset_id=asset_id,
-            impact_code=v.impactName,  # registry keeps canonical name/code in impactName
-            level=_clamp_0_4(int(v.impactLevel)),
-            note=None,
+            locale=locale,
+            # Provide selection for consistency with UI + graph behavior
+            selection={"asset_id": asset_id},
+            # Direct intent + typed payload (graph bypasses planner and goes straight to node)
+            action="set",
+            set_payload={
+                "asset_id": asset_id,
+                "items": [{"impact_code": v.impactName, "level": _clamp_0_4(int(v.impactLevel))}],
+            },
         )
-        submit_res = await deps.submit_or_outbox(changeset)
-        return UIResponse.submitted(
-            tab="impacts",
-            op=op,
-            changeset=changeset,
-            submit=submit_res,
-            result={"results": [ImpactSetResultItem(asset_id=asset_id, impactName=v.impactName, level=_clamp_0_4(int(v.impactLevel)), previous=previous)]},
-        )
+        # Delegate to the graph runner (handles submit, outbox fallback, confirmation)
+        return await run_set_level(deps=deps, ui_req=ui_req)
 
     # ---------------------------
-    # WRITE (ChangeSet→submit_or_outbox): impact.bulk_set
+    # WRITE (delegate to graph runner): impact.bulk_set
     # ---------------------------
     if op == "impact.bulk_set":
         v = cast(ImpactBulkSetArgs, validated)
@@ -348,48 +338,42 @@ async def graph_impacts_entrypoint(
             backend, org_id=org_id, asset_id=v.assetId, asset_name=v.assetName
         )
 
-        # Best-effort previous
-        try:
-            prev_rows = await _run_async(getattr(backend, "asset_get_impacts"), asset_id)  # type: ignore[misc]
-        except Exception:
-            prev_rows = []
+        entries = [{
+            "asset_id": asset_id,
+            "items": [{"impact_code": it.impactName, "level": _clamp_0_4(int(it.impactLevel))} for it in v.items],
+        }]
 
-        entries = []
-        results: List[ImpactSetResultItem] = []
-        for it in v.items:
-            lvl = _clamp_0_4(int(it.impactLevel))
-            entries.append({"impact_code": it.impactName, "level": lvl, "note": None})
-            results.append(
-                ImpactSetResultItem(
-                    asset_id=asset_id,
-                    impactName=it.impactName,
-                    level=lvl,
-                    previous=_current_level_from_rows(prev_rows, it.impactName),
-                )
-            )
-
-        changeset = deps.changes.build_bulk_set_impact_levels(
-            org_id=org_id, user_id=user_id, asset_id=asset_id, entries=entries
-        )
-        submit_res = await deps.submit_or_outbox(changeset)
-        return UIResponse.submitted(
+        ui_req = UIRequest(
             tab="impacts",
-            op=op,
-            changeset=changeset,
-            submit=submit_res,
-            result={"results": results},
+            org_id=org_id,
+            user_id=user_id,
+            locale=locale,
+            selection={"asset_id": asset_id},
+            action="bulk_set",
+            bulk_payload={"entries": entries},
         )
+        return await run_bulk_set(deps=deps, ui_req=ui_req)
 
     # ---------------------------
-    # EXPLAIN (RAG→LLM fallback): impact.explain
+    # EXPLAIN (delegate to graph runner): impact.explain
     # ---------------------------
-async def run_explain_impacts(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
-    # Backed by manager so máme jednotné chování (RAG→LLM fallback už řeší explain path uvnitř).
-    from workshops_ai.graph.manager import route_chat
-    return await route_chat(ui_req)
+    if op == "impact.explain":
+        v = cast(ImpactExplainArgs, validated)
+        ui_req = UIRequest(
+            tab="impacts",
+            org_id=org_id,
+            user_id=user_id,
+            locale=locale,
+            action="explain",
+            message=v.impactName,  # the graph will use message/question as the query
+        )
+        return await run_explain_impacts(deps=deps, ui_req=ui_req)
+
+    # Unknown op (shouldn’t happen due to registry validation)
+    return UIResponse.error(tab="impacts", op=op, error=f"Unsupported op: {op}")
 
 
-# ---------------------------
+# -----------------------------------------------------------------------------
 # Exports
-# ---------------------------
+# -----------------------------------------------------------------------------
 __all__ = ["router", "graph_router"]

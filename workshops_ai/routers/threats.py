@@ -1,9 +1,24 @@
 # File: workshops_ai/routers/threats.py
+# -----------------------------------------------------------------------------
+# Threats Router (SSOT-aligned)
+#
+# What changed in this version
+# - ✅ Still validates tool payloads strictly against the central ToolRegistry.
+# - ✅ READ endpoints remain local (catalog + asset_get).
+# - 🔁 WRITE paths (threat.set_probability, threat.bulk_set, NEW: threat.upsert)
+#   no longer handcraft confirmations / submit flows. They now delegate to thin
+#   graph runners (run_set_probability / run_bulk_set / run_upsert) that execute
+#   through the Threat LangGraph and produce Asset-like confirmations:
+#   - short LLM confirm
+#   - {"kind":"changeset", ...}
+#   - {"kind":"submit_result", ...}
+# - ℹ️  threat.explain continues to use a graph runner.
+# -----------------------------------------------------------------------------
+
 from __future__ import annotations
 
-
 # ---------------------------
-# Unified like assets/impacts; ChangeSet + outbox; RAG→LLM explain)
+# Unified like assets/impacts; ChangeSet + outbox; RAG→LLM explain
 # ---------------------------
 import asyncio
 import inspect
@@ -13,7 +28,7 @@ from typing import Any, Dict, List, Optional, Literal, cast
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status, Body
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
-from workshops_ai.graph.threat_graph import run_explain
+
 from workshops_ai.app.security import require_auth
 from workshops_ai.tools.telemetry import telemetry_log
 
@@ -22,7 +37,6 @@ from workshops_ai.backend.port import BackendPort
 from workshops_ai.backend.csv_backend import CsvBackend
 from workshops_ai.graph.factory import GraphDeps, get_graph_deps
 
-
 # UI contract (same DTO used across routers)
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 
@@ -30,9 +44,19 @@ from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 from workshops_ai.agents.tools.registry import (
     ToolRegistry,
     ThreatListArgs,
+    ThreatAssetGetArgs,         # ⬅ NEW: validate asset_get payload
     ThreatSetProbabilityArgs,
     ThreatBulkSetArgs,
     ThreatExplainArgs,
+    ThreatUpsertArgs,           # presence toggle on asset
+)
+
+# Thin graph runners (Threat graph) — single source of submit/confirm behavior
+from workshops_ai.graph.threat_graph import (
+    run_explain,             # UIRequest -> UIResponse
+    run_set_probability,     # UIRequest -> UIResponse
+    run_bulk_set,            # UIRequest -> UIResponse
+    run_upsert,              # UIRequest -> UIResponse
 )
 
 logger = logging.getLogger(__name__)
@@ -191,8 +215,10 @@ class ThreatSetResult(BaseModel):
 class GraphToolCall(BaseModel):
     op: Literal[
         "threat.list",
+        "threat.asset_get",          # ⬅ NEW: read risks for an asset
         "threat.set_probability",
         "threat.bulk_set",
+        "threat.upsert",
         "threat.explain",
     ]
     args: dict = Field(default_factory=dict)
@@ -205,7 +231,7 @@ class GraphToolCall(BaseModel):
 @graph_router.post(
     "",
     response_class=JSONResponse,
-    summary="[tool] Unified threats tools (SSOT): list/set_probability/bulk_set/explain (RAG→LLM)",
+    summary="[tool] Unified threats tools (SSOT): list/asset_get/set_probability/bulk_set/upsert/explain",
 )
 async def graph_threats_entrypoint(
     call: GraphToolCall = Body(...),
@@ -228,9 +254,10 @@ async def graph_threats_entrypoint(
     except ValidationError as ve:
         return UIResponse.error(tab="threats", op=op, error=f"Invalid payload for {op}", details=ve.errors())
 
-    backend: BackendPort = deps.backend
+    backend: BackendPort = deps.backend  # type: ignore[attr-defined]
     org_id: str = ui.get("org_id") or "demo-org"
     user_id: str = ui.get("user_id") or "demo-user"
+    locale: Optional[str] = ui.get("locale")
 
     # ---------------------------
     # READ-ONLY: threat.list
@@ -260,44 +287,57 @@ async def graph_threats_entrypoint(
         return UIResponse.ok(tab="threats", op=op, result={"items": items, "total": len(items)})
 
     # ---------------------------
-    # WRITE (ChangeSet→submit_or_outbox): threat.set_probability
+    # READ: threat.asset_get (risks for an asset)
+    # ---------------------------
+    if op == "threat.asset_get":
+        v = cast(ThreatAssetGetArgs, validated)
+        asset_id = await _resolve_asset_id(
+            backend, org_id=org_id, asset_id=v.assetId, asset_name=v.assetName
+        )
+        try:
+            getter = getattr(backend, "threats_for_asset", None) or getattr(backend, "asset_get_risks", None)
+            rows = await _run_async(getter, asset_id) if getter else []  # type: ignore[misc]
+        except AttributeError:
+            return UIResponse.error(tab="threats", op=op, error="Backend does not support threats_for_asset()")
+        except Exception as ex:
+            return UIResponse.error(tab="threats", op=op, error=f"Failed to fetch threats for asset: {ex!s}")
+
+        items: List[dict] = []
+        for r in rows or []:
+            name = str(r.get("threat_code") or r.get("code") or r.get("name") or "")
+            lv = r.get("probability") if r.get("probability") is not None else r.get("level")
+            if isinstance(lv, int):
+                items.append({"threatName": name, "probability": _clamp_0_4(lv)})
+            elif isinstance(lv, str) and lv.strip().isdigit():
+                items.append({"threatName": name, "probability": _clamp_0_4(int(lv.strip()))})
+        return UIResponse.ok(tab="threats", op=op, result={"asset_id": str(asset_id), "items": items})
+
+    # ---------------------------
+    # WRITE (delegate to graph runner): threat.set_probability
     # ---------------------------
     if op == "threat.set_probability":
         v = cast(ThreatSetProbabilityArgs, validated)
         asset_id = await _resolve_asset_id(
             backend, org_id=org_id, asset_id=v.assetId, asset_name=v.assetName
         )
-
-        # Best-effort previous read
-        try:
-            prev_rows = await _run_async(getattr(backend, "threats_for_asset"), asset_id)  # type: ignore[misc]
-        except Exception:
-            prev_rows = []
-
-        previous = _current_probability_from_rows(prev_rows, v.threatName)
         lvl = _clamp_0_4(int(v.probability))
 
-        # Build and submit ChangeSet (aligned with impacts/assets pattern)
-        changeset = deps.changes.build_set_threat_probability(
+        ui_req = UIRequest(
+            tab="threats",
             org_id=org_id,
             user_id=user_id,
-            asset_id=asset_id,
-            threat_code=v.threatName,  # registry keeps canonical code/name in threatName
-            probability=lvl,
-            note=None,
+            locale=locale,
+            selection={"asset_id": asset_id},
+            action="set",
+            set_payload={
+                "asset_id": asset_id,
+                "items": [{"threat_code": v.threatName, "probability": lvl}],
+            },
         )
-        submit_res = await deps.submit_or_outbox(changeset)
-
-        return UIResponse.submitted(
-            tab="threats",
-            op=op,
-            changeset=changeset,
-            submit=submit_res,
-            result={"results": [ThreatSetResultItem(asset_id=asset_id, threatName=v.threatName, level=lvl, previous=previous)]},
-        )
+        return await run_set_probability(deps=deps, ui_req=ui_req)
 
     # ---------------------------
-    # WRITE (ChangeSet→submit_or_outbox): threat.bulk_set
+    # WRITE (delegate to graph runner): threat.bulk_set
     # ---------------------------
     if op == "threat.bulk_set":
         v = cast(ThreatBulkSetArgs, validated)
@@ -305,47 +345,63 @@ async def graph_threats_entrypoint(
             backend, org_id=org_id, asset_id=v.assetId, asset_name=v.assetName
         )
 
-        # Best-effort previous
-        try:
-            prev_rows = await _run_async(getattr(backend, "threats_for_asset"), asset_id)  # type: ignore[misc]
-        except Exception:
-            prev_rows = []
+        entries = [{
+            "asset_id": asset_id,
+            "items": [{"threat_code": it.threatName, "probability": _clamp_0_4(int(it.probability))} for it in v.items],
+        }]
 
-        entries = []
-        results: List[ThreatSetResultItem] = []
-        for it in v.items:
-            lvl = _clamp_0_4(int(it.probability))
-            entries.append({"threat_code": it.threatName, "probability": lvl, "note": None})
-            results.append(
-                ThreatSetResultItem(
-                    asset_id=asset_id,
-                    threatName=it.threatName,
-                    level=lvl,
-                    previous=_current_probability_from_rows(prev_rows, it.threatName),
-                )
-            )
-
-        changeset = deps.changes.build_bulk_set_threat_probabilities(
-            org_id=org_id, user_id=user_id, asset_id=asset_id, entries=entries
-        )
-        submit_res = await deps.submit_or_outbox(changeset)
-
-        return UIResponse.submitted(
+        ui_req = UIRequest(
             tab="threats",
-            op=op,
-            changeset=changeset,
-            submit=submit_res,
-            result={"results": results},
+            org_id=org_id,
+            user_id=user_id,
+            locale=locale,
+            selection={"asset_id": asset_id},
+            action="bulk_set",
+            bulk_payload={"entries": entries},
         )
+        return await run_bulk_set(deps=deps, ui_req=ui_req)
 
     # ---------------------------
-    # EXPLAIN (RAG→LLM fallback): threat.explain
+    # WRITE (delegate to graph runner): threat.upsert
     # ---------------------------
-async def run_explain_threats(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
-    # Backed by manager so máme jednotné chování (RAG→LLM fallback už řeší explain path uvnitř).
-    from workshops_ai.graph.manager import route_chat
-    return await route_chat(ui_req)
+    if op == "threat.upsert":
+        v = cast(ThreatUpsertArgs, validated)
+        asset_id = await _resolve_asset_id(
+            backend, org_id=org_id, asset_id=v.assetId, asset_name=v.assetName
+        )
+        ui_req = UIRequest(
+            tab="threats",
+            org_id=org_id,
+            user_id=user_id,
+            locale=locale,
+            selection={"asset_id": asset_id},
+            action="upsert",
+            upsert_payload={
+                "asset_id": asset_id,
+                "items": [
+                    {"threatName": v.threatName, "present": bool(v.present), "note": v.note or None}
+                ],
+            },
+        )
+        return await run_upsert(deps=deps, ui_req=ui_req)
 
+    # ---------------------------
+    # EXPLAIN (delegate to graph runner): threat.explain
+    # ---------------------------
+    if op == "threat.explain":
+        v = cast(ThreatExplainArgs, validated)
+        ui_req = UIRequest(
+            tab="threats",
+            org_id=org_id,
+            user_id=user_id,
+            locale=locale,
+            action="explain",
+            message=v.threatName,  # graph uses message/question as the query
+        )
+        return await run_explain(deps=deps, ui_req=ui_req)
+
+    # Unknown op (shouldn’t happen due to registry validation)
+    return UIResponse.error(tab="threats", op=op, error=f"Unsupported op: {op}")
 
 
 # ---------------------------

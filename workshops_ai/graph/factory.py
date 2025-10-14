@@ -2,7 +2,8 @@
 # Purpose: Central LangGraph factory + lightweight DI for all tabs (assets | impacts | threats).
 # - Single source of truth for building GraphDeps (used by manager + routers)
 # - Injects a centralized llm_client (forced to LangChain ChatOpenAI) and explicit llm_temperature
-# - Preserves checkpointer, Redis-backed ephemeral memory, and submit (online or OUTBOX)
+# - Preserves checkpointer, Redis-backed ephemeral memory
+# - Exposes a unified submit_changeset wrapper (online submit → OUTBOX fallback) used by all graphs
 # - Exposes helpers to build per-turn LangGraph config (thread_id/checkpoint_ns)
 # - Ensures RAG retriever is wired consistently via the retriever factory
 
@@ -11,7 +12,7 @@ from __future__ import annotations
 import logging
 import asyncio
 import atexit
-from dataclasses import dataclass, is_dataclass, asdict
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, Optional, Protocol, Final
 
@@ -31,15 +32,13 @@ from workshops_ai.settings import get_settings, AppSettings
 from workshops_ai.graph.checkpointer import make_checkpointer as _central_make_checkpointer
 
 # Central LLM client + RAG retriever
-# NOTE: Keep this import to avoid breaking older code-paths that side-effect at import time.
 from workshops_ai.llm.client import make_llm_client_from_settings  # noqa: F401
-
 from workshops_ai.rag.retriever import make_retriever as _rag_make_retriever
 
 # Enforce LangChain OpenAI chat model
 from langchain_openai import ChatOpenAI  # type: ignore
 
-# Submitter/outbox (online submit preferred, fallback to OUTBOX)
+# Unified submit wrapper (online → OUTBOX fallback)
 from workshops_ai.app.services.outbox_writer import (
     submit_or_fallback,
     SubmitOrFallbackResult,
@@ -113,7 +112,6 @@ def _get_checkpointer_cached(
       - make_checkpointer(settings=AppSettings)
       - make_checkpointer(kind=..., redis_url=..., sqlite_path=..., namespace=..., ttl_sec=...)
     """
-    # Try param-based constructor first; if unavailable, fall back to settings-based.
     try:
         return _central_make_checkpointer(
             kind=kind,
@@ -136,19 +134,19 @@ def _get_checkpointer_cached(
 
 class MemoryGet(Protocol):
     async def __call__(self, key: str) -> Optional[str]: ...
-    # Runtime adapter also accepts keyword-only args:
+    # Rich form supported via kwargs:
     #   memory_get(org_id=..., user_id=..., thread_id=..., namespace=..., key=...)
 
 
 class MemorySet(Protocol):
     async def __call__(self, key: str, value: str, *, ttl_sec: Optional[int] = None) -> None: ...
-    # Runtime adapter also accepts keyword-only args:
+    # Rich form supported via kwargs:
     #   memory_set(org_id=..., user_id=..., thread_id=..., namespace=..., key=..., value=..., ttl_sec=...)
 
 
 class MemoryDelete(Protocol):
     async def __call__(self, key: str) -> None: ...
-    # Runtime adapter also accepts keyword-only args:
+    # Rich form supported via kwargs:
     #   memory_delete(org_id=..., user_id=..., thread_id=..., namespace=..., key=...)
 
 
@@ -176,6 +174,9 @@ class GraphDeps:
       forced to LangChain ChatOpenAI by the factory.
     - `llm_temperature` is provided separately to avoid coupling to any client type.
     - `llm` is kept for backward compatibility with older agent nodes (avoid in new code).
+
+    IMPORTANT: Use `submit_changeset` for ALL mutations across tabs.
+               It is the unified wrapper that performs online submit and falls back to OUTBOX.
     """
     backend_port: Any
     ws_hub: Any
@@ -192,12 +193,12 @@ class GraphDeps:
     # Ephemeral memory helpers (Redis if configured, no-ops otherwise)
     memory_get: MemoryGet | None = None
     memory_set: MemorySet | None = None
-    memory_delete: MemoryDelete | None = None  # allows graphs to clear per-turn drafts/state
+    memory_delete: MemoryDelete | None = None
 
-    # Mutations: submit changeset (online preferred, fallback to OUTBOX)
+    # Mutations: unified submit wrapper (online preferred, fallback to OUTBOX)
     submit_changeset: SubmitChangeSet | None = None
 
-    # Back-compat alias expected by some routers/tools
+    # Back-compat alias (legacy routers/tools). Prefer submit_changeset everywhere.
     submit_or_outbox: SubmitChangeSet | None = None
 
     # Expose checkpoint namespace so routers/tests can pass it to LangGraph
@@ -371,7 +372,6 @@ def make_redis_memory(settings: AppSettings):
     async def memory_get(*args, **kwargs) -> Optional[str]:
         fields = _coerce_mem_args(*args, **kwargs)
         if fields["mode"] == "simple":
-            # The simple form already passes a fully-composed key (e.g., from RollingWindowMemory)
             return await client.get(fields["key"])
         k = _compose_key(
             org_id=fields["org_id"],
@@ -428,7 +428,6 @@ def make_redis_memory(settings: AppSettings):
             else:
                 loop.run_until_complete(client.close())
         except Exception:
-            # Swallow any shutdown errors
             pass
 
     atexit.register(_finalizer)
@@ -445,8 +444,7 @@ def _make_submit_callable(settings: AppSettings) -> SubmitChangeSet:
     (if an API client is available), otherwise falls back to writing
     into the OUTBOX directory via submit_or_fallback().
 
-    The fallback outbox_dir is taken from settings.tazila.outbox_path
-    so all tabs (ASSETS/IMPACTS/THREATS) store uniformly.
+    This is the canonical submit used by ALL graphs via deps.submit_changeset.
     """
     submitter: Any = None
     try:
@@ -499,14 +497,12 @@ def make_default_deps(
     CHANGE:
     - We *always* construct a LangChain `ChatOpenAI` from settings and inject it as `llm_client`.
       Any ad-hoc/legacy client is ignored to keep graphs clean and consistent.
+    - We expose `submit_changeset` as the unified submit wrapper. Prefer it everywhere.
     """
     # Settings first (manager may pass settings; routers often pass app.state.settings)
     s = settings or get_settings()
 
     # --- Checkpointer (CACHED) ---
-    # OLD:
-    # saver = _central_make_checkpointer(settings=s)
-    # NEW: derive an immutable fingerprint from settings and use the cached builder
     kind = getattr(getattr(s, "checkpointer", object()), "kind", None) or getattr(s, "checkpointer_kind", None)
     redis_url = getattr(getattr(s, "redis", object()), "url", None)
     sqlite_path = getattr(getattr(getattr(s, "sqlite", object()), "ckpt_path", object()), "__str__", lambda: None)()
@@ -548,20 +544,19 @@ def make_default_deps(
         memory_set = memory_set or mset
         memory_delete = mdel
     else:
-        # Manager may inject its own memory; keep delete unset unless provided elsewhere.
         memory_delete = None
 
-    # Submit callable (online preferred, fallback to OUTBOX)
+    # Submit callable (online preferred, fallback to OUTBOX) — CANONICAL
     if submit_changeset is None:
         submit_changeset = _make_submit_callable(s)
 
-    # Back-compat alias for routers/tools still calling deps.submit_or_outbox(...)
+    # Back-compat alias for legacy callers still using deps.submit_or_outbox(...).
+    # Internally this just delegates to submit_changeset to keep lifecycle unified.
     async def _submit_or_outbox(
         changeset: ChangeSet,
         *,
         require_success: bool = False
     ) -> SubmitOrFallbackResult:
-        # Delegate to the unified submitter; same return type everywhere.
         return await submit_changeset(changeset, require_success=require_success)
 
     # --- LLM client (CACHED, forced to ChatOpenAI) ---
@@ -577,9 +572,6 @@ def make_default_deps(
     if not model or not api_key:
         raise RuntimeError("ChatOpenAI cannot be constructed: missing llm.model or API key in settings.")
 
-    # OLD (uncached):
-    # llm_client = ChatOpenAI(model=model, api_key=api_key, temperature=llm_temperature, timeout=http_timeout, max_retries=max_retries, base_url=base_url)
-    # NEW (cached):
     llm_client = _get_llm_client_cached(
         model=model,
         api_key=api_key,
@@ -589,7 +581,6 @@ def make_default_deps(
         base_url=base_url,
     )
 
-    # One-time wiring log for the LLM client (best-effort)
     try:
         logger.info(
             "LLM client wired (LangChain ChatOpenAI): model=%s, base_url=%s, temperature=%s",
@@ -615,13 +606,12 @@ def make_default_deps(
         llm_temperature=llm_temperature,
         llm=llm,                           # legacy passthrough (avoid using in new code)
         # --- Memory + submit ---
-        memory_get=memory_get,             # rich-kwargs + simple positional adapter (or no-op)
-        memory_set=memory_set,             # rich-kwargs + simple positional adapter (or no-op)
+        memory_get=memory_get,
+        memory_set=memory_set,
         memory_delete=memory_delete,
-        submit_changeset=submit_changeset,
-        submit_or_outbox=_submit_or_outbox,  # <— compatibility alias
+        submit_changeset=submit_changeset,          # canonical submit for ALL graphs
+        submit_or_outbox=_submit_or_outbox,         # legacy alias, delegates to submit_changeset
         checkpoint_ns=ckpt_ns,
-        # Optional: manager/routers can set an EffectivePolicy later; default None keeps behavior unchanged
         effective_policy=None,
     )
 
@@ -754,7 +744,6 @@ __all__ = [
     "get_graph_deps",
     "make_langgraph_config",
     "build_checkpointer",
-    # Optionally export memory protocol for testing/injection
     "MemoryGet",
     "MemorySet",
     "MemoryDelete",

@@ -23,14 +23,16 @@ from pydantic import (
 # Optional op-name constants (handy for call-sites/tests; not used in Literals)
 # =============================================================================
 
-OP_CREATE_ASSET    = "create_asset"
-OP_SET_ASSET_META  = "set_asset_meta"
-OP_SET_IMPACTS     = "set_impacts"
-OP_SET_RISKS       = "set_risks"
-OP_UPSERT_CONTROLS = "upsert_controls"
-OP_REMOVE_CONTROLS = "remove_controls"
-OP_UPSERT_THREATS  = "upsert_threats"
-OP_UPSERT_IMPACTS  = "upsert_impacts"
+OP_CREATE_ASSET                     = "create_asset"
+OP_SET_ASSET_META                   = "set_asset_meta"
+OP_SET_IMPACTS                      = "set_impacts"
+OP_SET_RISKS                        = "set_risks"
+OP_UPSERT_CONTROLS                  = "upsert_controls"
+OP_REMOVE_CONTROLS                  = "remove_controls"
+OP_UPSERT_THREATS                   = "upsert_threats"
+OP_UPSERT_IMPACTS                   = "upsert_impacts"
+# NEW: Asset-scoped presence of a threat (toggle add/remove on a specific asset)
+OP_ASSET_UPSERT_THREAT_PRESENCE     = "asset_upsert_threat_presence"
 
 # =============================================================================
 # Audit envelope (strict, snake_case on the wire)
@@ -332,6 +334,44 @@ class ActionUpsertImpacts(BaseModel):
     items: list[ImpactUpsert]
 
 
+class ActionAssetUpsertThreatPresence(BaseModel):
+    """
+    Ensure presence/absence of a given threat on a specific asset.
+    - present=True  → add/ensure presence
+    - present=False → remove presence (some backends may queue this to OUTBOX)
+    """
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    op: Literal["asset_upsert_threat_presence"] = OP_ASSET_UPSERT_THREAT_PRESENCE
+    asset_id: Optional[StrictStr] = None
+    asset_ref: Optional[StrictStr] = None
+    threat_code: StrictStr
+    present: bool = True
+    note: Optional[str] = None
+
+    @field_validator("threat_code")
+    @classmethod
+    def _trim_code(cls, v: str) -> str:
+        v2 = v.strip()
+        if not v2:
+            raise ValueError("threat_code must be a non-empty string")
+        return v2
+
+    @field_validator("note")
+    @classmethod
+    def _trim_note(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v2 = v.strip()
+        return v2 or None
+
+    @model_validator(mode="after")
+    def _require_asset_selector(self) -> "ActionAssetUpsertThreatPresence":
+        if not (self.asset_id or self.asset_ref):
+            raise ValueError("One of 'asset_id' or 'asset_ref' must be provided.")
+        return self
+
+
 Action = Annotated[
     Union[
         ActionCreateAsset,
@@ -342,6 +382,7 @@ Action = Annotated[
         ActionRemoveControls,
         ActionUpsertThreats,
         ActionUpsertImpacts,
+        ActionAssetUpsertThreatPresence,  # NEW
     ],
     Field(discriminator="op"),
 ]
@@ -475,6 +516,40 @@ def build_changeset(
         audit=audit,
     )
 
+# ---- Convenience builder for asset-scoped threat presence -------------------
+
+def build_upsert_threat_presence(
+    org_id: str,
+    user_id: str,
+    asset_id: str,
+    threat_code: str,
+    present: bool,
+    note: Optional[str] = None,
+) -> ChangeSet:
+    """
+    Build a ChangeSet that toggles presence of a specific threat on an asset.
+
+    Intent:
+      - present=True  → ensure the threat is linked to the asset
+      - present=False → remove the threat link (CSV backend lacks hard delete,
+                        so submit may fall back to OUTBOX — this is OK)
+
+    Returns:
+      ChangeSet with a single ActionAssetUpsertThreatPresence.
+    """
+    action = ActionAssetUpsertThreatPresence(
+        asset_id=asset_id,
+        threat_code=threat_code,
+        present=bool(present),
+        note=(note.strip() or None) if isinstance(note, str) else None,
+    )
+    return build_changeset(
+        org_id=org_id,
+        user_id=user_id,
+        actions=[action],
+        intent="apply",
+    )
+
 __all__ = [
     # constants
     "OP_CREATE_ASSET",
@@ -485,6 +560,7 @@ __all__ = [
     "OP_REMOVE_CONTROLS",
     "OP_UPSERT_THREATS",
     "OP_UPSERT_IMPACTS",
+    "OP_ASSET_UPSERT_THREAT_PRESENCE",
     # models
     "Audit",
     "ImpactItem",
@@ -500,9 +576,11 @@ __all__ = [
     "ActionCreateAsset",
     "ActionUpsertThreats",
     "ActionUpsertImpacts",
+    "ActionAssetUpsertThreatPresence",
     "Action",
     "ChangeSet",
     # helpers
     "actions_digest_for_logging",
     "build_changeset",
+    "build_upsert_threat_presence",
 ]

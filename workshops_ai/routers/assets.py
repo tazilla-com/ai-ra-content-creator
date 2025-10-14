@@ -41,9 +41,10 @@ from workshops_ai.api.schema.asset import Asset
 from workshops_ai.agents.tools.registry import (
     ToolRegistry,
     AssetListArgs,
-    AssetCreateArgs,        # imported for Literal parity & potential future use
+    AssetCreateArgs,
     AssetUpdateMetaArgs,
     AssetExplainArgs,
+    AssetGetArgs,  # <-- needed for /graph/assets: asset.get
 )
 
 # UI contract (used when delegating to graph runners)
@@ -80,9 +81,21 @@ class AssetRiskItem(BaseModel):
 # -----------------------------------------------------------------------------
 
 class ToolAssetLite(BaseModel):
+    """Minimal shape the agent needs when listing or selecting assets."""
     asset_id: str
     name: str
     type: Optional[str] = None
+
+
+class ToolAssetType(BaseModel):
+    """Simple code+name pair for asset types (catalog)."""
+    code: str
+    name: str
+
+
+class ToolListAssetTypesResponse(BaseModel):
+    items: list[ToolAssetType]
+    total: int
 
 
 class ToolListAssetsResponse(BaseModel):
@@ -97,7 +110,15 @@ class ToolAssetUpdateResponse(BaseModel):
 
 # Unified tool call request/response wrapper for /graph/assets
 class GraphToolCall(BaseModel):
-    op: Literal["asset.list", "asset.create", "asset.update_meta", "asset.explain"]
+    # Extended to include the two missing ops: asset.list_types, asset.get
+    op: Literal[
+        "asset.list",
+        "asset.list_types",
+        "asset.get",
+        "asset.create",
+        "asset.update_meta",
+        "asset.explain",
+    ]
     args: dict = Field(default_factory=dict)
 
 # -----------------------------------------------------------------------------
@@ -419,7 +440,7 @@ async def get_asset_risks(
 @graph_router.post(
     "",
     response_class=JSONResponse,
-    summary="[tool] Unified assets tools (SSOT): list/create/update_meta/explain",
+    summary="[tool] Unified assets tools (SSOT): list/list_types/get/create/update_meta/explain",
 )
 async def graph_assets_entrypoint(
     request: Request,
@@ -432,10 +453,12 @@ async def graph_assets_entrypoint(
     """
     Single SSOT-aligned endpoint for all asset tools.
     Strictly validates arguments via ToolRegistry to ensure schema parity.
-      - asset.list        → handled here (backend list)
-      - asset.update_meta → delegated to graph runner (slot-driven + ChangeSet)
-      - asset.create      → delegated to graph runner (slot-driven + ChangeSet)
-      - asset.explain     → delegated to graph runner (RAG/LLM)
+      - asset.list         → handled here (backend list)
+      - asset.list_types   → handled here (catalog list from backend)
+      - asset.get          → handled here (fetch by id or name)
+      - asset.update_meta  → delegated to graph runner (slot-driven + ChangeSet)
+      - asset.create       → delegated to graph runner (slot-driven + ChangeSet)
+      - asset.explain      → delegated to graph runner (RAG/LLM)
     """
     op = call.op
     args = call.args or {}
@@ -458,11 +481,70 @@ async def graph_assets_entrypoint(
     headers = dict(request.headers)
     user_id = headers.get("x-user-id") or "demo-user"
 
-    # Dispatch per op
+    # --- asset.list (backend passthrough) ------------------------------------
     if op == "asset.list":
         v: AssetListArgs = cast(AssetListArgs, validated_model)
         return await _handle_asset_list(org_id=org_id, q=(v.query or None), backend=backend)
 
+    # --- asset.list_types (catalog) ------------------------------------------
+    if op == "asset.list_types":
+        # Returns list of catalog codes (EN) for asset types.
+        try:
+            types = await _run_async(backend.list_asset_types)
+        except Exception as ex:
+            raise HTTPException(
+                status_code=500,
+                detail={"message": "Failed to list asset types", "error": str(ex)},
+            ) from ex
+        items = [ToolAssetType(code=t, name=t) for t in (types or [])]
+        return ToolListAssetTypesResponse(items=items, total=len(items))
+
+    # --- asset.get (by id or name) -------------------------------------------
+    if op == "asset.get":
+        # Validate args against registry model; support id or name.
+        v: AssetGetArgs = cast(AssetGetArgs, validated_model)
+        asset_id: str | None = None
+
+        # Prefer explicit ID if provided
+        if getattr(v, "assetId", None):
+            asset_id = str(v.assetId).strip()
+
+        # Otherwise resolve by name via assets_list (first exact match, else first partial)
+        if not asset_id and getattr(v, "assetName", None):
+            name = str(v.assetName).strip()
+            try:
+                candidates = await _run_async(backend.assets_list, org_id, name, None, None)
+            except Exception as ex:
+                raise HTTPException(
+                    status_code=500,
+                    detail={"message": "Failed to search asset by name", "name": name, "error": str(ex)},
+                ) from ex
+            exact = next((a for a in candidates if str(getattr(a, "name", "")).strip().lower() == name.lower()), None)
+            chosen = exact or (candidates[0] if candidates else None)
+            if chosen:
+                # Accept id or asset_id attribute, whichever the backend exposes
+                asset_id = str(getattr(chosen, "id", "") or getattr(chosen, "asset_id", "")).strip()
+
+        if not asset_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"message": "Asset not found by id or name", "assetId": getattr(v, "assetId", None), "assetName": getattr(v, "assetName", None)},
+            )
+
+        try:
+            item = await _run_async(backend.asset_get, asset_id)
+        except Exception as ex:
+            raise HTTPException(
+                status_code=500,
+                detail={"message": "Failed to fetch asset", "assetId": asset_id, "error": str(ex)},
+            ) from ex
+
+        if not item:
+            raise HTTPException(status_code=404, detail={"message": "Asset not found", "assetId": asset_id})
+
+        return {"asset": _shape_tool_asset(item)}
+
+    # --- asset.update_meta (delegates to graph runner) -----------------------
     if op == "asset.update_meta":
         # Delegate to slot-driven graph runner (the graph will ask questions if needed)
         v: AssetUpdateMetaArgs = cast(AssetUpdateMetaArgs, validated_model)
@@ -479,6 +561,7 @@ async def graph_assets_entrypoint(
         )
         return JSONResponse(ui_resp.model_dump(mode="json"), status_code=200)
 
+    # --- asset.create (delegates to graph runner) ----------------------------
     if op == "asset.create":
         # Delegate to slot-driven graph runner (the graph will iterate questions and then apply)
         v: AssetCreateArgs = cast(AssetCreateArgs, validated_model)  # type: ignore[assignment]
@@ -495,6 +578,7 @@ async def graph_assets_entrypoint(
         )
         return JSONResponse(ui_resp.model_dump(mode="json"), status_code=200)
 
+    # --- asset.explain (delegates to graph runner) ---------------------------
     if op == "asset.explain":
         # Our asset graph exposes run_explain(deps, text, locale) returning a dict UI payload.
         # AssetExplainArgs = AssetSelector (assetId | assetName). Build a natural question.
@@ -504,6 +588,7 @@ async def graph_assets_entrypoint(
         # Prefer name when available; otherwise use the id
         question = f"Explain asset '{asset_name}'." if asset_name else f"Explain asset with id '{asset_id}'."
         # Locale: take Accept-Language best-effort; otherwise EN
+        headers = dict(request.headers)
         accept_lang = headers.get("accept-language") or "en"
         payload = await run_explain(deps=deps, text=question, locale=accept_lang)
         return JSONResponse(payload, status_code=200)

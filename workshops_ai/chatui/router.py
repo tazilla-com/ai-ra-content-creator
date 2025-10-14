@@ -76,7 +76,6 @@ async def demo_page() -> str:
         <option value="assets" selected>assets</option>
         <option value="impacts">impacts</option>
         <option value="threats">threats</option>
-        <option value="controls">controls</option>
       </select>
     </label>
     <label>API key <input id="apiKey" value="" size="16" placeholder="X-API-Key (optional)" /></label>
