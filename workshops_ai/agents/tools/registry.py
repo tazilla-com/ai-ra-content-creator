@@ -540,8 +540,8 @@ class ToolRegistry:
             endpoint="/graph/assets",
             op="asset.create",
             slots={
-                "name": SlotDef(required=True,  autofill=False, label="Asset name",  hint="e.g., CRM, Data Warehouse"),
-                "assetType": SlotDef(required=True, autofill=True,  label="Asset type",
+                "name": SlotDef(required=True, autofill=False, label="Asset name",  hint="e.g., CRM, Data Warehouse"),
+                "assetType": SlotDef(required=True, autofill=False,  label="Asset type",
                                      hint="Catalog value", enum=list(get_args(AssetType))),
                 "isPrimary": SlotDef(required=False, autofill=True, label="Primary asset", hint="true/false"),
                 "confidentiality": SlotDef(required=False, autofill=True, label="Confidentiality (policy)",
@@ -553,7 +553,7 @@ class ToolRegistry:
                                         hint="LOW/MEDIUM/HIGH", enum=list(get_args(TriadLevel))),
                 "description": SlotDef(required=False, autofill=True, label="Description", hint="Short purpose/notes"),
             },
-            ask_order=["name", "assetType", "isPrimary", "confidentiality", "integrity", "availability", "description"],
+            ask_order=["assetType", "name", "isPrimary", "confidentiality", "integrity", "availability", "description"],
         ))
         tools.append(ToolSpec(
             name="asset.update_meta",
@@ -591,7 +591,7 @@ class ToolRegistry:
             op="asset.set_meta",
             slots={
                 "assetId": SlotDef(required=True,  autofill=False, label="Asset ID", hint="UUID v7"),
-                "assetType": SlotDef(required=False, autofill=True, label="Asset type",
+                "assetType": SlotDef(required=True, autofill=False, label="Asset type",
                                      hint="Catalog value", enum=list(get_args(AssetType))),
                 "isPrimary": SlotDef(required=False, autofill=False, label="Primary asset", hint="true/false"),
                 "confidentiality": SlotDef(required=False, autofill=True, label="Confidentiality (0..4)", hint="Integer 0..4"),

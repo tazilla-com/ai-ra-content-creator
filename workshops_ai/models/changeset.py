@@ -31,8 +31,14 @@ OP_UPSERT_CONTROLS                  = "upsert_controls"
 OP_REMOVE_CONTROLS                  = "remove_controls"
 OP_UPSERT_THREATS                   = "upsert_threats"
 OP_UPSERT_IMPACTS                   = "upsert_impacts"
-# NEW: Asset-scoped presence of a threat (toggle add/remove on a specific asset)
 OP_ASSET_UPSERT_THREAT_PRESENCE     = "asset_upsert_threat_presence"
+
+# =============================================================================
+# CIA enums for normalization/validation in CreateAssetFields
+# =============================================================================
+
+CONF_LEVELS = {"PUBLIC", "INTERNAL", "PROTECTED", "STRICTLY_PROTECTED"}
+TRI_LEVELS = {"LOW", "MEDIUM", "HIGH"}
 
 # =============================================================================
 # Audit envelope (strict, snake_case on the wire)
@@ -291,6 +297,83 @@ class ActionSetAssetMeta(BaseModel):
             raise ValueError("One of 'asset_id' or 'asset_ref' must be provided.")
         return self
 
+# -----------------------------------------------------------------------------
+# Typed create payload with optional isPrimary and conditional CIA requirement
+# -----------------------------------------------------------------------------
+
+class CreateAssetFields(BaseModel):
+    """
+    Strict payload for the create_asset operation.
+
+    Policy:
+      - Required: name, assetType.
+      - Optional: isPrimary (bool), description, id.
+      - CIA (confidentiality/integrity/availability) is required ONLY when
+        isPrimary=True. Otherwise CIA must be None and is ignored by the server.
+    """
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    # Required core fields
+    name: StrictStr
+    assetType: StrictStr
+
+    # Optional flags/metadata
+    isPrimary: Optional[bool] = None
+    confidentiality: Optional[str] = None
+    integrity: Optional[str] = None
+    availability: Optional[str] = None
+    description: Optional[str] = None
+
+    # Optional client-supplied id/reference passthrough
+    id: Optional[StrictStr] = None
+
+    @field_validator("name", "assetType")
+    @classmethod
+    def _trim_required_nonempty(cls, v: str, info) -> str:
+        """Trim and ensure required strings remain non-empty."""
+        s = v.strip()
+        if not s:
+            raise ValueError(f"{info.field_name} must be a non-empty string")
+        return s
+
+    @field_validator("confidentiality")
+    @classmethod
+    def _norm_conf(cls, v: Optional[str]) -> Optional[str]:
+        """Normalize confidentiality to UPPER_SNAKE and validate against whitelist."""
+        if v is None:
+            return None
+        x = v.strip().upper().replace("-", "_").replace(" ", "_")
+        if x == "STRICTLYPROTECTED":
+            x = "STRICTLY_PROTECTED"
+        return x if x in CONF_LEVELS else None
+
+    @field_validator("integrity", "availability")
+    @classmethod
+    def _norm_tri(cls, v: Optional[str]) -> Optional[str]:
+        """Normalize integrity/availability to UPPER_SNAKE and validate against whitelist."""
+        if v is None:
+            return None
+        x = v.strip().upper().replace("-", "_").replace(" ", "_")
+        if x == "MEDIUM_":
+            x = "MEDIUM"
+        return x if x in TRI_LEVELS else None
+
+    @model_validator(mode="after")
+    def _gate_required_and_cia(self) -> "CreateAssetFields":
+        """
+        Enforce CIA only for primary assets; null out CIA for supporting assets
+        or when isPrimary is not specified.
+        """
+        if self.isPrimary is True:
+            missing = [k for k in ("confidentiality", "integrity", "availability") if getattr(self, k) in (None, "")]
+            if missing:
+                raise ValueError(f"primary asset requires CIA fields, missing: {', '.join(missing)}")
+        else:
+            # Supporting (or unspecified) assets must not carry CIA in the payload
+            self.confidentiality = None
+            self.integrity = None
+            self.availability = None
+        return self
 
 class ActionCreateAsset(BaseModel):
     """
@@ -301,7 +384,8 @@ class ActionCreateAsset(BaseModel):
 
     op: Literal["create_asset"] = OP_CREATE_ASSET
     client_token: StrictStr
-    fields: dict[str, Any]
+    # Typed & validated payload instead of an arbitrary dict
+    fields: CreateAssetFields
 
     @field_validator("client_token")
     @classmethod
@@ -382,7 +466,7 @@ Action = Annotated[
         ActionRemoveControls,
         ActionUpsertThreats,
         ActionUpsertImpacts,
-        ActionAssetUpsertThreatPresence,  # NEW
+        ActionAssetUpsertThreatPresence,  
     ],
     Field(discriminator="op"),
 ]
@@ -573,6 +657,7 @@ __all__ = [
     "ActionUpsertControls",
     "ActionRemoveControls",
     "ActionSetAssetMeta",
+    "CreateAssetFields",
     "ActionCreateAsset",
     "ActionUpsertThreats",
     "ActionUpsertImpacts",

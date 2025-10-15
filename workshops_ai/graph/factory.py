@@ -1,11 +1,20 @@
 # File: workshops_ai/graph/factory.py
+# =============================================================================
 # Purpose: Central LangGraph factory + lightweight DI for all tabs (assets | impacts | threats).
 # - Single source of truth for building GraphDeps (used by manager + routers)
 # - Injects a centralized llm_client (forced to LangChain ChatOpenAI) and explicit llm_temperature
 # - Preserves checkpointer, Redis-backed ephemeral memory
 # - Exposes a unified submit_changeset wrapper (online submit → OUTBOX fallback) used by all graphs
-# - Exposes helpers to build per-turn LangGraph config (thread_id/checkpoint_ns)
+# - Exposes helpers to build per-turn LangGraph config (thread_id/checkpoint_ns/lang)
 # - Ensures RAG retriever is wired consistently via the retriever factory
+#
+# CHANGE (language stability):
+# - Introduced a tiny normalizer `_normalize_lang_iso(...)`.
+# - Added `build_graph_config(req, deps=None)` that produces a LangGraph `configurable`
+#   with a stable `lang` key (and legacy `user_lang`) so agents keep replying in the
+#   user’s language throughout the session (no drift).
+# - `make_langgraph_config(...)` now also sets both `lang` and `user_lang` for symmetry.
+# =============================================================================
 
 from __future__ import annotations
 
@@ -678,8 +687,25 @@ def invoke_with_timeout(
 
 
 # =============================================================================
-# Utility: build the LangGraph 'configurable' dict (thread_id/namespace)
+# Language normalization + LangGraph config builders
 # =============================================================================
+
+def _normalize_lang_iso(tag: Optional[str]) -> str:
+    """
+    Normalize Accept-Language-ish values into a primary ISO language code.
+
+    Examples:
+      "cs-CZ" -> "cs"
+      "cs-CZ, cs" -> "cs"
+      "en" -> "en"
+      None -> "cs" (conservative default to keep UI Czech-first unless overridden)
+    """
+    if not tag:
+        return "cs"
+    head = str(tag).split(",")[0].split(";")[0].strip()
+    primary = (head.split("-")[0] or "cs").lower()
+    return primary
+
 
 def make_langgraph_config(
     *,
@@ -693,15 +719,57 @@ def make_langgraph_config(
     Compose a LangGraph config with required 'configurable' keys for the checkpointer.
     - thread_id      : required by LangGraph checkpointers
     - checkpoint_ns  : optional but recommended (taken from deps.checkpoint_ns)
-    - user_lang      : optional pass-through; if provided, set as configurable hint for nodes
+    - lang/user_lang : stable per-request language hint for ALL agent prompts
+
+    NOTE:
+    - `user_lang` is expected to be a primary ISO code (e.g., "cs"|"sk"|"en").
+      This will be written to BOTH `configurable.lang` (new) and `configurable.user_lang`
+      (legacy), so older nodes/templates can keep working unchanged.
     """
     cfg: dict[str, Any] = {"configurable": {}}
     user = (user_id or "anon").strip() or "anon"
     cfg["configurable"]["thread_id"] = f"{org_id}:{tab}:{user}"
     if deps.checkpoint_ns:
         cfg["configurable"]["checkpoint_ns"] = deps.checkpoint_ns
+
+    # Language (stable; set both keys for back-compat)
     if user_lang:
-        cfg["configurable"]["user_lang"] = user_lang.lower().strip()
+        iso = _normalize_lang_iso(user_lang)
+        cfg["configurable"]["lang"] = iso
+        cfg["configurable"]["user_lang"] = iso  # back-compat
+    return cfg
+
+
+def build_graph_config(req: UIRequest, deps: Optional[GraphDeps] = None) -> dict[str, Any]:
+    """
+    Convenience wrapper to build the per-turn LangGraph config from a UIRequest.
+
+    - Extracts and normalizes language from `req.language` (already ISO by ws_router).
+    - Computes a stable thread_id:
+        * If deps is provided → use deps.thread_id_for(req)
+        * Else fallback to "<user_id or anon>:<active_tab or assets>"
+    - Sets both `configurable.lang` (new) and `configurable.user_lang` (legacy).
+    """
+    # Normalize language (defensive; ws_router already sends ISO like "cs")
+    iso = _normalize_lang_iso(getattr(req, "language", None))
+
+    # Thread id
+    if deps is not None:
+        thread_id = deps.thread_id_for(req)
+        ckpt_ns = deps.checkpoint_ns
+    else:
+        uid = (getattr(req, "user_id", None) or "anon").strip() or "anon"
+        tab = (getattr(req, "active_tab", None) or "assets").strip() or "assets"
+        thread_id = f"{uid}:{tab}"
+        ckpt_ns = None
+
+    cfg: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    if ckpt_ns:
+        cfg["configurable"]["checkpoint_ns"] = ckpt_ns
+
+    cfg["configurable"]["lang"] = iso
+    cfg["configurable"]["user_lang"] = iso  # back-compat
+
     return cfg
 
 
@@ -719,7 +787,10 @@ def build_checkpointer(settings: AppSettings | None = None) -> Any:
     s = settings or get_settings()
     kind = getattr(getattr(s, "checkpointer", object()), "kind", None) or getattr(s, "checkpointer_kind", None)
     redis_url = getattr(getattr(s, "redis", object()), "url", None)
-    sqlite_path = getattr(getattr(getattr(s, "sqlite", object()), "ckpt_path", object()), "__str__", lambda: None)()
+    sqlite_path = getattr(getattr(s, "sqlite", object()), "ckpt_path", None)
+    # Some settings may wrap the path; ensure a plain string (best-effort)
+    if hasattr(sqlite_path, "__str__"):
+        sqlite_path = str(sqlite_path)
     ns = getattr(s, "checkpoint_ns", None)
     ttl_sec = getattr(s, "checkpoint_ttl_sec", None)
     return _get_checkpointer_cached(
@@ -743,6 +814,7 @@ __all__ = [
     "make_default_deps",
     "get_graph_deps",
     "make_langgraph_config",
+    "build_graph_config",            
     "build_checkpointer",
     "MemoryGet",
     "MemorySet",

@@ -1,5 +1,4 @@
 # File: workshops_ai/routers/chat_router.py
-
 from __future__ import annotations
 
 """
@@ -11,12 +10,17 @@ Chat Router (UIRequest → route_chat → UIResponse)
 - Calls the unified LangGraph manager with DI built via graph.factory.make_default_deps()
   so the manager/graphs receive a centralized `llm_client` and related deps.
 - Single timeout from settings.chat.timeout_sec.
-- Best-effort telemetry; safe error mapping.
+- Accept-Language handling:
+    • Prefer explicit UIRequest.language
+    • else payload.accept_language
+    • else HTTP header "Accept-Language"
+  The chosen value is *session-locked* (Redis) for this user/thread (TTL ~30 min) so the
+  model does not drift between CS/EN/SK mid-conversation.
 """
 
 import asyncio
 import inspect
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status, Body
 from fastapi.responses import JSONResponse
@@ -69,14 +73,27 @@ def _normalize_language(payload: dict[str, Any]) -> None:
     """
     Accept `accept_language` (from UI/browser) and map it to UIRequest.language.
     Drop unknown key to satisfy UIRequest(extra='forbid').
+
+    NOTE: We only set language from payload here. HTTP header fallback is applied
+    after we have a validated UIRequest (see _lock_user_language).
     """
     al = payload.get("accept_language")
-    if al and isinstance(al, str) and al.strip():
+    if isinstance(al, str) and al.strip():
         # Do not overwrite explicit `language` if client provided it already
         payload.setdefault("language", al.strip()[:256])
     # Remove unrecognized key to avoid 422
     if "accept_language" in payload:
         payload.pop("accept_language", None)
+
+
+def _header_accept_language(request: Request) -> Optional[str]:
+    """Extract the HTTP 'Accept-Language' header (trimmed, capped)."""
+    h = request.headers.get("accept-language")
+    if isinstance(h, str):
+        h = h.strip()
+        if h:
+            return h[:256]
+    return None
 
 
 async def _run_with_timeout(awaitable_or_result: Any, timeout_sec: float) -> Any:
@@ -115,6 +132,72 @@ def _to_ui_request(payload: dict[str, Any]) -> UIRequest:
             ) from e2
 
 
+async def _lock_user_language(
+    *,
+    request: Request,
+    ui_req: UIRequest,
+    deps,  # GraphDeps
+    ttl_sec: int = 1800,
+) -> str | None:
+    """
+    Compute a stable user language for this conversation and persist a short-lived lock in memory.
+
+    Precedence:
+      1) ui_req.language (explicit from client payload)
+      2) HTTP header 'Accept-Language'
+    If a lock already exists in memory, it wins over both (to prevent drift).
+
+    Memory key:
+      namespace='ux', key='lang', thread_id=deps.thread_id_for(ui_req)
+    """
+    # Candidate from payload (already normalized) or HTTP header
+    candidate = (ui_req.language or _header_accept_language(request))
+    candidate = (candidate.strip()[:256] if isinstance(candidate, str) else None)
+
+    # Memory not guaranteed; guard each use
+    mem_get = getattr(deps, "memory_get", None)
+    mem_set = getattr(deps, "memory_set", None)
+
+    locked: Optional[str] = None
+    try:
+        if callable(mem_get):
+            locked = await mem_get(
+                org_id=ui_req.org_id,
+                user_id=ui_req.user_id,
+                thread_id=deps.thread_id_for(ui_req),
+                namespace="ux",
+                key="lang",
+            )
+    except Exception:
+        locked = None  # fail-open
+
+    # Decide the effective language
+    effective = locked or candidate
+
+    # If nothing known yet, you can choose a safe default (optional).
+    # Keeping None here means the manager/graphs may decide based on policy.
+    # If you prefer a default, uncomment one of the lines below:
+    # effective = effective or "cs"
+    # effective = effective or "en"
+
+    # Persist the candidate only when no lock existed yet
+    if (locked is None) and candidate and callable(mem_set):
+        try:
+            await mem_set(
+                org_id=ui_req.org_id,
+                user_id=ui_req.user_id,
+                thread_id=deps.thread_id_for(ui_req),
+                namespace="ux",
+                key="lang",
+                value=candidate,
+                ttl_sec=int(ttl_sec),
+            )
+        except Exception:
+            pass  # best-effort
+
+    return effective
+
+
 # ----------------------------------------------------------------------
 # Route
 # ----------------------------------------------------------------------
@@ -141,6 +224,7 @@ async def chat_endpoint(
     - Unified timeout (CHAT_TIMEOUT_SEC).
     - Backward-compatible acceptance of legacy ChatIn (auto-bridged).
     - DI: manager receives GraphDeps via make_default_deps() with a centralized llm_client.
+    - Language lock: Accept-Language (payload/header) is persisted per user/thread (TTL ~30m).
     """
     # 1) Validate inbound payload (UIRequest or legacy), with language normalization
     ui_req = _to_ui_request(payload)
@@ -152,7 +236,20 @@ async def chat_endpoint(
             detail={"message": f"message too long (>{MAX_MESSAGE_LEN} chars)"},
         )
 
-    # 3) Telemetry (best-effort)
+    # 3) Build DI (GraphDeps) with centralized llm_client and friends
+    deps = make_default_deps(tab=ui_req.active_tab)
+
+    # 4) Determine + lock the user language (best-effort)
+    try:
+        locked_lang = await _lock_user_language(request=request, ui_req=ui_req, deps=deps, ttl_sec=1800)
+        if locked_lang:
+            # Mutate the request object so manager/graphs get a stable hint
+            ui_req.language = locked_lang
+    except Exception:
+        # If locking fails, we still proceed; manager may infer/respond
+        pass
+
+    # 5) Telemetry IN (best-effort)
     try:
         telemetry_log(
             "chat.request",
@@ -177,10 +274,7 @@ async def chat_endpoint(
     except Exception:
         pass
 
-    # 4) Build DI (GraphDeps) with centralized llm_client and friends
-    deps = make_default_deps(tab=ui_req.active_tab)
-
-    # 5) Route strictly to the LangGraph manager
+    # 6) Route strictly to the LangGraph manager
     try:
         from workshops_ai.graph.manager import route_chat  # lazy import to avoid import cycles
 
@@ -191,7 +285,7 @@ async def chat_endpoint(
             # Legacy manager signature without DI (not recommended)
             result = await _run_with_timeout(route_chat(ui_req), timeout_sec=CHAT_TIMEOUT_SEC)
 
-        # 6) Validate outbound payload (strict → UIResponse)
+        # 7) Validate outbound payload (strict → UIResponse)
         if isinstance(result, dict):
             ui_resp = UIResponse.model_validate(result)
         elif isinstance(result, UIResponse):
@@ -217,7 +311,7 @@ async def chat_endpoint(
             detail={"message": "Router error", "error": str(ex)},
         ) from ex
 
-    # 7) Telemetry (best-effort)
+    # 8) Telemetry OUT (best-effort)
     try:
         telemetry_log(
             "chat.response",
@@ -229,6 +323,7 @@ async def chat_endpoint(
                 "has_proposals": bool(getattr(ui_resp, "proposals", None)),
                 "staging": getattr(ui_resp, "staging", None),
                 "has_agent_events": bool(getattr(ui_resp, "agent_events", None)),
+                "language_used": getattr(ui_req, "language", None),
                 "source": "API.router",
             },
         )

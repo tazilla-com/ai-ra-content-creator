@@ -3,23 +3,34 @@
 # LangGraph: ASSETS — LLM-first, slot-driven, ONE action per turn
 #
 # Key changes implemented here (as requested):
-# - NO regex anywhere (no `import re`). All light NLP uses lowercase + token scans.
-# - Ask-next behavior exists ONLY inside the `asset.create` node
-#   (no separate tool/action exposed). The node asks exactly one question per turn
-#   until required slots are present, then prepares a changeset.
-# - Strong "create intent" gating: if the user text looks like "create/add/new"
-#   (CZ/EN heuristic), the planner's allowed actions are restricted to `asset.create`
-#   so it cannot drift into list/list_types. This is done WITHOUT regex.
-#   map to the canonical asset type "Cloud services" (if present in the catalog).
-# - CIA levels use STRING ENUMS aligned with client expectations:
-#     confidentiality: PUBLIC|INTERNAL|PROTECTED|STRICTLY_PROTECTED
-#     integrity: LOW|MEDIUM|HIGH
-#     availability: LOW|MEDIUM|HIGH
-# - Supporting assets rule: if isPrimary == False, CIA are ignored (set to None)
-#   and we do not ask about them.
-# - Chat update path is SAFE and NARROW: only `name` and `description`.
-# - WS emits call hub.aemit_asset_created / hub.aemit_asset_updated directly
-#   (best-effort; never fail the turn), without hasattr-guards.
+# - Flow-lock for CREATE: when we are mid slot-filling (`create_draft`/`pending_fields`),
+#   the planner whitelists ONLY `asset.create` (plus a one-off `explain`) so the model
+#   cannot drift to `asset.list_types`.
+# - First-step guard for CREATE: if the user asks to create but no known catalog type
+#   is present in the utterance, we route to `asset.list_types` FIRST (and ask type).
+# - Stricter create gating (FINAL): require `assetType`, `name`, and `isPrimary` before submit.
+#   If `isPrimary=True`, also require CIA (confidentiality/integrity/availability).
+#   If `isPrimary=False`, CIA must be None and we never ask for it.
+# - Type-lock inside CREATE: once `assetType` is captured in the draft, later turns
+#   cannot overwrite it (prevents model drift).
+# - “Type-as-name” confirmation: if only NAME is missing and the user’s reply equals
+#   a catalog TYPE label, ask to confirm using it as the NAME (do not change type).
+# - Mid-creation explain: allow a one-off `explain` while slot-filling; after answering,
+#   append a short reminder about fields still missing.
+# - After submit: clear `state.actions` to prevent duplicate re-submits.
+#
+# CIA levels (STRING ENUMS):
+#   confidentiality: PUBLIC|INTERNAL|PROTECTED|STRICTLY_PROTECTED
+#   integrity: LOW|MEDIUM|HIGH
+#   availability: LOW|MEDIUM|HIGH
+#
+# Non-localization rules:
+#   - assetType labels come from a fixed EN code list → never translate them.
+#   - CIA enum tokens are fixed EN values → never translate them.
+#
+# Chat update path is SAFE and NARROW: only `name` and `description`.
+# WS emits call hub.aemit_asset_created / hub.aemit_asset_updated directly
+# (best-effort; never fail the turn).
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -29,7 +40,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Callable, Literal, Optional, cast, TYPE_CHECKING
+from typing import Callable, Literal, Optional, cast, TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
@@ -221,18 +232,11 @@ def _lang(loc: Optional[str]) -> str:
 
 
 def _hint_create(locale: Optional[str], example_type: str) -> str:
+    # English-only catalog labels — ask a neutral follow-up, no bias to any example type.
     l = _lang(locale)
     if l in ("cs", "sk"):
-        return f"Přeješ si, abych rovnou založil typ „{example_type}“?"
-    return f"Want me to create a “{example_type}” for you?"
-
-
-# -----------------------------------------------------------------------------
-# Tiny NLP (no regex)
-# -----------------------------------------------------------------------------
-def _contains_any(text: str, terms: list[str]) -> bool:
-    t = (text or "").casefold()
-    return any(term in t for term in terms)
+        return f"Který typ aktiva chceš vytvořit?"
+    return f"Which asset type do you want to create?"
 
 
 def _tokenize(text: str) -> list[str]:
@@ -327,6 +331,25 @@ def _llm_text(*, deps: GraphDeps, messages: list[dict[str, str]], temperature: f
 
 
 # -----------------------------------------------------------------------------
+# Catalog type detection helpers (deterministic, no regex)
+# -----------------------------------------------------------------------------
+def _extract_catalog_type_from_text(text: str, asset_types: list[str]) -> Optional[str]:
+    """
+    Return exactly one matching catalog label (case-insensitive substring).
+    If none or multiple match, return None (do not guess).
+    NOTE: Labels are EN and must not be translated.
+    """
+    m = (text or "").strip().lower()
+    hits: list[str] = []
+    for t in asset_types:
+        tl = (t or "").strip().lower()
+        if tl and tl in m:
+            hits.append(t)
+    uniq = list(dict.fromkeys(hits))
+    return uniq[0] if len(uniq) == 1 else None
+
+
+# -----------------------------------------------------------------------------
 # Ask-next question (generated) — ONLY used inside create
 # -----------------------------------------------------------------------------
 def _build_next_question(
@@ -334,27 +357,32 @@ def _build_next_question(
 ) -> str:
     """
     Ask EXACTLY ONE short follow-up question in the user's language to complete the draft.
-    Selection logic (we still compute locally to be deterministic):
-      ask order = [name, assetType, isPrimary, confidentiality, integrity, availability, description]
-      If isPrimary == False → never ask CIA.
+    Ask order (deterministic):
+      [assetType, name, isPrimary, confidentiality, integrity, availability, description]
+      If isPrimary == False → never ask CIA; if isPrimary is unknown → ask isPrimary before CIA.
+      IMPORTANT: When listing asset types, preserve EXACT English labels from catalog (no translation).
     """
     lang = _lang(locale)
-    order = ["name", "assetType", "isPrimary", "confidentiality", "integrity", "availability", "description"]
+    order = ["assetType", "name", "isPrimary", "confidentiality", "integrity", "availability", "description"]
     missing = [k for k in order if (draft.get(k) in (None, "", []) or k not in draft)]
     if draft.get("isPrimary") is False:
         missing = [k for k in missing if k not in ("confidentiality", "integrity", "availability")]
+    # Ensure we never ask CIA before isPrimary is known
+    if "isPrimary" in missing:
+        missing = [x for x in missing if x not in ("confidentiality", "integrity", "availability")]
     target = missing[0] if missing else None
 
     system = (
         "You help a user create an asset by asking ONE concise follow-up question.\n"
         f"Language: {lang}.\n"
-        "- Ask for the most important missing field next.\n"
+        "- Ask for the most important missing field next, following the given order.\n"
         "- If asking about asset type, list 3–6 catalog types (bulleted) as options.\n"
-        "- For CIA, REQUIRE these enums:\n"
+        "- Preserve catalog labels EXACTLY as provided (English). Do NOT translate catalog labels.\n"
+        "- For CIA, REQUIRE these exact enums (do not translate):\n"
         "  • confidentiality: PUBLIC, INTERNAL, PROTECTED, STRICTLY_PROTECTED\n"
         "  • integrity: LOW, MEDIUM, HIGH\n"
         "  • availability: LOW, MEDIUM, HIGH\n"
-        "- If isPrimary is false, do not ask about CIA.\n"
+        "- Ask 'isPrimary' before any CIA question. If isPrimary is false, do not ask CIA.\n"
         "- Output only the question text, no preamble, no markdown fences."
     )
     payload = {
@@ -395,7 +423,30 @@ def _llm_confirm(*, deps: GraphDeps, loc: str, actions: list[dict], queued: bool
 
 
 # -----------------------------------------------------------------------------
-# NLU (planner) — strong create-intent gating WITHOUT regex
+# NLU helpers: lightweight intent checks
+# -----------------------------------------------------------------------------
+def _looks_like_create(msg: str) -> bool:
+    """Heuristic robust across CS/SK/EN without regex."""
+    m = (msg or "").strip().lower()
+    tokens = ["vytvoř", "vytvor", "založ", "zaloz", "přidej", "pridej", "add", "create", "nové", "nove", "new"]
+    return any(t in m for t in tokens)
+
+def _contains_known_type(msg: str, asset_types: list[str]) -> bool:
+    """Simple case-insensitive substring match for ANY exact catalog label."""
+    m = (msg or "").strip().lower()
+    for t in asset_types:
+        if isinstance(t, str) and t.strip() and t.lower() in m:
+            return True
+    return False
+
+def _looks_like_explain(msg: str) -> bool:
+    m = (msg or "").strip().lower()
+    keys = ["explain", "what is", "co je", "vysvětli", "vysvetli", "prosím vysvětli"]
+    return any(k in m for k in keys)
+
+
+# -----------------------------------------------------------------------------
+# NLU (planner)
 # -----------------------------------------------------------------------------
 def _history_tail(state: AssetState, k: int = 5) -> list[dict]:
     try:
@@ -403,30 +454,97 @@ def _history_tail(state: AssetState, k: int = 5) -> list[dict]:
     except Exception:
         return []
 
-
-def _looks_like_create(text: str) -> bool:
-    # CZ + EN verbs; substring-only (no regex)
-    return _contains_any(
-        text,
-        ["vytvoř", "založ", "přidej", "přidat", "nové", "nový", "create", "add", "new", "make", "create cloud", "add cloud"],
-    )
-
-
 async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
     """
     Map the user input to exactly one intent using the planner.
-    If the text looks like "create", we hard-restrict allowed actions to prevent drifting.
+    CHANGED: flow-lock for ongoing CREATE and first-step guard (list_types when type is unknown).
     """
     raw = (state.message or "").strip()
 
+    # Honor explicit action from router (unchanged)
     if state.action in ("list", "get", "create", "update_meta", "explain", "list_types", "agent_reply"):
         state.intent = cast(Intent, state.action)
         return state
 
     sel = state.selection or {}
-    create_intent = _looks_like_create(raw)
 
-    # Base allowed actions
+    # ------------------------- Flow-lock while CREATE is in progress -------------------------
+    # Allow only `asset.create` to continue slot-filling, EXCEPT a one-off `explain`.
+    if (getattr(state, "pending_fields", None) or getattr(state, "create_draft", None)):
+        if _looks_like_explain(raw):
+            state.intent = cast(Intent, "explain")
+            return state
+
+        decision: AgentDecision = await agent_decide(
+            deps=deps,
+            tab="assets",
+            message=raw,
+            language=state.locale or "en",
+            history=_history_tail(state, 5),
+            selection=sel,
+            allowed_actions=["asset.create"],   # flow-lock to continue slot-filling
+            one_action_only=True,
+        )
+        state.intent = cast(Intent, "create" if (decision.action or "").strip() == "asset.create" else "agent_reply")
+        if getattr(decision, "args", None):
+            q = (decision.args or {}).get("question")
+            if isinstance(q, str):
+                state.question = q
+        return state
+
+    # ------------------------- First step for CREATE without a known type --------------------
+    create_intent = _looks_like_create(raw)
+    if create_intent:
+        types = [str(x) for x in (deps.backend_port.list_asset_types() or [])]
+        if not _contains_known_type(raw, types):
+            state.intent = cast(Intent, "list_types")
+            return state
+        # If a known type is present, call create directly (the create node will ask next slot).
+        decision: AgentDecision = await agent_decide(
+            deps=deps,
+            tab="assets",
+            message=raw,
+            language=state.locale or "en",
+            history=_history_tail(state, 5),
+            selection=sel,
+            allowed_actions=["asset.create"],   # constrain to create
+            one_action_only=True,
+        )
+        state.intent = cast(Intent, "create" if (decision.action or "").strip() == "asset.create" else "agent_reply")
+        if getattr(decision, "args", None):
+            q = (decision.args or {}).get("question")
+            if isinstance(q, str):
+                state.question = q
+        return state
+
+    # ---------------- TYPE-ONLY reply guard (hardening after list_types) ----------------
+    # English comment:
+    # If the message matches exactly one catalog type label (and we're not already flow-locked),
+    # treat it as continuation of CREATE and constrain the planner to asset.create.
+    try:
+        types = [str(x) for x in (deps.backend_port.list_asset_types() or [])]
+    except Exception:
+        types = []
+    matched = _extract_catalog_type_from_text(raw, types)
+    if matched:
+        decision: AgentDecision = await agent_decide(
+            deps=deps,
+            tab="assets",
+            message=raw,
+            language=state.locale or "en",
+            history=_history_tail(state, 5),
+            selection=sel,
+            allowed_actions=["asset.create"],  # hard constrain
+            one_action_only=True,
+        )
+        state.intent = cast(Intent, "create" if (decision.action or "").strip() == "asset.create" else "agent_reply")
+        if getattr(decision, "args", None):
+            q = (decision.args or {}).get("question")
+            if isinstance(q, str):
+                state.question = q
+        return state
+
+    # --------------------------------- Default planner path ---------------------------------
     allowed_default = [
         "llm.explain",
         "asset.list",
@@ -435,9 +553,6 @@ async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
         "asset.update_meta",
         "asset.get",
     ]
-    # If user indicates create, restrict to create only (prevents list/list_types calls).
-    allowed = ["asset.create"] if create_intent else allowed_default
-
     decision: AgentDecision = await agent_decide(
         deps=deps,
         tab="assets",
@@ -445,7 +560,7 @@ async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
         language=state.locale or "en",
         history=_history_tail(state, 5),
         selection=sel,
-        allowed_actions=allowed,
+        allowed_actions=allowed_default,
         one_action_only=True,
     )
 
@@ -458,11 +573,6 @@ async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
         "asset.get": "get",
     }
     chosen = tool_to_intent.get((decision.action or "").strip())
-
-    # Extra safety: if it still didn't pick create but we see create-intent, force it.
-    if create_intent and chosen != "create":
-        chosen = "create"
-
     state.intent = cast(Intent, chosen or "agent_reply")
 
     if getattr(decision, "args", None):
@@ -540,6 +650,7 @@ def _list_asset_types(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
             types = deps.backend_port.list_asset_types() or []
             heading = "Asset types" if _lang(state.locale) not in ("cs", "sk") else "Typy aktiv"
             content = [title(heading), ""]
+            # IMPORTANT: we render catalog labels exactly as provided (English); do not translate.
             content.append(bullet_list([str(x) for x in types]) if types else "_No types found_")
             if types:
                 content.extend(["", _hint_create(state.locale, str(types[0]))])
@@ -548,6 +659,15 @@ def _list_asset_types(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
             state.result = _ui_response(parts[0], extra={"agent_events": state.agent_events})
             if len(parts) > 1:
                 state.result["messages"].extend(parts[1:])  # type: ignore[index]
+
+            # ---------- NEW: start slot-filling & flow-lock for CREATE after listing types ----------
+            # English comment:
+            # Mark that we are entering the CREATE flow with the next missing slot being `assetType`.
+            # This ensures the user's next reply (e.g., "Network infrastructure") routes to asset.create.
+            state.create_draft = (state.create_draft or {})
+            state.create_draft.pop("assetType", None)  # keep unset; the user must choose
+            state.pending_fields = ["assetType"]       # key for NLU flow-lock
+
             _finish(state, t0, tool="asset.list_types", ok=True, meta={"count": len(types)})
         except Exception as e:
             _finish(state, t0, tool="asset.list_types", ok=False, meta={"error": str(e)})
@@ -563,6 +683,10 @@ def _validate_write_actions(actions: list[dict]) -> tuple[list[dict], Optional[s
     """
     Validate and coerce actions into ChangeSet payloads.
     Returns (validated_actions, error_or_none).
+
+    NOTE: We keep client-side guards aligned to the conversational gating:
+      - create_asset requires fields.name, fields.assetType, fields.isPrimary
+      - If isPrimary=True → require CIA; if isPrimary=False → CIA must be None/missing
     """
     validated: list[dict] = []
     for a in actions:
@@ -570,9 +694,28 @@ def _validate_write_actions(actions: list[dict]) -> tuple[list[dict], Optional[s
         try:
             if op == "create_asset":
                 payload = {"op": "create_asset", "client_token": a.get("client_token"), "fields": a.get("fields") or {}}
-                if not payload["fields"].get("name"):
+                f = payload["fields"]
+
+                # Basic required fields
+                if not (isinstance(f.get("name"), str) and f["name"].strip()):
                     return [], "create_asset requires fields.name"
+                if not (isinstance(f.get("assetType"), str) and f["assetType"].strip()):
+                    return [], "create_asset requires fields.assetType"
+                if not isinstance(f.get("isPrimary"), bool):
+                    return [], "create_asset requires fields.isPrimary (bool)"
+
+                # CIA consistency
+                c, i, a_ = f.get("confidentiality"), f.get("integrity"), f.get("availability")
+                if f["isPrimary"] is True:
+                    if not (c and i and a_):
+                        return [], "create_asset with isPrimary=True requires CIA (confidentiality, integrity, availability)"
+                else:
+                    # If isPrimary=False, CIA must be None or absent
+                    if any(x is not None for x in (c, i, a_)):
+                        return [], "create_asset with isPrimary=False must not contain CIA"
+
                 validated.append(_guard_validate(ActionCreateAsset, payload))  # type: ignore[arg-type]
+
             elif op == "set_asset_meta":
                 fields = (a.get("fields") or {})
                 illegal = set(fields.keys()) - {"name", "description"}
@@ -593,61 +736,138 @@ def _validate_write_actions(actions: list[dict]) -> tuple[list[dict], Optional[s
 
 def _extract_create_draft_with_llm(*, deps: GraphDeps, text: str, asset_types: list[str]) -> dict:
     """
-    Ask LLM to convert free-form request into STRICT JSON draft.
+    Convert a short request into STRICT JSON draft.
+    Enforce:
+      - Do not guess assetType; if unknown → null
+      - If text contains exactly one catalog label → use that exact label
+      - Do not use any catalog label as the name unless explicitly indicated
+      - If isPrimary=false → force CIA to null
+      - Do not translate CIA or assetType labels (keep canonical EN tokens)
     """
+    detected_type = _extract_catalog_type_from_text(text, asset_types)
+
     system = (
         "Transform a short asset request into STRICT JSON.\n"
         "Allowed keys: name (str), assetType (str|null), isPrimary (bool|null), "
         "confidentiality (PUBLIC|INTERNAL|PROTECTED|STRICTLY_PROTECTED|null), "
         "integrity (LOW|MEDIUM|HIGH|null), availability (LOW|MEDIUM|HIGH|null), "
-        "description (str|null). If unsure, set null. Output JSON only."
+        "description (str|null).\n"
+        "- If user_text contains exactly one catalog label, use that exact label as assetType.\n"
+        "- Never guess assetType; if none or multiple match, set assetType=null.\n"
+        "- Never set name equal to any catalog label unless the user explicitly states it is the name.\n"
+        "- Preserve enum tokens and catalog labels exactly (English), do not translate.\n"
+        "Output JSON only."
     )
     human = {"user_text": text, "asset_types": asset_types}
+
     try:
         raw = _llm_text(
             deps=deps,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": json.dumps(human, ensure_ascii=False)}],
             temperature=getattr(deps, "llm_temperature", None) or 0.0,
-        )
-        obj = json.loads(raw)
+        ).strip()
+
+        # Tolerate code fences and extract the first JSON object if present.
+        if raw.startswith("```"):
+            i, j = raw.find("{"), raw.rfind("}")
+            if i != -1 and j != -1 and j > i:
+                raw = raw[i:j+1]
+
+        obj = json.loads(raw) if raw else {}
         if not isinstance(obj, dict):
-            return {}
+            obj = {}
+
+        # Enforce catalog type lock / validity
+        if detected_type:
+            obj["assetType"] = detected_type
+        elif obj.get("assetType") not in asset_types:
+            obj["assetType"] = None
+
+        # Prevent "type as name"
+        nm = obj.get("name")
+        if isinstance(nm, str) and nm.strip().lower() in [t.lower() for t in asset_types]:
+            obj["name"] = None
+
+        # Normalize CIA enums
         obj["confidentiality"] = _norm_enum(obj.get("confidentiality"), allowed=CONF_LEVELS)
         obj["integrity"] = _norm_enum(obj.get("integrity"), allowed=TRI_LEVELS)
         obj["availability"] = _norm_enum(obj.get("availability"), allowed=TRI_LEVELS)
+
+        # If isPrimary=false, strip CIA
+        if obj.get("isPrimary") is False:
+            obj["confidentiality"] = None
+            obj["integrity"] = None
+            obj["availability"] = None
+
         return obj
     except Exception:
         return {}
-
 
 
 def _create_asset(deps: GraphDeps) -> Callable[[AssetState], AssetState]:
     """
     Iterative slot-filling for asset.create (ask-next ONLY inside this node):
       1) Maintain a JSON draft in state.create_draft (merged from LLM + heuristics).
-      2) If name/assetType missing → ask ONE follow-up question in user's language.
-      3) When ready, build changeset with ActionCreateAsset (CIA rules applied).
-      4) Best-effort WS emit (created) if a stable id is known (rare at this stage).
+      2) Ask exactly ONE follow-up when something is missing (localized).
+      3) Enforce supporting assets (isPrimary=False) never carry CIA.
+      4) Build a single ActionCreateAsset and return a prepared changeset.
     """
     def _inner(state: AssetState) -> AssetState:
-        types = deps.backend_port.list_asset_types() or []
+        raw_types = deps.backend_port.list_asset_types() or []
+        types = [str(x) for x in raw_types]  # ensure JSON-serializable & LLM-friendly
 
         # Merge into current draft
         draft = dict(state.create_draft or {})
+        prev_type = draft.get("assetType")
         if state.message:
             inc = _extract_create_draft_with_llm(deps=deps, text=state.message, asset_types=types)
+
+            # TYPE-LOCK: once assetType is set in this flow, do not overwrite it later
+            if prev_type and isinstance(inc, dict) and inc.get("assetType") and inc.get("assetType") != prev_type:
+                inc.pop("assetType", None)
+
+            # Merge remaining fields (name/isPrimary/CIA/description)
             for k, v in (inc or {}).items():
-                if v is not None:
+                if v is not None and (k != "assetType" or not prev_type):
                     draft[k] = v
-            
-        # Minimal requirement: name + assetType
+
+        # Minimal requirements before submit (FINAL):
+        # - Always require: name + assetType + isPrimary
+        # - If isPrimary=True, also require all CIA (confidentiality/integrity/availability)
         need_name = not (isinstance(draft.get("name"), str) and draft["name"].strip())
         need_type = not (isinstance(draft.get("assetType"), str) and draft["assetType"].strip())
+        need_primary = draft.get("isPrimary") is None
+        need_cia = bool(draft.get("isPrimary") is True and any(
+            draft.get(k) in (None, "") for k in ("confidentiality", "integrity", "availability")
+        ))
 
-        if need_name or need_type:
+        # Edge case: ONLY name missing and the user typed a catalog TYPE label → ask to use it as NAME
+        if need_name and not (need_type or need_primary or need_cia):
+            raw_msg = (state.message or "").strip()
+            if raw_msg and raw_msg.lower() in (t.lower() for t in types):
+                confirm_q = (
+                    f"Use “{raw_msg}” as the asset name?"
+                    if _lang(state.locale) not in ("cs", "sk")
+                    else f"Mám použít „{raw_msg}“ jako název aktiva?"
+                )
+                state.create_draft = draft
+                state.pending_fields = ["name"]
+                state.actions = None
+                state.result = _ui_response(confirm_q)
+                return state
+
+        if need_name or need_type or need_primary or need_cia:
             q = _build_next_question(deps=deps, draft=draft, asset_types=types, locale=(state.locale or "en"))
             state.create_draft = draft
-            state.pending_fields = [f for f, need in (("name", need_name), ("assetType", need_type)) if need]
+            pending = []
+            if need_type: pending.append("assetType")
+            if need_name: pending.append("name")
+            if need_primary: pending.append("isPrimary")
+            if need_cia:
+                for c in ("confidentiality", "integrity", "availability"):
+                    if draft.get(c) in (None, ""):
+                        pending.append(c)
+            state.pending_fields = pending
             state.actions = None  # nothing to submit this turn
             state.result = _ui_response(q or "Provide the next value.")
             return state
@@ -823,10 +1043,11 @@ async def _submit_changeset_async(deps: GraphDeps, state: AssetState) -> AssetSt
                     ],
                 },
             )
+            state.actions = None  # prevent duplicate re-submit
             return state
 
         # queued/outbox path
-        _finish(state, t0, tool="submit_changeset", ok=False, meta={"queued": True})
+        _finish(state, t0, tool="submit_changeset", ok=True, meta={"queued": True})
         msg_json = {
             "kind": "changeset.queued",
             "tab": "assets",
@@ -836,17 +1057,21 @@ async def _submit_changeset_async(deps: GraphDeps, state: AssetState) -> AssetSt
             "actor": state.user_id,
         }
         confirm = _llm_confirm(deps=deps, loc=loc, actions=acts, queued=True)
-        state.result = _ui_response(confirm, extra={"agent_events": state.agent_events, "messages": [msg_json]})
+        res = _ui_response(confirm, extra={"agent_events": state.agent_events})
+        res["messages"].append(msg_json)
+        state.result = res
+        state.actions = None  # prevent duplicate re-submit
         return state
 
     except Exception as e:
         _finish(state, t0, tool="submit_changeset", ok=False, meta={"error": str(e)})
         state.result = _ui_response("Submission failed.", extra={"agent_events": state.agent_events})
+        state.actions = None  # best-effort cleanup even on failure
         return state
 
 
 # -----------------------------------------------------------------------------
-# Explain (RAG → LLM synth; concise)
+# Explain (RAG → LLM synth; concise) + mid-creation reminder
 # -----------------------------------------------------------------------------
 async def _explain_assets_async(deps: GraphDeps, state: AssetState) -> AssetState:
     q = (state.question or state.message or "").strip()
@@ -895,6 +1120,7 @@ async def _explain_assets_async(deps: GraphDeps, state: AssetState) -> AssetStat
             if txt:
                 _finish(state, t0, tool="llm.synthesize", ok=True, meta={})
                 state.result = _ui_response(txt, extra={"snippets": tagged, "agent_events": state.agent_events})
+                _append_pending_reminder(state)
                 return state
         except Exception as e:
             _finish(state, t0, tool="llm.synthesize", ok=False, meta={"error": str(e)})
@@ -908,12 +1134,39 @@ async def _explain_assets_async(deps: GraphDeps, state: AssetState) -> AssetStat
             if txt:
                 _finish(state, t0, tool="llm.explain", ok=True, meta={})
                 state.result = _ui_response(txt, extra={"agent_events": state.agent_events})
+                _append_pending_reminder(state)
                 return state
         except Exception as e:
             _finish(state, t0, tool="llm.explain", ok=False, meta={"error": str(e)})
 
     state.result = _ui_response("No evidence available and fallback did not answer.", extra={"agent_events": state.agent_events})
+    _append_pending_reminder(state)
     return state
+
+
+def _append_pending_reminder(state: AssetState) -> None:
+    """
+    If we're in the middle of CREATE, append a short reminder indicating which fields are still missing.
+    Order mirrors the question order to avoid confusion.
+    """
+    draft = state.create_draft or {}
+    if not (draft or state.pending_fields):
+        return
+    order = ["assetType", "name", "isPrimary", "confidentiality", "integrity", "availability", "description"]
+    missing = [k for k in order if (draft.get(k) in (None, "", []) or k not in draft)]
+    if draft.get("isPrimary") is False:
+        missing = [k for k in missing if k not in ("confidentiality", "integrity", "availability")]
+    if not missing:
+        return
+    note = (
+        f"Do you want to continue? I’m waiting for: {', '.join(missing[:3])}."
+        if _lang(state.locale) not in ('cs', 'sk')
+        else f"Chceš pokračovat? Aktuálně čekám na: {', '.join(missing[:3])}."
+    )
+    try:
+        state.result["messages"].append(note)  # type: ignore[index]
+    except Exception:
+        pass
 
 
 # -----------------------------------------------------------------------------
