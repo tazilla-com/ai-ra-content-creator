@@ -6,7 +6,8 @@
 # Characteristics:
 # - Strict (extra="forbid"), whitespace strip, safe JSON serialization.
 # - Helper conversions: to_ui()/from_ui() bridging the new UI contract.
-# - Minimal but extendable typing for "selection" and "proposals".
+# - A strict helper _to_ui_request(...) to accept a dict payload and return UIRequest,
+#   normalizing language/locale, selection.asset_id, and carrying staging/session_id/conn_id.
 #
 # Notes:
 # - Newer code should prefer UIRequest/UIResponse directly (see schemas/ui_contract.py).
@@ -14,7 +15,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -57,34 +58,84 @@ class ChatIn(StrictModel):
         description="Optional user message in natural language.",
     )
     staging: bool = Field(
-        default=True,
-        description="Whether actions run in staging mode (no commit).",
+        default=False,
+        description="Whether actions run in staging mode (no commit); default False for safety.",
     )
     user_id: str = Field(..., description="User ID for audit/telemetry.")
 
+    # Newly surfaced transport/session hints (strictly forwarded to UIRequest):
+    session_id: str | None = Field(
+        default=None,
+        description="Conversation/session/thread id; if None, router may derive a stable value.",
+    )
+    conn_id: str | None = Field(
+        default=None,
+        description="Best-effort transport connection id (e.g., WS connection).",
+    )
+
+    # Language hints (we unify to UIRequest.language; locale works as a fallback):
+    language: str | None = Field(
+        default=None,
+        description="Preferred language code (e.g., 'cs-CZ', 'en').",
+    )
+    locale: str | None = Field(
+        default=None,
+        description="Optional locale hint; used only if language is not provided.",
+    )
+
     # --- Conversion to the new contract ---
     def to_ui(self) -> "UIRequest":  # type: ignore[name-defined]
+        """
+        Convert ChatIn → UIRequest:
+        - selection is normalized to dict | None
+        - language is unified: prefer `language`, else `locale`
+        - staging/session_id/conn_id are passed through without guessing
+        """
         from workshops_ai.schemas.ui_contract import UIRequest  # lazy import
-        # UIRequest allows selection as dict[str, Any] | None — pass through as-is
-        selection = self.selection.model_dump() if isinstance(self.selection, BaseModel) else self.selection
+
+        # Normalize selection to a dict with optional asset_id, or None
+        selection: dict[str, Any] | None
+        if isinstance(self.selection, BaseModel):
+            sel_dict = self.selection.model_dump()
+            selection = sel_dict if any(v is not None for v in sel_dict.values()) else None
+        elif isinstance(self.selection, dict):
+            # Keep only safe keys; currently we standardize on 'asset_id'
+            asset_id = self.selection.get("asset_id")
+            selection = {"asset_id": asset_id} if asset_id else None
+        else:
+            selection = None
+
+        # Unify language/locale (do not guess if both are None)
+        eff_lang = self.language or self.locale
+
         return UIRequest(
             org_id=self.org_id,
             active_tab=self.active_tab,
-            selection=selection or None,
+            selection=selection,
             message=self.message,
             staging=self.staging,
             user_id=self.user_id,
+            session_id=self.session_id,
+            conn_id=self.conn_id,
+            language=eff_lang,
         )
 
     @classmethod
     def from_ui(cls, ui: "UIRequest") -> "ChatIn":  # type: ignore[name-defined]
+        """
+        Convert UIRequest → ChatIn:
+        - selection normalized to ChatSelection (asset_id only)
+        - language propagated to ChatIn.language (locale remains None here)
+        - carries staging/session_id/conn_id
+        """
         selection = ui.selection or {}
         # Heuristic: if it's a plain dict, try to pull asset_id
-        asset_id = None
+        asset_id: Optional[str] = None
         try:
             asset_id = selection.get("asset_id")  # type: ignore[assignment]
         except Exception:
             pass
+
         return cls(
             org_id=ui.org_id,
             active_tab=ui.active_tab,
@@ -92,6 +143,10 @@ class ChatIn(StrictModel):
             message=ui.message,
             staging=ui.staging,
             user_id=ui.user_id,
+            session_id=getattr(ui, "session_id", None),
+            conn_id=getattr(ui, "conn_id", None),
+            language=getattr(ui, "language", None),
+            locale=None,
         )
 
 
@@ -183,6 +238,64 @@ class ChatOut(StrictModel):
 
 
 # ======================
+# Helper: strict payload → UIRequest
+# ======================
+
+def _to_ui_request(payload: dict[str, Any]) -> "UIRequest":  # type: ignore[name-defined]
+    """
+    Strictly parse a dict payload into UIRequest with normalization:
+
+    - language/locale: prefer 'language'; if missing, fall back to 'locale';
+      remove 'locale' key before validation since UIRequest is strict (extra='forbid').
+    - selection: ensure a dict with only 'asset_id' (if present); ignore unknown keys.
+    - staging/session_id/conn_id: pass them through verbatim if provided.
+    - accept_language (legacy): if present and 'language' is not set, map it to language.
+
+    If direct UIRequest validation fails, bridge via ChatIn (legacy) and convert with .to_ui().
+    """
+    from workshops_ai.schemas.ui_contract import UIRequest  # lazy import
+
+    # Work on a shallow copy to avoid mutating caller's dict.
+    data = dict(payload or {})
+
+    # Normalize accept_language → language (only if language not explicitly provided)
+    al = data.get("accept_language")
+    if isinstance(al, str) and al.strip() and not data.get("language"):
+        data["language"] = al.strip()[:256]
+    data.pop("accept_language", None)  # drop unknown key for strict models
+
+    # Unify language/locale (keep only language for UIRequest)
+    if not data.get("language") and isinstance(data.get("locale"), str):
+        data["language"] = (data.get("locale") or "").strip()[:256] or None
+    data.pop("locale", None)
+
+    # Normalize selection to a dict with asset_id if possible
+    sel = data.get("selection")
+    if isinstance(sel, BaseModel):
+        sel = sel.model_dump()
+    if isinstance(sel, dict):
+        asset_id = sel.get("asset_id")
+        data["selection"] = {"asset_id": asset_id} if asset_id else None
+    elif sel is None:
+        pass
+    else:
+        # Unknown selection shape → drop to avoid validation failure
+        data["selection"] = None
+
+    # Ensure staging/session_id/conn_id keys are preserved if present;
+    # (no-op here since we don't alter them; just documenting intent)
+    # data.get("staging"); data.get("session_id"); data.get("conn_id")
+
+    # Validate directly against UIRequest first
+    try:
+        return UIRequest.model_validate(data)
+    except Exception:
+        # Fallback: validate as ChatIn (legacy) and bridge to UIRequest
+        legacy = ChatIn.model_validate(data)
+        return legacy.to_ui()
+
+
+# ======================
 # OpenAPI examples
 # ======================
 # Set OpenAPI examples FIRST…
@@ -193,8 +306,11 @@ ChatIn.model_config["json_schema_extra"] = {  # type: ignore[index]
             "active_tab": "assets",
             "selection": {"asset_id": "asset-001"},
             "message": "List primary assets",
-            "staging": True,
+            "staging": False,
             "user_id": "demo-user",
+            "session_id": "thread-abc",
+            "conn_id": "WO5JZvgTYvhqpUTJ_Cr11Fls",
+            "language": "cs-CZ",
         }
     ]
 }

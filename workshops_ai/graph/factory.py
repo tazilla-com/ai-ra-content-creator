@@ -8,12 +8,16 @@
 # - Exposes helpers to build per-turn LangGraph config (thread_id/checkpoint_ns/lang)
 # - Ensures RAG retriever is wired consistently via the retriever factory
 #
-# CHANGE (language stability):
-# - Introduced a tiny normalizer `_normalize_lang_iso(...)`.
-# - Added `build_graph_config(req, deps=None)` that produces a LangGraph `configurable`
-#   with a stable `lang` key (and legacy `user_lang`) so agents keep replying in the
-#   user’s language throughout the session (no drift).
-# - `make_langgraph_config(...)` now also sets both `lang` and `user_lang` for symmetry.
+# Language stability:
+# - `_normalize_lang_iso(...)` normalizes Accept-Language-like values to ISO primaries.
+# - `build_graph_config(req, deps=None)` produces a LangGraph `configurable` with stable `lang`
+#   (and legacy `user_lang`) so agents keep replying in the user’s language (no drift).
+#
+# Thread identity (single source of truth):
+# - `_derive_thread_id(req, ...)` computes a stable thread id:
+#     1) prefer req.session_id (sticky across reconnects),
+#     2) else uuid5(org, conn_id|user_id), always scoped by tab,
+#   and GraphDeps.thread_id_for(...) delegates to it.
 # =============================================================================
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from __future__ import annotations
 import logging
 import asyncio
 import atexit
+import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, Optional, Protocol, Final
@@ -170,6 +175,37 @@ class SubmitChangeSet(Protocol):
 
 
 # =============================================================================
+# Thread id derivation (single source of truth)
+# =============================================================================
+
+def _derive_thread_id(req: UIRequest, fallback_tab: str | None = None) -> str:
+    """
+    Build a stable thread_id for LangGraph/checkpointers and per-thread memory.
+
+    Priority:
+      1) If `req.session_id` is present → use it (sticky across reconnects).
+      2) Else compute uuid5(namespace=org_id, name=(conn_id | user_id)).
+    Always scope by tab to avoid cross-talk between tabs.
+
+    Shape:
+      "<org_id>:<tab>:<session_id | uuid5_hex>"
+    """
+    tab = (getattr(req, "active_tab", None) or fallback_tab or "assets").strip() or "assets"
+    org = (getattr(req, "org_id", None) or "org").strip() or "org"
+
+    # 1) Session-based thread id (preferred)
+    sid = getattr(req, "session_id", None)
+    if isinstance(sid, str) and sid.strip():
+        return f"{org}:{tab}:{sid.strip()}"
+
+    # 2) Deterministic uuid5(org, seed) where seed = conn_id | user_id | "anon"
+    seed = getattr(req, "conn_id", None) or getattr(req, "user_id", None) or "anon"
+    ns = uuid.uuid5(uuid.NAMESPACE_URL, f"org:{org}")
+    th = uuid.uuid5(ns, str(seed))
+    return f"{org}:{tab}:{th.hex}"
+
+
+# =============================================================================
 # Dependency bundle injected into each graph
 # =============================================================================
 
@@ -219,21 +255,17 @@ class GraphDeps:
     # Stable per-thread key builder (used by graphs for memory key composition)
     def thread_id_for(self, req: Optional[UIRequest] = None) -> str:
         """
-        Build a stable 'thread_id' suffix for memory keys. If UIRequest provides an
-        explicit thread_id, use it; otherwise derive from (user_id, tab).
+        Build a stable thread_id using the single source of truth:
+          session_id → uuid5(org, conn_id|user_id), always scoped by tab.
         """
-        try:
-            if req and getattr(req, "thread_id", None):
-                return str(req.thread_id)
-            if req and isinstance(req.body, dict):
-                t = req.body.get("thread_id")
-                if t:
-                    return str(t)
-        except Exception:
-            pass
-        uid = (getattr(req, "user_id", None) or "anon").strip() or "anon"
-        tab = (getattr(req, "active_tab", None) or self.tab or "assets").strip() or "assets"
-        return f"{uid}:{tab}"
+        if req is not None:
+            try:
+                return _derive_thread_id(req, fallback_tab=self.tab)
+            except Exception:
+                pass
+        # Last-resort fallback (very rare)
+        tab = (self.tab or "assets").strip() or "assets"
+        return f"org:{tab}:fallback"
 
 
 # =============================================================================
@@ -745,22 +777,20 @@ def build_graph_config(req: UIRequest, deps: Optional[GraphDeps] = None) -> dict
     Convenience wrapper to build the per-turn LangGraph config from a UIRequest.
 
     - Extracts and normalizes language from `req.language` (already ISO by ws_router).
-    - Computes a stable thread_id:
-        * If deps is provided → use deps.thread_id_for(req)
-        * Else fallback to "<user_id or anon>:<active_tab or assets>"
+    - Computes a stable thread_id via the single source of truth:
+        * If deps is provided → deps.thread_id_for(req) → _derive_thread_id(...)
+        * Else → _derive_thread_id(req) directly
     - Sets both `configurable.lang` (new) and `configurable.user_lang` (legacy).
     """
     # Normalize language (defensive; ws_router already sends ISO like "cs")
     iso = _normalize_lang_iso(getattr(req, "language", None))
 
-    # Thread id
+    # Thread id (single source of truth)
     if deps is not None:
         thread_id = deps.thread_id_for(req)
         ckpt_ns = deps.checkpoint_ns
     else:
-        uid = (getattr(req, "user_id", None) or "anon").strip() or "anon"
-        tab = (getattr(req, "active_tab", None) or "assets").strip() or "assets"
-        thread_id = f"{uid}:{tab}"
+        thread_id = _derive_thread_id(req)
         ckpt_ns = None
 
     cfg: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
@@ -814,7 +844,7 @@ __all__ = [
     "make_default_deps",
     "get_graph_deps",
     "make_langgraph_config",
-    "build_graph_config",            
+    "build_graph_config",
     "build_checkpointer",
     "MemoryGet",
     "MemorySet",
