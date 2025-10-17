@@ -1,0 +1,95 @@
+# File: docker-compose.yaml
+services:
+  api:
+    build: .
+    image: workshops-ai:local
+    container_name: workshops-ai-api
+    ports:
+      - "8000:8000"
+
+    env_file:
+      - .env
+
+    environment:
+      # Network / ports
+      APP_HOST: ${APP_HOST:-0.0.0.0}
+      APP_PORT: ${APP_PORT:-8000}
+      PORT: ${APP_PORT:-8000}
+
+      # RAG under /app/workshops_ai (no writes to /app/data required, but we guard it anyway)
+      WORKSHOPS_AI_RAG__DATA_DIR: /app/workshops_ai/data/chroma
+      WORKSHOPS_AI_RAG__CHROMA_DIR: ${WORKSHOPS_AI_RAG__CHROMA_DIR:-}
+
+      # LangGraph checkpointer
+      WORKSHOPS_AI_CHECKPOINTER: ${WORKSHOPS_AI_CHECKPOINTER:-redis}
+      WORKSHOPS_AI_REDIS_URL: ${WORKSHOPS_AI_REDIS_URL:-redis://redis:6379/0}
+      WORKSHOPS_AI_REDIS__URL: ${WORKSHOPS_AI_REDIS__URL:-redis://redis:6379/0}
+      WORKSHOPS_AI_SQLITE_CKPT_PATH: /app/workshops_ai/data/state/checkpoints.db
+      WORKSHOPS_AI_CHECKPOINT_NS: ${WORKSHOPS_AI_CHECKPOINT_NS:-lg:ckpt}
+      WORKSHOPS_AI_CHECKPOINT_TTL_SEC: ${WORKSHOPS_AI_CHECKPOINT_TTL_SEC:-1209600}
+
+      # Auth
+      WORKSHOPS_AI_SECURITY__ENABLE_API_KEY: ${WORKSHOPS_AI_SECURITY__ENABLE_API_KEY:-true}
+      WORKSHOPS_AI_SECURITY__API_KEYS: ${WORKSHOPS_AI_SECURITY__API_KEYS:-}
+
+      # JWT (optional)
+      WORKSHOPS_AI_SECURITY__ENABLE_JWT: ${WORKSHOPS_AI_SECURITY__ENABLE_JWT:-false}
+      WORKSHOPS_AI_SECURITY__JWT_ALGORITHM: ${WORKSHOPS_AI_SECURITY__JWT_ALGORITHM:-HS256}
+      WORKSHOPS_AI_SECURITY__JWT_SECRET: ${WORKSHOPS_AI_SECURITY__JWT_SECRET:-}
+      WORKSHOPS_AI_SECURITY__JWT_ISSUER: ${WORKSHOPS_AI_SECURITY__JWT_ISSUER:-}
+      WORKSHOPS_AI_SECURITY__JWT_AUDIENCE: ${WORKSHOPS_AI_SECURITY__JWT_AUDIENCE:-}
+      WORKSHOPS_AI_SECURITY__JWKS_URL: ${WORKSHOPS_AI_SECURITY__JWKS_URL:-}
+
+      # CORS
+      WORKSHOPS_AI_CORS_ORIGINS: ${WORKSHOPS_AI_CORS_ORIGINS:-}
+
+      # LLM / agents
+      WORKSHOPS_AI_LLM__MODEL: ${WORKSHOPS_AI_LLM__MODEL:-gpt-4o-mini}
+      WORKSHOPS_AI_LLM__TEMPERATURE: ${WORKSHOPS_AI_LLM__TEMPERATURE:-0.0}
+      WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC: ${WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC:-60}
+      WORKSHOPS_AI_LLM__OPENAI_MAX_RETRIES: ${WORKSHOPS_AI_LLM__OPENAI_MAX_RETRIES:-3}
+
+      # Rate limiting
+      WORKSHOPS_AI_RATELIMIT__ENABLED: ${WORKSHOPS_AI_RATELIMIT__ENABLED:-true}
+      WORKSHOPS_AI_RATELIMIT__PER_MINUTE: ${WORKSHOPS_AI_RATELIMIT__PER_MINUTE:-120}
+
+      # Telemetry
+      WORKSHOPS_AI_TELEMETRY__ENABLED: ${WORKSHOPS_AI_TELEMETRY__ENABLED:-true}
+      WORKSHOPS_AI_TELEMETRY__LEVEL: ${WORKSHOPS_AI_TELEMETRY__LEVEL:-INFO}
+      WORKSHOPS_AI_TELEMETRY__LOG_TO_FILE: ${WORKSHOPS_AI_TELEMETRY__LOG_TO_FILE:-false}
+      WORKSHOPS_AI_TELEMETRY__LOG_FILE_PATH: ${WORKSHOPS_AI_TELEMETRY__LOG_FILE_PATH:-/app/logs/workshops_ai.log}
+      WORKSHOPS_AI_TELEMETRY__MAX_PAYLOAD_LEN: ${WORKSHOPS_AI_TELEMETRY__MAX_PAYLOAD_LEN:-16000}
+
+      # Tazila export
+      WORKSHOPS_AI_TAZILA__MODE: ${WORKSHOPS_AI_TAZILA__MODE:-file}
+      WORKSHOPS_AI_TAZILA__OUTBOX_PATH: /app/workshops_ai/data/outbox
+      WORKSHOPS_AI_TAZILA__ENDPOINT: ${WORKSHOPS_AI_TAZILA__ENDPOINT:-}
+      WORKSHOPS_AI_TAZILA__AUTH_TOKEN: ${WORKSHOPS_AI_TAZILA__AUTH_TOKEN:-}
+      WORKSHOPS_AI_TAZILA__TIMEOUT_SEC: ${WORKSHOPS_AI_TAZILA__TIMEOUT_SEC:-30}
+
+      # Chat limits
+      WORKSHOPS_AI_CHAT__TIMEOUT_SEC: ${WORKSHOPS_AI_CHAT__TIMEOUT_SEC:-180}
+      WORKSHOPS_AI_CHAT__MAX_MESSAGE_LEN: ${WORKSHOPS_AI_CHAT__MAX_MESSAGE_LEN:-4000}
+
+    volumes:
+      - ./workshops_ai/data:/app/workshops_ai/data
+      - ./logs:/app/logs
+
+    depends_on:
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: workshops-ai-redis
+    ports:
+      - "6379:6379"
+    environment:
+      REDIS_ARGS: --save "" --appendonly no
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:

@@ -1,0 +1,545 @@
+# workshops_ai/wizard/schemas.py
+"""
+Wizard request/response schemas.
+
+For LLM output schemas, we reuse existing schemas from workshops_ai.api.schema
+where possible. Wizard-specific request models are defined here.
+"""
+from __future__ import annotations
+
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Optional, List, Literal
+from workshops_ai.api.schema.asset import Asset
+from workshops_ai.api.schema.impact import AssetImpact
+from workshops_ai.api.schema.threat import AssetRisk
+from workshops_ai.api.schema.control import AssetControls
+
+# ===================================================================================
+# Sector Values (Fixed List)
+# ===================================================================================
+
+SECTOR_VALUES = [
+    "Digital infrastructure",
+    "Transport",
+    "Energy",
+    "Finance",
+    "Financial markets infrastructure",
+    "Post",
+    "Industry",
+    "Public administration",
+    "Water and atmosphere",
+    "Health",
+]
+
+# ===================================================================================
+# Domain Models
+# ===================================================================================
+
+class Service(BaseModel):
+    """Represents a core business service within the organization."""
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        ...,
+        description="Unique localized name of the service (e.g., Broadband Internet)."
+    )
+    description: Optional[str] = Field(
+        None,
+        description="Description of the service, its function, or business relevance."
+    )
+    sector: Optional[Literal[
+        "Digital infrastructure",
+        "Transport",
+        "Energy",
+        "Finance",
+        "Financial markets infrastructure",
+        "Post",
+        "Industry",
+        "Public administration",
+        "Water and atmosphere",
+        "Health"
+    ]] = Field(
+        None,
+        description="Optional sector classification. Fixed code list; must not be translated."
+    )
+
+# ===================================================================================
+# Common/Shared Request Models
+# ===================================================================================
+
+class WizardStepInput(BaseModel):
+    """Base model for wizard step inputs."""
+    model_config = ConfigDict(extra="forbid")
+
+    ai_model: Optional[str] = Field(
+        None,
+        description="LLM model override (e.g., gpt-5, gpt-4o, gpt-4o-mini)"
+    )
+
+
+# ===================================================================================
+# Scrape/Website
+# ===================================================================================
+
+class ScrapeWebsiteInput(BaseModel):
+    """Input for /scrape/website endpoint (standalone, not session-based)."""
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(..., description="URL to scrape")
+    search_method: Literal["scrape", "web_search"] = Field(
+        default="scrape",
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    )
+
+
+class ScrapeWebsiteOutput(BaseModel):
+    """Output from website scraping - compatible with both scrape and web_search methods."""
+    url: str = Field(..., description="Website URL (final URL after redirects)")
+    content: str = Field(..., description="Combined scraped content from all pages")
+
+
+# ===================================================================================
+# Services
+# ===================================================================================
+
+class OrganizationProfile(BaseModel):
+    """Optional organization data for context."""
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(None, description="Organization name")
+    address: Optional[str] = Field(None, description="Organization address")
+    employees: Optional[int] = Field(None, description="Number of employees")
+    industry: Optional[str] = Field(None, description="Industry/sector")
+
+
+class WebsiteContent(BaseModel):
+    """Website content data when not using session."""
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(..., description="Website URL")
+    content: str = Field(..., description="Scraped website content")
+
+
+class ServicesInput(WizardStepInput):
+    """Input for /wizard/services endpoint."""
+
+    # Website content sources
+    website_url: Optional[str] = Field(
+        None,
+        description="Website URL to scrape (will be cached in session)"
+    )
+    website_content: Optional[WebsiteContent] = Field(
+        None,
+        description="Provide website content directly when not using session"
+    )
+
+    # Search method
+    search_method: Literal["scrape", "web_search"] = Field(
+        default="scrape",
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    )
+
+    # Generation parameters
+    language: str = Field(
+        default="en",
+        description="Output language (en/sk/cs)"
+    )
+    number_of_services: int = Field(
+        default=3,
+        ge=1,
+        le=3,
+        description="Number of services to generate (1-3)"
+    )
+
+    # Optional context for better generation
+    organization_profile: Optional[OrganizationProfile] = Field(
+        None,
+        description="Optional organization data (name, address, employees, etc.)"
+    )
+
+    # Refinement (for iterating on previous results)
+    previous_services: Optional[List[Service]] = Field(
+        None,
+        description="Optional previous services for refinement; if omitted and user_instructions provided, loaded from session"
+    )
+    user_instructions: Optional[str] = Field(
+        None,
+        description="User instructions for refining previous services"
+    )
+
+
+class ServicesOutput(BaseModel):
+    """Output for business services generation."""
+    model_config = ConfigDict(extra="forbid")
+
+    services: List[Service] = Field(
+        ...,
+        description="List of generated business services"
+    )
+    debug: Optional[dict] = Field(
+        None,
+        description="Debug information (only included when expose_debug_info=true)"
+    )
+
+
+# ===================================================================================
+# Assets
+# ===================================================================================
+
+class AssetsInput(WizardStepInput):
+    """Input for /wizard/assets endpoint."""
+
+    # Website content sources
+    website_url: Optional[str] = Field(
+        None,
+        description="Website URL to scrape (will be cached in session)"
+    )
+    website_content: Optional[WebsiteContent] = Field(
+        None,
+        description="Provide website content directly when not using session"
+    )
+
+    # Search method
+    search_method: Literal["scrape", "web_search"] = Field(
+        default="scrape",
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    )
+
+    # Services context (from previous step or direct)
+    services: Optional[List[Service]] = Field(
+        None,
+        description="Services from previous step or provided directly"
+    )
+
+    # Generation parameters
+    language: str = Field(
+        default="en",
+        description="Output language (en/sk/cs)"
+    )
+    number_of_assets: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Target number of assets to generate (1-50)"
+    )
+
+    # Optional context for better generation
+    organization_profile: Optional[OrganizationProfile] = Field(
+        None,
+        description="Optional organization data (name, address, employees, etc.)"
+    )
+
+    # Refinement (for iterating on previous results)
+    previous_assets: Optional[List[Asset]] = Field(
+        None,
+        description="Optional previous assets for refinement; if omitted and user_instructions provided, loaded from session"
+    )
+    user_instructions: Optional[str] = Field(
+        None,
+        description="User instructions for refining previous assets"
+    )
+
+
+class AssetsOutput(BaseModel):
+    """Output for assets generation."""
+    model_config = ConfigDict(extra="forbid")
+
+    assets: List[Asset] = Field(
+        ...,
+        description="List of generated IT and business assets"
+    )
+    debug: Optional[dict] = Field(
+        None,
+        description="Debug information (only included when expose_debug_info=true)"
+    )
+
+
+# ===================================================================================
+# Impacts
+# ===================================================================================
+
+class ImpactsInput(WizardStepInput):
+    """Input for /wizard/impacts endpoint."""
+
+    # Assets context (from previous step or direct)
+    assets: Optional[List[Asset]] = Field(
+        None,
+        description="Assets from previous step or provided directly"
+    )
+
+    # Services context (optional, for better impact evaluation)
+    services: Optional[List[Service]] = Field(
+        None,
+        description="Optional services for context"
+    )
+
+    # Generation parameters
+    language: str = Field(
+        default="en",
+        description="Output language (en/sk/cs)"
+    )
+
+    # Optional context for better generation
+    organization_profile: Optional[OrganizationProfile] = Field(
+        None,
+        description="Optional organization data (name, address, employees, etc.)"
+    )
+
+    # Refinement (for iterating on previous results)
+    user_instructions: Optional[str] = Field(
+        None,
+        description="User instructions for refining impact evaluations"
+    )
+
+
+class ImpactsOutput(BaseModel):
+    """Output for impact evaluations."""
+    model_config = ConfigDict(extra="forbid")
+
+    asset_impacts: List[AssetImpact] = Field(
+        ...,
+        description="List of assets with their impact evaluations"
+    )
+    debug: Optional[dict] = Field(
+        None,
+        description="Debug information (only included when expose_debug_info=true)"
+    )
+
+
+# ===================================================================================
+# Risks
+# ===================================================================================
+
+class RisksInput(WizardStepInput):
+    """Input for /wizard/risks endpoint."""
+
+    # Assets context (from previous step or direct)
+    assets: Optional[List[Asset]] = Field(
+        None,
+        description="Assets from previous step or provided directly"
+    )
+
+    # Asset impacts context (optional, for better risk evaluation)
+    asset_impacts: Optional[List[AssetImpact]] = Field(
+        None,
+        description="Optional asset impacts from previous step for context"
+    )
+
+    # Services context (optional, for better risk evaluation)
+    services: Optional[List[Service]] = Field(
+        None,
+        description="Optional services for context"
+    )
+
+    # Generation parameters
+    language: str = Field(
+        default="en",
+        description="Output language (en/sk/cs)"
+    )
+
+    # Optional context for better generation
+    organization_profile: Optional[OrganizationProfile] = Field(
+        None,
+        description="Optional organization data (name, address, employees, etc.)"
+    )
+
+    # Refinement (for iterating on previous results)
+    user_instructions: Optional[str] = Field(
+        None,
+        description="User instructions for refining risk evaluations"
+    )
+
+
+class RisksOutput(BaseModel):
+    """Output for risk evaluations."""
+    model_config = ConfigDict(extra="forbid")
+
+    asset_risks: List[AssetRisk] = Field(
+        ...,
+        description="List of assets with their risk evaluations (threat + probability)"
+    )
+    debug: Optional[dict] = Field(
+        None,
+        description="Debug information (only included when expose_debug_info=true)"
+    )
+
+
+# ===================================================================================
+# Controls
+# ===================================================================================
+
+class ControlsInput(WizardStepInput):
+    """Input for /wizard/controls endpoint."""
+
+    # Assets context (from previous step or direct)
+    assets: Optional[List[Asset]] = Field(
+        None,
+        description="Assets from previous step or provided directly"
+    )
+
+    # Asset risks context (REQUIRED - from previous step or direct)
+    asset_risks: Optional[List[AssetRisk]] = Field(
+        None,
+        description="Asset risks from previous step (REQUIRED)"
+    )
+
+    # Generation parameters
+    language: str = Field(
+        default="en",
+        description="Output language (en/sk/cs)"
+    )
+    max_controls_per_asset: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="Maximum controls per asset (1-10)"
+    )
+
+    # Optional context for better generation
+    organization_profile: Optional[OrganizationProfile] = Field(
+        None,
+        description="Optional organization data (name, address, employees, etc.)"
+    )
+
+    # Refinement (for iterating on previous results)
+    user_instructions: Optional[str] = Field(
+        None,
+        description="User instructions for control selection (e.g., 'Focus on low-cost controls')"
+    )
+
+
+class ControlsOutput(BaseModel):
+    """Output for control recommendations."""
+    model_config = ConfigDict(extra="forbid")
+
+    asset_controls: List[AssetControls] = Field(
+        ...,
+        description="List of assets with their selected controls (with costs and threat coverage)"
+    )
+    debug: Optional[dict] = Field(
+        None,
+        description="Debug information (only included when expose_debug_info=true)"
+    )
+
+
+# ===================================================================================
+# Evaluation (Meta-Endpoint)
+# ===================================================================================
+
+class StepTiming(BaseModel):
+    """Timing information for a single wizard step."""
+    model_config = ConfigDict(extra="forbid")
+
+    step_name: str = Field(..., description="Step name (services/assets/impacts/risks/controls)")
+    processing_time_ms: int = Field(..., description="Processing time in milliseconds")
+    success: bool = Field(..., description="Whether step completed successfully")
+    error: Optional[str] = Field(None, description="Error message if step failed")
+
+
+class EvaluationData(BaseModel):
+    """Combined results from full wizard evaluation."""
+    model_config = ConfigDict(extra="forbid")
+
+    services: Optional[List[Service]] = None
+    assets: Optional[List[Asset]] = None
+    asset_impacts: Optional[List[AssetImpact]] = None
+    asset_risks: Optional[List[AssetRisk]] = None
+    asset_controls: Optional[List[AssetControls]] = None
+
+
+class EvaluationInput(WizardStepInput):
+    """Input for /wizard/evaluation endpoint - runs all 5 wizard steps in sequence."""
+
+    # Website input (required - either url or website_content)
+    website_url: Optional[str] = Field(
+        None,
+        description="Website URL to scrape (will be cached in session)"
+    )
+    website_content: Optional[WebsiteContent] = Field(
+        None,
+        description="Pre-scraped website content (alternative to URL)"
+    )
+
+    # Search method
+    search_method: Literal["scrape", "web_search"] = Field(
+        default="scrape",
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    )
+
+    # Common parameters
+    organization_profile: Optional[OrganizationProfile] = Field(
+        None,
+        description="Optional organization metadata for all steps"
+    )
+    language: str = Field(
+        default="en",
+        description="Output language for all steps (en/sk/cs)"
+    )
+
+    # Step-specific parameters
+    number_of_services: int = Field(
+        default=3,
+        ge=1,
+        le=3,
+        description="Number of services to generate (1-3)"
+    )
+    number_of_assets: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Number of assets to generate (1-50)"
+    )
+    max_controls_per_asset: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="Maximum controls per asset (1-10)"
+    )
+
+    # Control flags
+    skip_existing: bool = Field(
+        default=False,
+        description="Skip steps if data already exists in session"
+    )
+    continue_on_error: bool = Field(
+        default=True,
+        description="Continue even if a step fails (returns partial results)"
+    )
+
+
+class EvaluationOutput(BaseModel):
+    """Output for full wizard evaluation."""
+    model_config = ConfigDict(extra="forbid")
+
+    total_processing_time_ms: int = Field(
+        ...,
+        description="Total processing time for all steps in milliseconds"
+    )
+    data: EvaluationData = Field(
+        ...,
+        description="Results from all wizard steps (fields may be None if steps failed)"
+    )
+    step_timings: List[StepTiming] = Field(
+        ...,
+        description="Per-step timing and success information"
+    )
+    errors: Optional[List[str]] = Field(
+        None,
+        description="List of error messages if any step failed"
+    )
+    debug: Optional[dict] = Field(
+        None,
+        description="Debug information from all steps (only included when expose_debug_info=true)"
+    )
+
+
+# ===================================================================================
+# State Management
+# ===================================================================================
+
+class WizardStateResponse(BaseModel):
+    """Response for GET /wizard/state."""
+    org_id: str
+    user_id: str
+    steps_completed: List[str]
+    data: dict

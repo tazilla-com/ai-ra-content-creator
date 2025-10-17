@@ -1,0 +1,1771 @@
+# workshops_ai/wizard/router.py
+"""
+FastAPI router for AI Wizard endpoints.
+
+Provides endpoints for cybersecurity onboarding workflow:
+- /wizard/services - Generate critical business services
+- /wizard/assets - Generate IT assets for services
+- /wizard/impacts - Evaluate CIA impacts of asset compromise
+- /wizard/risks - Identify and evaluate risks
+- /wizard/controls - Recommend security controls
+- /wizard/evaluation - Overall security evaluation
+- /wizard/state - Get/clear wizard state
+
+Each endpoint:
+- Secured by API key/JWT (reuses existing auth)
+- Accepts input data directly or loads from previous step in session
+- Stores step data in Redis (org_id + user_id keys)
+- Returns structured JSON
+- Supports model override per request
+"""
+from __future__ import annotations
+
+import logging
+import time
+from fastapi import APIRouter, Depends, HTTPException, status, Response, Header
+from typing import Dict, Any, Optional
+
+from workshops_ai.app.security import require_auth
+from workshops_ai.app.services.redis_pool import get_redis
+from workshops_ai.settings import get_settings
+from workshops_ai.wizard.schemas import (
+    # Inputs
+    ServicesInput,
+    AssetsInput,
+    ImpactsInput,
+    RisksInput,
+    ControlsInput,
+    EvaluationInput,
+    # Outputs
+    ServicesOutput,
+    AssetsOutput,
+    ImpactsOutput,
+    RisksOutput,
+    ControlsOutput,
+    EvaluationOutput,
+    # Evaluation specific
+    EvaluationData,
+    StepTiming,
+    # State
+    WizardStateResponse,
+)
+from workshops_ai.wizard.session import (
+    get_wizard_state,
+    save_wizard_step,
+    get_wizard_step,
+    clear_wizard_state,
+)
+from workshops_ai.wizard.llm_helper import call_llm_with_structured_output
+# Note: Old placeholder prompts (SERVICES_PROMPT, etc.) are not used in new implementation
+# New implementation uses ServiceGenerator with prompts from prompts.py
+from workshops_ai.wizard.service_generator import ServiceGenerator
+from workshops_ai.wizard.asset_generator import AssetGenerator
+from workshops_ai.wizard.impact_generator import ImpactGenerator
+from workshops_ai.wizard.risk_generator import RiskGenerator
+from workshops_ai.wizard.control_generator import ControlGenerator
+from workshops_ai.wizard.content_resolver import ContentResolver
+from workshops_ai.wizard.exceptions import ContentNotFoundError
+
+logger = logging.getLogger(__name__)
+
+# Router (auth applied in main.py when mounting)
+router = APIRouter(
+    prefix="/wizard",
+    tags=["wizard"],
+)
+
+
+# =============================================================================
+# Dependencies: Session key and identity extraction
+# =============================================================================
+
+async def get_session_key(
+    identity: Dict[str, Any] = Depends(require_auth),
+    x_org_id: Optional[str] = Header(None, alias="X-Org-ID"),
+    x_user_id: Optional[str] = Header(None, alias="X-User-ID"),
+) -> str:
+    """
+    Dependency: Extract session key from auth identity and headers.
+
+    For API key auth, reads X-Org-ID and X-User-ID headers.
+    For JWT auth, extracts from token claims.
+
+    Returns:
+        Session key in format "wizard:{org_id}:{user_id}"
+
+    Raises:
+        HTTPException: If authentication fails or required fields missing
+    """
+    org_id, user_id = _extract_identity(identity, x_org_id, x_user_id)
+    return f"wizard:{org_id}:{user_id}"
+
+
+def _extract_identity(
+    identity: Dict[str, Any],
+    x_org_id: Optional[str] = None,
+    x_user_id: Optional[str] = None
+) -> tuple[str, str]:
+    """
+    Extract org_id and user_id from auth identity or headers.
+
+    Priority for API key auth:
+    1. X-Org-ID and X-User-ID headers
+    2. Fallback to test values for local development
+
+    Args:
+        identity: Auth identity dict from require_auth
+        x_org_id: Optional org_id from X-Org-ID header
+        x_user_id: Optional user_id from X-User-ID header
+
+    Returns:
+        Tuple of (org_id, user_id)
+
+    Raises:
+        HTTPException: If org_id or user_id missing for JWT auth
+    """
+    # For JWT, extract from claims
+    if identity.get("method") == "jwt":
+        claims = identity.get("claims", {})
+        org_id = claims.get("org_id") or claims.get("organization_id")
+        user_id = claims.get("sub") or claims.get("user_id") or claims.get("uid")
+
+        if not org_id or not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="JWT must contain org_id and sub/user_id claims"
+            )
+
+        return str(org_id), str(user_id)
+
+    # For API key, use headers if provided, otherwise fallback to test values
+    if identity.get("method") == "api_key":
+        # Production: use X-Org-ID and X-User-ID headers
+        if x_org_id and x_user_id:
+            return x_org_id, x_user_id
+
+        # Development fallback: use test values
+        logger.warning(
+            "X-Org-ID and X-User-ID headers not provided, using test values for API key auth",
+            extra={
+                "x_org_id": x_org_id,
+                "x_user_id": x_user_id,
+                "fallback_org": "test_org",
+                "fallback_user": "test_user",
+            }
+        )
+        return "test_org", "test_user"
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Unknown authentication method"
+    )
+
+
+# =============================================================================
+# Endpoints
+# =============================================================================
+
+@router.post(
+    "/services",
+    response_model=ServicesOutput,
+    summary="Generate business services",
+    description="Identify critical business services for the organization"
+)
+async def generate_services(
+    request: ServicesInput,
+    response: Response,
+    session_key: str = Depends(get_session_key),
+) -> ServicesOutput:
+    """
+    Generate critical business services from website content.
+
+    Resolution priority for website content:
+    1. Direct text from request.website_text
+    2. URL scraping from request.website_url (cached in session)
+    3. Cached content from previous request in session
+
+    Args:
+        request: ServicesInput with website content and generation params
+        response: FastAPI Response for injecting headers
+        session_key: Session key from dependency (format: wizard:{org_id}:{user_id})
+
+    Returns:
+        ServicesOutput with generated services and optional debug info
+
+    Raises:
+        ContentNotFoundError: If no website content available
+        AITimeoutError: If LLM request times out
+        AIResponseError: If LLM response invalid
+        ValidationRetriesExhausted: If validation fails after retries
+    """
+    settings = get_settings()
+
+    # Extract org_id and user_id from session_key for logging
+    parts = session_key.split(":")
+    org_id = parts[1] if len(parts) > 1 else "unknown"
+    user_id = parts[2] if len(parts) > 2 else "unknown"
+
+    logger.info(
+        "wizard_services_started",
+        extra={
+            "org_id": org_id,
+            "user_id": user_id,
+            "session_key": session_key,
+            "model": request.ai_model,
+            "language": request.language,
+            "number_of_services": request.number_of_services,
+        }
+    )
+
+    # Initialize components
+    redis = await get_redis()
+    content_resolver = ContentResolver(redis)
+    service_generator = ServiceGenerator(model=request.ai_model)
+
+    # Step 1: Resolve website content
+    try:
+        website_content, content_metadata = await content_resolver.resolve_content(
+            session_key=session_key,
+            website_text=request.website_content.content if request.website_content else None,
+            website_url=request.website_url,
+            search_method=request.search_method,
+            ai_model=request.ai_model,
+        )
+
+        logger.info(
+            "content_resolved",
+            extra={
+                "session_key": session_key,
+                "source": content_metadata.get("source"),
+                "content_length": content_metadata.get("content_length"),
+            }
+        )
+
+    except ContentNotFoundError as e:
+        logger.error(
+            "content_resolution_failed",
+            extra={
+                "session_key": session_key,
+                "error": str(e),
+            }
+        )
+        raise
+
+    # Step 2: Build organization profile from request
+    organization_profile = None
+    if request.organization_profile:
+        organization_profile = {
+            "name": request.organization_profile.name,
+            "industry": request.organization_profile.industry,
+            "address": request.organization_profile.address,
+            "employees": request.organization_profile.employees,
+        }
+
+    # Step 3: Load previous services from session (if refining)
+    previous_services = None
+    if request.user_instructions:
+        # User is refining - load previous services
+        previous_step = await get_wizard_step(org_id, user_id, "services")
+        if previous_step and previous_step.get("services"):
+            from workshops_ai.wizard.schemas import Service
+            previous_services = [
+                Service(**s) for s in previous_step["services"]
+            ]
+            logger.info(
+                "previous_services_loaded",
+                extra={
+                    "session_key": session_key,
+                    "count": len(previous_services),
+                }
+            )
+
+    # Step 4: Generate services with LLM
+    try:
+        services, usage_metrics, debug_info = await service_generator.generate_services(
+            website_content=website_content,
+            language=request.language,
+            number_of_services=request.number_of_services,
+            organization_profile=organization_profile,
+            user_instructions=request.user_instructions,
+            previous_services=previous_services,
+        )
+
+        logger.info(
+            "services_generated",
+            extra={
+                "session_key": session_key,
+                "services_count": len(services),
+                "tokens": usage_metrics.total_tokens,
+                "cost_usd": usage_metrics.cost_usd,
+            }
+        )
+
+    except Exception as e:
+        logger.error(
+            "service_generation_failed",
+            extra={
+                "session_key": session_key,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+        )
+        raise
+
+    # Step 5: Save to session
+    step_data = {
+        "services": [s.model_dump() for s in services],
+        "language": request.language,
+        "model": service_generator.model_name,
+        "usage": usage_metrics.model_dump(),
+    }
+
+    await save_wizard_step(org_id, user_id, "services", step_data)
+
+    logger.info(
+        "services_saved_to_session",
+        extra={"session_key": session_key}
+    )
+
+    # Step 6: Add response headers (if enabled)
+    if settings.wizard.expose_debug_info:
+        # GPT headers (per-request metrics)
+        response.headers["X-GPT-Model"] = service_generator.model_name
+        response.headers["X-GPT-Tokens-Prompt"] = str(usage_metrics.prompt_tokens)
+        response.headers["X-GPT-Tokens-Completion"] = str(usage_metrics.completion_tokens)
+        response.headers["X-GPT-Tokens-Total"] = str(usage_metrics.total_tokens)
+        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
+
+        # Wizard headers (session-level metrics)
+        response.headers["X-Wizard-Session-Key"] = session_key
+        response.headers["X-Wizard-Content-Source"] = content_metadata.get("source", "unknown")
+
+    # Step 7: Build response
+    output = ServicesOutput(services=services)
+
+    # Include debug info if enabled
+    if settings.wizard.expose_debug_info:
+        output.debug = {
+            "model": service_generator.model_name,
+            "usage": usage_metrics.model_dump(),
+            "content_source": content_metadata.get("source"),
+            "content_length": content_metadata.get("content_length"),
+            "prompt_preview": debug_info.get("prompt_text", "")[:500],
+            "response_preview": debug_info.get("response_text", "")[:500],
+        }
+
+    logger.info(
+        "wizard_services_completed",
+        extra={
+            "session_key": session_key,
+            "services_count": len(services),
+        }
+    )
+
+    return output
+
+
+@router.post(
+    "/assets",
+    response_model=AssetsOutput,
+    summary="Generate IT assets",
+    description="Identify IT assets that support business services"
+)
+async def generate_assets(
+    request: AssetsInput,
+    response: Response,
+    session_key: str = Depends(get_session_key),
+) -> AssetsOutput:
+    """
+    Generate IT and business assets from services and website content.
+
+    Resolution priority for content:
+    1. Services from request.services (direct)
+    2. Services from session (previous step)
+    3. Website content for additional context
+
+    Args:
+        request: AssetsInput with services, website content, and generation params
+        response: FastAPI Response for injecting headers
+        session_key: Session key from dependency (format: wizard:{org_id}:{user_id})
+
+    Returns:
+        AssetsOutput with generated assets and optional debug info
+
+    Raises:
+        ContentNotFoundError: If no website content available
+        AITimeoutError: If LLM request times out
+        AIResponseError: If LLM response invalid
+        ValidationRetriesExhausted: If validation fails after retries
+    """
+    settings = get_settings()
+
+    # Extract org_id and user_id from session_key for logging
+    parts = session_key.split(":")
+    org_id = parts[1] if len(parts) > 1 else "unknown"
+    user_id = parts[2] if len(parts) > 2 else "unknown"
+
+    logger.info(
+        "wizard_assets_started",
+        extra={
+            "org_id": org_id,
+            "user_id": user_id,
+            "session_key": session_key,
+            "model": request.ai_model,
+            "language": request.language,
+            "number_of_assets": request.number_of_assets,
+        }
+    )
+
+    # Initialize components
+    redis = await get_redis()
+    content_resolver = ContentResolver(redis)
+    asset_generator = AssetGenerator(model=request.ai_model)
+
+    # Step 1: Resolve services (from request or previous step)
+    services = request.services
+    if not services:
+        services_step = await get_wizard_step(org_id, user_id, "services")
+        if services_step and services_step.get("services"):
+            from workshops_ai.wizard.schemas import Service
+            services = [
+                Service(**s) for s in services_step["services"]
+            ]
+            logger.info(
+                "services_loaded_from_session",
+                extra={
+                    "session_key": session_key,
+                    "count": len(services),
+                }
+            )
+
+    # Step 2: Resolve website content (optional additional context)
+    website_content = ""
+    content_metadata = {"source": "none"}
+
+    try:
+        website_content, content_metadata = await content_resolver.resolve_content(
+            session_key=session_key,
+            website_text=request.website_content.content if request.website_content else None,
+            website_url=request.website_url,
+            search_method=request.search_method,
+            ai_model=request.ai_model,
+        )
+
+        logger.info(
+            "content_resolved",
+            extra={
+                "session_key": session_key,
+                "source": content_metadata.get("source"),
+                "content_length": content_metadata.get("content_length"),
+            }
+        )
+
+    except ContentNotFoundError:
+        # Website content is optional for assets (services are primary input)
+        logger.info(
+            "no_website_content_available",
+            extra={"session_key": session_key}
+        )
+
+    # Step 3: Build organization profile from request
+    organization_profile = None
+    if request.organization_profile:
+        organization_profile = {
+            "name": request.organization_profile.name,
+            "industry": request.organization_profile.industry,
+            "address": request.organization_profile.address,
+            "employees": request.organization_profile.employees,
+        }
+
+    # Step 4: Load previous assets from session (if refining)
+    previous_assets = request.previous_assets
+    if not previous_assets and request.user_instructions:
+        # User is refining - load previous assets
+        previous_step = await get_wizard_step(org_id, user_id, "assets")
+        if previous_step and previous_step.get("assets"):
+            from workshops_ai.api.schema.asset import Asset
+            previous_assets = [
+                Asset(**a) for a in previous_step["assets"]
+            ]
+            logger.info(
+                "previous_assets_loaded",
+                extra={
+                    "session_key": session_key,
+                    "count": len(previous_assets),
+                }
+            )
+
+    # Step 5: Generate assets with LLM
+    try:
+        assets, usage_metrics, debug_info = await asset_generator.generate_assets(
+            website_content=website_content,
+            language=request.language,
+            number_of_assets=request.number_of_assets,
+            services=services,
+            organization_profile=organization_profile,
+            user_instructions=request.user_instructions,
+            previous_assets=previous_assets,
+        )
+
+        logger.info(
+            "assets_generated",
+            extra={
+                "session_key": session_key,
+                "assets_count": len(assets),
+                "tokens": usage_metrics.total_tokens,
+                "cost_usd": usage_metrics.cost_usd,
+            }
+        )
+
+    except Exception as e:
+        logger.error(
+            "asset_generation_failed",
+            extra={
+                "session_key": session_key,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+        )
+        raise
+
+    # Step 6: Save to session
+    step_data = {
+        "assets": [a.model_dump() for a in assets],
+        "language": request.language,
+        "model": asset_generator.model_name,
+        "usage": usage_metrics.model_dump(),
+    }
+
+    await save_wizard_step(org_id, user_id, "assets", step_data)
+
+    logger.info(
+        "assets_saved_to_session",
+        extra={"session_key": session_key}
+    )
+
+    # Step 7: Add response headers (if enabled)
+    if settings.wizard.expose_debug_info:
+        # GPT headers (per-request metrics)
+        response.headers["X-GPT-Model"] = asset_generator.model_name
+        response.headers["X-GPT-Tokens-Prompt"] = str(usage_metrics.prompt_tokens)
+        response.headers["X-GPT-Tokens-Completion"] = str(usage_metrics.completion_tokens)
+        response.headers["X-GPT-Tokens-Total"] = str(usage_metrics.total_tokens)
+        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
+
+        # Wizard headers (session-level metrics)
+        response.headers["X-Wizard-Session-Key"] = session_key
+        response.headers["X-Wizard-Content-Source"] = content_metadata.get("source", "unknown")
+
+    # Step 8: Build response
+    output = AssetsOutput(assets=assets)
+
+    # Include debug info if enabled
+    if settings.wizard.expose_debug_info:
+        output.debug = {
+            "model": asset_generator.model_name,
+            "usage": usage_metrics.model_dump(),
+            "content_source": content_metadata.get("source"),
+            "content_length": content_metadata.get("content_length"),
+            "services_count": len(services) if services else 0,
+            "prompt_preview": debug_info.get("prompt_text", "")[:500],
+            "response_preview": debug_info.get("response_text", "")[:500],
+            "allowed_asset_types": debug_info.get("allowed_asset_types", []),
+        }
+
+    logger.info(
+        "wizard_assets_completed",
+        extra={
+            "session_key": session_key,
+            "assets_count": len(assets),
+        }
+    )
+
+    return output
+
+
+@router.post(
+    "/impacts",
+    response_model=ImpactsOutput,
+    summary="Evaluate asset impacts",
+    description="Evaluate impact severity levels for each asset based on official Impact catalog"
+)
+async def generate_impacts(
+    request: ImpactsInput,
+    response: Response,
+    session_key: str = Depends(get_session_key),
+) -> ImpactsOutput:
+    """
+    Generate impact evaluations for assets using catalog-based approach.
+
+    Resolution priority for content:
+    1. Assets from request.assets (direct)
+    2. Assets from session (previous step)
+    3. Services and organization profile for context
+
+    Args:
+        request: ImpactsInput with assets and generation params
+        response: FastAPI Response for injecting headers
+        session_key: Session key from dependency (format: wizard:{org_id}:{user_id})
+
+    Returns:
+        ImpactsOutput with asset impact evaluations and optional debug info
+
+    Raises:
+        HTTPException: If no assets available
+        AITimeoutError: If LLM request times out
+        AIResponseError: If LLM response invalid
+        ValidationRetriesExhausted: If validation fails after retries
+    """
+    settings = get_settings()
+
+    # Extract org_id and user_id from session_key for logging
+    parts = session_key.split(":")
+    org_id = parts[1] if len(parts) > 1 else "unknown"
+    user_id = parts[2] if len(parts) > 2 else "unknown"
+
+    logger.info(
+        "wizard_impacts_started",
+        extra={
+            "org_id": org_id,
+            "user_id": user_id,
+            "session_key": session_key,
+            "model": request.ai_model,
+            "language": request.language,
+        }
+    )
+
+    # Initialize components
+    impact_generator = ImpactGenerator(model=request.ai_model)
+
+    # Step 1: Resolve assets (from request or previous step)
+    assets = request.assets
+    if not assets:
+        assets_step = await get_wizard_step(org_id, user_id, "assets")
+        if assets_step and assets_step.get("assets"):
+            from workshops_ai.api.schema.asset import Asset
+            assets = [
+                Asset(**a) for a in assets_step["assets"]
+            ]
+            logger.info(
+                "assets_loaded_from_session",
+                extra={
+                    "session_key": session_key,
+                    "count": len(assets),
+                }
+            )
+
+    # Validate we have assets
+    if not assets:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No assets provided and none found in session"
+        )
+
+    # Step 2: Resolve services (optional, for context)
+    services = request.services
+    if not services:
+        services_step = await get_wizard_step(org_id, user_id, "services")
+        if services_step and services_step.get("services"):
+            from workshops_ai.wizard.schemas import Service
+            services = [
+                Service(**s) for s in services_step["services"]
+            ]
+            logger.info(
+                "services_loaded_from_session",
+                extra={
+                    "session_key": session_key,
+                    "count": len(services),
+                }
+            )
+
+    # Step 3: Build organization profile from request
+    organization_profile = None
+    if request.organization_profile:
+        organization_profile = {
+            "name": request.organization_profile.name,
+            "industry": request.organization_profile.industry,
+            "address": request.organization_profile.address,
+            "employees": request.organization_profile.employees,
+        }
+
+    # Step 4: Generate impact evaluations with LLM
+    try:
+        asset_impacts, usage_metrics, debug_info = await impact_generator.generate_asset_impacts(
+            assets=assets,
+            language=request.language,
+            organization_profile=organization_profile,
+            services=services,
+            user_instructions=request.user_instructions,
+        )
+
+        logger.info(
+            "impacts_generated",
+            extra={
+                "session_key": session_key,
+                "assets_count": len(assets),
+                "asset_impacts_count": len(asset_impacts),
+                "tokens": usage_metrics.total_tokens,
+                "cost_usd": usage_metrics.cost_usd,
+            }
+        )
+
+    except Exception as e:
+        logger.error(
+            "impact_generation_failed",
+            extra={
+                "session_key": session_key,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+        )
+        raise
+
+    # Step 5: Save to session
+    step_data = {
+        "asset_impacts": [ai.model_dump() for ai in asset_impacts],
+        "language": request.language,
+        "model": impact_generator.model_name,
+        "usage": usage_metrics.model_dump(),
+    }
+
+    await save_wizard_step(org_id, user_id, "impacts", step_data)
+
+    logger.info(
+        "impacts_saved_to_session",
+        extra={"session_key": session_key}
+    )
+
+    # Step 6: Add response headers (if enabled)
+    if settings.wizard.expose_debug_info:
+        # GPT headers (per-request metrics)
+        response.headers["X-GPT-Model"] = impact_generator.model_name
+        response.headers["X-GPT-Tokens-Prompt"] = str(usage_metrics.prompt_tokens)
+        response.headers["X-GPT-Tokens-Completion"] = str(usage_metrics.completion_tokens)
+        response.headers["X-GPT-Tokens-Total"] = str(usage_metrics.total_tokens)
+        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
+
+        # Wizard headers (session-level metrics)
+        response.headers["X-Wizard-Session-Key"] = session_key
+
+    # Step 7: Build response
+    output = ImpactsOutput(asset_impacts=asset_impacts)
+
+    # Include debug info if enabled
+    if settings.wizard.expose_debug_info:
+        output.debug = {
+            "model": impact_generator.model_name,
+            "usage": usage_metrics.model_dump(),
+            "assets_processed": debug_info.get("assets_processed"),
+            "catalog_impacts_count": debug_info.get("catalog_impacts_count"),
+            "services_count": len(services) if services else 0,
+            "last_prompt_preview": debug_info.get("last_prompt_preview", "")[:500],
+            "last_response_preview": debug_info.get("last_response_preview", "")[:500],
+        }
+
+    logger.info(
+        "wizard_impacts_completed",
+        extra={
+            "session_key": session_key,
+            "asset_impacts_count": len(asset_impacts),
+        }
+    )
+
+    return output
+
+
+@router.post(
+    "/risks",
+    response_model=RisksOutput,
+    summary="Evaluate asset risks",
+    description="Evaluate risk probability levels for each asset based on official Threat catalog"
+)
+async def generate_risks(
+    request: RisksInput,
+    response: Response,
+    session_key: str = Depends(get_session_key),
+) -> RisksOutput:
+    """
+    Generate risk evaluations for assets using catalog-based approach.
+
+    Resolution priority for content:
+    1. Assets from request.assets (direct)
+    2. Assets from session (previous step)
+    3. Asset impacts, services, and organization profile for context
+
+    Args:
+        request: RisksInput with assets and generation params
+        response: FastAPI Response for injecting headers
+        session_key: Session key from dependency (format: wizard:{org_id}:{user_id})
+
+    Returns:
+        RisksOutput with asset risk evaluations and optional debug info
+
+    Raises:
+        HTTPException: If no assets available
+        AITimeoutError: If LLM request times out
+        AIResponseError: If LLM response invalid
+        ValidationRetriesExhausted: If validation fails after retries
+    """
+    settings = get_settings()
+
+    # Extract org_id and user_id from session_key for logging
+    parts = session_key.split(":")
+    org_id = parts[1] if len(parts) > 1 else "unknown"
+    user_id = parts[2] if len(parts) > 2 else "unknown"
+
+    logger.info(
+        "wizard_risks_started",
+        extra={
+            "org_id": org_id,
+            "user_id": user_id,
+            "session_key": session_key,
+            "model": request.ai_model,
+            "language": request.language,
+        }
+    )
+
+    # Initialize components
+    risk_generator = RiskGenerator(model=request.ai_model)
+
+    # Step 1: Resolve assets (from request or previous step)
+    assets = request.assets
+    if not assets:
+        assets_step = await get_wizard_step(org_id, user_id, "assets")
+        if assets_step and assets_step.get("assets"):
+            from workshops_ai.api.schema.asset import Asset
+            assets = [
+                Asset(**a) for a in assets_step["assets"]
+            ]
+            logger.info(
+                "assets_loaded_from_session",
+                extra={
+                    "session_key": session_key,
+                    "count": len(assets),
+                }
+            )
+
+    # Validate we have assets
+    if not assets:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No assets provided and none found in session"
+        )
+
+    # Step 2: Resolve asset impacts (optional, for context)
+    asset_impacts = request.asset_impacts
+    if not asset_impacts:
+        impacts_step = await get_wizard_step(org_id, user_id, "impacts")
+        if impacts_step and impacts_step.get("asset_impacts"):
+            from workshops_ai.api.schema.impact import AssetImpact
+            asset_impacts = [
+                AssetImpact(**ai) for ai in impacts_step["asset_impacts"]
+            ]
+            logger.info(
+                "asset_impacts_loaded_from_session",
+                extra={
+                    "session_key": session_key,
+                    "count": len(asset_impacts),
+                }
+            )
+
+    # Step 3: Resolve services (optional, for context)
+    services = request.services
+    if not services:
+        services_step = await get_wizard_step(org_id, user_id, "services")
+        if services_step and services_step.get("services"):
+            from workshops_ai.wizard.schemas import Service
+            services = [
+                Service(**s) for s in services_step["services"]
+            ]
+            logger.info(
+                "services_loaded_from_session",
+                extra={
+                    "session_key": session_key,
+                    "count": len(services),
+                }
+            )
+
+    # Step 4: Build organization profile from request
+    organization_profile = None
+    if request.organization_profile:
+        organization_profile = {
+            "name": request.organization_profile.name,
+            "industry": request.organization_profile.industry,
+            "address": request.organization_profile.address,
+            "employees": request.organization_profile.employees,
+        }
+
+    # Step 5: Generate risk evaluations with LLM
+    try:
+        asset_risks, usage_metrics, debug_info = await risk_generator.generate_asset_risks(
+            assets=assets,
+            language=request.language,
+            organization_profile=organization_profile,
+            services=services,
+            asset_impacts=asset_impacts,
+            user_instructions=request.user_instructions,
+        )
+
+        logger.info(
+            "risks_generated",
+            extra={
+                "session_key": session_key,
+                "assets_count": len(assets),
+                "asset_risks_count": len(asset_risks),
+                "tokens": usage_metrics.total_tokens,
+                "cost_usd": usage_metrics.cost_usd,
+            }
+        )
+
+    except Exception as e:
+        logger.error(
+            "risk_generation_failed",
+            extra={
+                "session_key": session_key,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+        )
+        raise
+
+    # Step 6: Save to session
+    step_data = {
+        "asset_risks": [ar.model_dump() for ar in asset_risks],
+        "language": request.language,
+        "model": risk_generator.model_name,
+        "usage": usage_metrics.model_dump(),
+    }
+
+    await save_wizard_step(org_id, user_id, "risks", step_data)
+
+    logger.info(
+        "risks_saved_to_session",
+        extra={"session_key": session_key}
+    )
+
+    # Step 7: Add response headers (if enabled)
+    if settings.wizard.expose_debug_info:
+        # GPT headers (per-request metrics)
+        response.headers["X-GPT-Model"] = risk_generator.model_name
+        response.headers["X-GPT-Tokens-Prompt"] = str(usage_metrics.prompt_tokens)
+        response.headers["X-GPT-Tokens-Completion"] = str(usage_metrics.completion_tokens)
+        response.headers["X-GPT-Tokens-Total"] = str(usage_metrics.total_tokens)
+        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
+
+        # Wizard headers (session-level metrics)
+        response.headers["X-Wizard-Session-Key"] = session_key
+
+    # Step 8: Build response
+    output = RisksOutput(asset_risks=asset_risks)
+
+    # Include debug info if enabled
+    if settings.wizard.expose_debug_info:
+        output.debug = {
+            "model": risk_generator.model_name,
+            "usage": usage_metrics.model_dump(),
+            "assets_processed": debug_info.get("assets_processed"),
+            "catalog_threats_total": debug_info.get("catalog_threats_total"),
+            "threats_per_asset": debug_info.get("threats_per_asset"),
+            "priors_available": debug_info.get("priors_available"),
+            "priors_count": debug_info.get("priors_count"),
+            "services_count": len(services) if services else 0,
+            "asset_impacts_count": len(asset_impacts) if asset_impacts else 0,
+            "last_prompt_preview": debug_info.get("last_prompt_preview", "")[:500],
+            "last_response_preview": debug_info.get("last_response_preview", "")[:500],
+        }
+
+    logger.info(
+        "wizard_risks_completed",
+        extra={
+            "session_key": session_key,
+            "asset_risks_count": len(asset_risks),
+        }
+    )
+
+    return output
+
+
+@router.post(
+    "/controls",
+    response_model=ControlsOutput,
+    summary="Recommend security controls",
+    description="Recommend security controls to mitigate identified risks using hybrid catalog + AI approach"
+)
+async def generate_controls(
+    request: ControlsInput,
+    response: Response,
+    session_key: str = Depends(get_session_key),
+) -> ControlsOutput:
+    """
+    Generate control recommendations for assets using hybrid catalog + AI approach.
+
+    Resolution priority for content:
+    1. Assets from request.assets (direct)
+    2. Assets from session (previous step)
+    3. Asset risks from request.asset_risks (REQUIRED - direct)
+    4. Asset risks from session (previous step)
+
+    Args:
+        request: ControlsInput with assets, asset risks, and generation params
+        response: FastAPI Response for injecting headers
+        session_key: Session key from dependency (format: wizard:{org_id}:{user_id})
+
+    Returns:
+        ControlsOutput with asset control recommendations and optional debug info
+
+    Raises:
+        HTTPException: If no assets or asset risks available
+        AITimeoutError: If LLM request times out
+        AIResponseError: If LLM response invalid
+        ValidationRetriesExhausted: If validation fails after retries
+    """
+    settings = get_settings()
+
+    # Extract org_id and user_id from session_key for logging
+    parts = session_key.split(":")
+    org_id = parts[1] if len(parts) > 1 else "unknown"
+    user_id = parts[2] if len(parts) > 2 else "unknown"
+
+    logger.info(
+        "wizard_controls_started",
+        extra={
+            "org_id": org_id,
+            "user_id": user_id,
+            "session_key": session_key,
+            "model": request.ai_model,
+            "language": request.language,
+            "max_controls_per_asset": request.max_controls_per_asset,
+        }
+    )
+
+    # Initialize components
+    control_generator = ControlGenerator(model=request.ai_model)
+
+    # Step 1: Resolve assets (from request or previous step)
+    assets = request.assets
+    if not assets:
+        assets_step = await get_wizard_step(org_id, user_id, "assets")
+        if assets_step and assets_step.get("assets"):
+            from workshops_ai.api.schema.asset import Asset
+            assets = [
+                Asset(**a) for a in assets_step["assets"]
+            ]
+            logger.info(
+                "assets_loaded_from_session",
+                extra={
+                    "session_key": session_key,
+                    "count": len(assets),
+                }
+            )
+
+    # Validate we have assets
+    if not assets:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No assets provided and none found in session"
+        )
+
+    # Step 2: Resolve asset risks (REQUIRED - from request or previous step)
+    asset_risks = request.asset_risks
+    if not asset_risks:
+        risks_step = await get_wizard_step(org_id, user_id, "risks")
+        if risks_step and risks_step.get("asset_risks"):
+            from workshops_ai.api.schema.threat import AssetRisk
+            asset_risks = [
+                AssetRisk(**ar) for ar in risks_step["asset_risks"]
+            ]
+            logger.info(
+                "asset_risks_loaded_from_session",
+                extra={
+                    "session_key": session_key,
+                    "count": len(asset_risks),
+                }
+            )
+
+    # Validate we have asset risks
+    if not asset_risks:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No asset risks provided and none found in session. Run /wizard/risks first."
+        )
+
+    # Step 3: Build organization profile from request (optional)
+    organization_profile = None
+    if request.organization_profile:
+        organization_profile = {
+            "name": request.organization_profile.name,
+            "industry": request.organization_profile.industry,
+            "address": request.organization_profile.address,
+            "employees": request.organization_profile.employees,
+        }
+
+    # Step 4: Generate control recommendations with LLM
+    try:
+        asset_controls, usage_metrics, debug_info = await control_generator.generate_asset_controls(
+            assets=assets,
+            asset_risks=asset_risks,
+            language=request.language,
+            max_controls_per_asset=request.max_controls_per_asset,
+            user_instructions=request.user_instructions,
+        )
+
+        logger.info(
+            "controls_generated",
+            extra={
+                "session_key": session_key,
+                "assets_count": len(assets),
+                "asset_controls_count": len(asset_controls),
+                "tokens": usage_metrics.total_tokens,
+                "cost_usd": usage_metrics.cost_usd,
+            }
+        )
+
+    except Exception as e:
+        logger.error(
+            "control_generation_failed",
+            extra={
+                "session_key": session_key,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+        )
+        raise
+
+    # Step 5: Save to session
+    step_data = {
+        "asset_controls": [ac.model_dump() for ac in asset_controls],
+        "language": request.language,
+        "model": control_generator.model_name,
+        "usage": usage_metrics.model_dump(),
+    }
+
+    await save_wizard_step(org_id, user_id, "controls", step_data)
+
+    logger.info(
+        "controls_saved_to_session",
+        extra={"session_key": session_key}
+    )
+
+    # Step 6: Add response headers (if enabled)
+    if settings.wizard.expose_debug_info:
+        # GPT headers (per-request metrics)
+        response.headers["X-GPT-Model"] = control_generator.model_name
+        response.headers["X-GPT-Tokens-Prompt"] = str(usage_metrics.prompt_tokens)
+        response.headers["X-GPT-Tokens-Completion"] = str(usage_metrics.completion_tokens)
+        response.headers["X-GPT-Tokens-Total"] = str(usage_metrics.total_tokens)
+        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
+
+        # Wizard headers (session-level metrics)
+        response.headers["X-Wizard-Session-Key"] = session_key
+
+    # Step 7: Build response
+    output = ControlsOutput(asset_controls=asset_controls)
+
+    # Include debug info if enabled
+    if settings.wizard.expose_debug_info:
+        output.debug = {
+            "model": control_generator.model_name,
+            "usage": usage_metrics.model_dump(),
+            "assets_processed": debug_info.get("assets_processed"),
+            "assets_skipped": debug_info.get("assets_skipped"),
+            "catalog_controls_total": debug_info.get("catalog_controls_total"),
+            "max_controls_per_asset": debug_info.get("max_controls_per_asset"),
+            "last_prompt_preview": debug_info.get("last_prompt_preview", "")[:500],
+            "last_response_preview": debug_info.get("last_response_preview", "")[:500],
+        }
+
+    logger.info(
+        "wizard_controls_completed",
+        extra={
+            "session_key": session_key,
+            "asset_controls_count": len(asset_controls),
+        }
+    )
+
+    return output
+
+
+@router.post(
+    "/evaluation",
+    response_model=EvaluationOutput,
+    summary="Full wizard evaluation",
+    description="Run complete wizard flow: services → assets → impacts → risks → controls (returns partial results if any step fails)"
+)
+async def generate_evaluation(
+    request: EvaluationInput,
+    response: Response,
+    session_key: str = Depends(get_session_key),
+) -> EvaluationOutput:
+    """
+    Run complete wizard evaluation: services → assets → impacts → risks → controls.
+
+    This meta-endpoint orchestrates all 5 wizard steps in a single API call.
+    Returns partial results if any step fails and continue_on_error=True.
+
+    Args:
+        request: EvaluationInput with website content and generation params
+        response: FastAPI Response for injecting headers
+        session_key: Session key from dependency (format: wizard:{org_id}:{user_id})
+
+    Returns:
+        EvaluationOutput with all step results, timings, and optional errors
+
+    Raises:
+        HTTPException: If no website content provided or step fails with continue_on_error=False
+    """
+    settings = get_settings()
+    start_total = time.time()
+
+    # Extract org_id and user_id from session_key
+    parts = session_key.split(":")
+    org_id = parts[1] if len(parts) > 1 else "unknown"
+    user_id = parts[2] if len(parts) > 2 else "unknown"
+
+    logger.info(
+        "wizard_evaluation_started",
+        extra={
+            "org_id": org_id,
+            "user_id": user_id,
+            "session_key": session_key,
+            "model": request.ai_model,
+            "language": request.language,
+            "skip_existing": request.skip_existing,
+            "continue_on_error": request.continue_on_error,
+        }
+    )
+
+    # Track results and timings
+    results = EvaluationData()
+    timings = []
+    errors = []
+    debug_prompts = {}
+
+    # Initialize components
+    redis = await get_redis()
+    content_resolver = ContentResolver(redis)
+
+    # Build organization profile once
+    organization_profile = None
+    if request.organization_profile:
+        organization_profile = {
+            "name": request.organization_profile.name,
+            "industry": request.organization_profile.industry,
+            "address": request.organization_profile.address,
+            "employees": request.organization_profile.employees,
+        }
+
+    # ==========================================================================
+    # Step 1: Services
+    # ==========================================================================
+    try:
+        start = time.time()
+
+        # Check skip_existing
+        if request.skip_existing:
+            existing = await get_wizard_step(org_id, user_id, "services")
+            if existing and existing.get("services"):
+                from workshops_ai.wizard.schemas import Service
+                results.services = [Service(**s) for s in existing["services"]]
+                timings.append(StepTiming(
+                    step_name="services",
+                    processing_time_ms=0,
+                    success=True,
+                    error="Skipped - using existing data"
+                ))
+                logger.info(
+                    "evaluate_step_skipped",
+                    extra={"session_key": session_key, "step": "services"}
+                )
+
+        if results.services is None:
+            # Resolve website content
+            website_content, content_metadata = await content_resolver.resolve_content(
+                session_key=session_key,
+                website_text=request.website_content.content if request.website_content else None,
+                website_url=request.website_url,
+                search_method=request.search_method,
+                ai_model=request.ai_model,
+            )
+
+            if not website_content:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No website content or URL provided"
+                )
+
+            # Generate services
+            service_generator = ServiceGenerator(model=request.ai_model)
+            services, usage_metrics, debug_info = await service_generator.generate_services(
+                website_content=website_content,
+                language=request.language,
+                number_of_services=request.number_of_services,
+                organization_profile=organization_profile,
+                user_instructions=None,  # Not exposed in evaluation mode
+                previous_services=None,
+            )
+
+            results.services = services
+            await save_wizard_step(org_id, user_id, "services", {
+                "services": [s.model_dump() for s in services],
+                "language": request.language,
+                "model": service_generator.model_name,
+                "usage": usage_metrics.model_dump(),
+            })
+
+            debug_prompts["services"] = {
+                "prompt_preview": debug_info.get("prompt_text", "")[:500],
+                "response_preview": debug_info.get("response_text", "")[:500],
+            }
+
+            elapsed = int((time.time() - start) * 1000)
+            timings.append(StepTiming(
+                step_name="services",
+                processing_time_ms=elapsed,
+                success=True
+            ))
+            logger.info(
+                "evaluate_step_completed",
+                extra={"session_key": session_key, "step": "services", "elapsed_ms": elapsed}
+            )
+
+    except Exception as e:
+        elapsed = int((time.time() - start) * 1000)
+        error_msg = f"Services generation failed: {str(e)}"
+        errors.append(error_msg)
+        timings.append(StepTiming(
+            step_name="services",
+            processing_time_ms=elapsed,
+            success=False,
+            error=str(e)
+        ))
+        logger.error(
+            "evaluate_step_failed",
+            extra={"session_key": session_key, "step": "services", "error": str(e)}
+        )
+
+        if not request.continue_on_error:
+            raise HTTPException(status_code=500, detail=error_msg)
+
+    # ==========================================================================
+    # Step 2: Assets
+    # ==========================================================================
+    if results.services or request.continue_on_error:
+        try:
+            start = time.time()
+
+            # Check skip_existing
+            if request.skip_existing:
+                existing = await get_wizard_step(org_id, user_id, "assets")
+                if existing and existing.get("assets"):
+                    from workshops_ai.api.schema.asset import Asset
+                    results.assets = [Asset(**a) for a in existing["assets"]]
+                    timings.append(StepTiming(
+                        step_name="assets",
+                        processing_time_ms=0,
+                        success=True,
+                        error="Skipped - using existing data"
+                    ))
+                    logger.info(
+                        "evaluate_step_skipped",
+                        extra={"session_key": session_key, "step": "assets"}
+                    )
+
+            if results.assets is None and results.services:
+                # Get website content from session (or re-scrape if cache fails)
+                website_content, _ = await content_resolver.resolve_content(
+                    session_key=session_key,
+                    website_text=request.website_content.content if request.website_content else None,
+                    website_url=request.website_url,
+                    search_method=request.search_method,
+                    ai_model=request.ai_model,
+                )
+
+                # Generate assets
+                asset_generator = AssetGenerator(model=request.ai_model)
+                assets, usage_metrics, debug_info = await asset_generator.generate_assets(
+                    website_content=website_content or "",
+                    language=request.language,
+                    number_of_assets=request.number_of_assets,
+                    services=results.services,
+                    organization_profile=organization_profile,
+                    user_instructions=None,
+                    previous_assets=None,
+                )
+
+                results.assets = assets
+                await save_wizard_step(org_id, user_id, "assets", {
+                    "assets": [a.model_dump() for a in assets],
+                    "language": request.language,
+                    "model": asset_generator.model_name,
+                    "usage": usage_metrics.model_dump(),
+                })
+
+                debug_prompts["assets"] = {
+                    "prompt_preview": debug_info.get("prompt_text", "")[:500],
+                    "response_preview": debug_info.get("response_text", "")[:500],
+                }
+
+                elapsed = int((time.time() - start) * 1000)
+                timings.append(StepTiming(
+                    step_name="assets",
+                    processing_time_ms=elapsed,
+                    success=True
+                ))
+                logger.info(
+                    "evaluate_step_completed",
+                    extra={"session_key": session_key, "step": "assets", "elapsed_ms": elapsed}
+                )
+
+        except Exception as e:
+            elapsed = int((time.time() - start) * 1000)
+            error_msg = f"Assets generation failed: {str(e)}"
+            errors.append(error_msg)
+            timings.append(StepTiming(
+                step_name="assets",
+                processing_time_ms=elapsed,
+                success=False,
+                error=str(e)
+            ))
+            logger.error(
+                "evaluate_step_failed",
+                extra={"session_key": session_key, "step": "assets", "error": str(e)}
+            )
+
+            if not request.continue_on_error:
+                raise HTTPException(status_code=500, detail=error_msg)
+
+    # ==========================================================================
+    # Step 3: Impacts
+    # ==========================================================================
+    if results.assets or request.continue_on_error:
+        try:
+            start = time.time()
+
+            # Check skip_existing
+            if request.skip_existing:
+                existing = await get_wizard_step(org_id, user_id, "impacts")
+                if existing and existing.get("asset_impacts"):
+                    from workshops_ai.api.schema.impact import AssetImpact
+                    results.asset_impacts = [AssetImpact(**ai) for ai in existing["asset_impacts"]]
+                    timings.append(StepTiming(
+                        step_name="impacts",
+                        processing_time_ms=0,
+                        success=True,
+                        error="Skipped - using existing data"
+                    ))
+                    logger.info(
+                        "evaluate_step_skipped",
+                        extra={"session_key": session_key, "step": "impacts"}
+                    )
+
+            if results.asset_impacts is None and results.assets:
+                # Generate impacts
+                impact_generator = ImpactGenerator(model=request.ai_model)
+                asset_impacts, usage_metrics, debug_info = await impact_generator.generate_asset_impacts(
+                    assets=results.assets,
+                    language=request.language,
+                    organization_profile=organization_profile,
+                    services=results.services,
+                    user_instructions=None,
+                )
+
+                results.asset_impacts = asset_impacts
+                await save_wizard_step(org_id, user_id, "impacts", {
+                    "asset_impacts": [ai.model_dump() for ai in asset_impacts],
+                    "language": request.language,
+                    "model": impact_generator.model_name,
+                    "usage": usage_metrics.model_dump(),
+                })
+
+                debug_prompts["impacts"] = {
+                    "last_prompt_preview": debug_info.get("last_prompt_preview", "")[:500],
+                    "last_response_preview": debug_info.get("last_response_preview", "")[:500],
+                }
+
+                elapsed = int((time.time() - start) * 1000)
+                timings.append(StepTiming(
+                    step_name="impacts",
+                    processing_time_ms=elapsed,
+                    success=True
+                ))
+                logger.info(
+                    "evaluate_step_completed",
+                    extra={"session_key": session_key, "step": "impacts", "elapsed_ms": elapsed}
+                )
+
+        except Exception as e:
+            elapsed = int((time.time() - start) * 1000)
+            error_msg = f"Impacts generation failed: {str(e)}"
+            errors.append(error_msg)
+            timings.append(StepTiming(
+                step_name="impacts",
+                processing_time_ms=elapsed,
+                success=False,
+                error=str(e)
+            ))
+            logger.error(
+                "evaluate_step_failed",
+                extra={"session_key": session_key, "step": "impacts", "error": str(e)}
+            )
+
+            if not request.continue_on_error:
+                raise HTTPException(status_code=500, detail=error_msg)
+
+    # ==========================================================================
+    # Step 4: Risks
+    # ==========================================================================
+    if results.assets or request.continue_on_error:
+        try:
+            start = time.time()
+
+            # Check skip_existing
+            if request.skip_existing:
+                existing = await get_wizard_step(org_id, user_id, "risks")
+                if existing and existing.get("asset_risks"):
+                    from workshops_ai.api.schema.threat import AssetRisk
+                    results.asset_risks = [AssetRisk(**ar) for ar in existing["asset_risks"]]
+                    timings.append(StepTiming(
+                        step_name="risks",
+                        processing_time_ms=0,
+                        success=True,
+                        error="Skipped - using existing data"
+                    ))
+                    logger.info(
+                        "evaluate_step_skipped",
+                        extra={"session_key": session_key, "step": "risks"}
+                    )
+
+            if results.asset_risks is None and results.assets:
+                # Generate risks
+                risk_generator = RiskGenerator(model=request.ai_model)
+                asset_risks, usage_metrics, debug_info = await risk_generator.generate_asset_risks(
+                    assets=results.assets,
+                    language=request.language,
+                    organization_profile=organization_profile,
+                    services=results.services,
+                    asset_impacts=results.asset_impacts,
+                    user_instructions=None,
+                )
+
+                results.asset_risks = asset_risks
+                await save_wizard_step(org_id, user_id, "risks", {
+                    "asset_risks": [ar.model_dump() for ar in asset_risks],
+                    "language": request.language,
+                    "model": risk_generator.model_name,
+                    "usage": usage_metrics.model_dump(),
+                })
+
+                debug_prompts["risks"] = {
+                    "last_prompt_preview": debug_info.get("last_prompt_preview", "")[:500],
+                    "last_response_preview": debug_info.get("last_response_preview", "")[:500],
+                }
+
+                elapsed = int((time.time() - start) * 1000)
+                timings.append(StepTiming(
+                    step_name="risks",
+                    processing_time_ms=elapsed,
+                    success=True
+                ))
+                logger.info(
+                    "evaluate_step_completed",
+                    extra={"session_key": session_key, "step": "risks", "elapsed_ms": elapsed}
+                )
+
+        except Exception as e:
+            elapsed = int((time.time() - start) * 1000)
+            error_msg = f"Risks generation failed: {str(e)}"
+            errors.append(error_msg)
+            timings.append(StepTiming(
+                step_name="risks",
+                processing_time_ms=elapsed,
+                success=False,
+                error=str(e)
+            ))
+            logger.error(
+                "evaluate_step_failed",
+                extra={"session_key": session_key, "step": "risks", "error": str(e)}
+            )
+
+            if not request.continue_on_error:
+                raise HTTPException(status_code=500, detail=error_msg)
+
+    # ==========================================================================
+    # Step 5: Controls
+    # ==========================================================================
+    if (results.assets and results.asset_risks) or request.continue_on_error:
+        try:
+            start = time.time()
+
+            # Check skip_existing
+            if request.skip_existing:
+                existing = await get_wizard_step(org_id, user_id, "controls")
+                if existing and existing.get("asset_controls"):
+                    from workshops_ai.api.schema.control import AssetControls
+                    results.asset_controls = [AssetControls(**ac) for ac in existing["asset_controls"]]
+                    timings.append(StepTiming(
+                        step_name="controls",
+                        processing_time_ms=0,
+                        success=True,
+                        error="Skipped - using existing data"
+                    ))
+                    logger.info(
+                        "evaluate_step_skipped",
+                        extra={"session_key": session_key, "step": "controls"}
+                    )
+
+            if results.asset_controls is None and results.assets and results.asset_risks:
+                # Generate controls
+                control_generator = ControlGenerator(model=request.ai_model)
+                asset_controls, usage_metrics, debug_info = await control_generator.generate_asset_controls(
+                    assets=results.assets,
+                    asset_risks=results.asset_risks,
+                    language=request.language,
+                    max_controls_per_asset=request.max_controls_per_asset,
+                    user_instructions=None,
+                )
+
+                results.asset_controls = asset_controls
+                await save_wizard_step(org_id, user_id, "controls", {
+                    "asset_controls": [ac.model_dump() for ac in asset_controls],
+                    "language": request.language,
+                    "model": control_generator.model_name,
+                    "usage": usage_metrics.model_dump(),
+                })
+
+                debug_prompts["controls"] = {
+                    "last_prompt_preview": debug_info.get("last_prompt_preview", "")[:500],
+                    "last_response_preview": debug_info.get("last_response_preview", "")[:500],
+                }
+
+                elapsed = int((time.time() - start) * 1000)
+                timings.append(StepTiming(
+                    step_name="controls",
+                    processing_time_ms=elapsed,
+                    success=True
+                ))
+                logger.info(
+                    "evaluate_step_completed",
+                    extra={"session_key": session_key, "step": "controls", "elapsed_ms": elapsed}
+                )
+
+        except Exception as e:
+            elapsed = int((time.time() - start) * 1000)
+            error_msg = f"Controls generation failed: {str(e)}"
+            errors.append(error_msg)
+            timings.append(StepTiming(
+                step_name="controls",
+                processing_time_ms=elapsed,
+                success=False,
+                error=str(e)
+            ))
+            logger.error(
+                "evaluate_step_failed",
+                extra={"session_key": session_key, "step": "controls", "error": str(e)}
+            )
+
+            if not request.continue_on_error:
+                raise HTTPException(status_code=500, detail=error_msg)
+
+    # ==========================================================================
+    # Build final response
+    # ==========================================================================
+    total_elapsed = int((time.time() - start_total) * 1000)
+
+    # Build output
+    output = EvaluationOutput(
+        total_processing_time_ms=total_elapsed,
+        data=results,
+        step_timings=timings,
+        errors=errors if errors else None,
+        debug=debug_prompts if settings.wizard.expose_debug_info and debug_prompts else None
+    )
+
+    # Add response headers if enabled
+    if settings.wizard.expose_debug_info:
+        response.headers["X-Wizard-Session-Key"] = session_key
+        response.headers["X-Wizard-Total-Time-MS"] = str(total_elapsed)
+        response.headers["X-Wizard-Steps-Completed"] = str(len([t for t in timings if t.success]))
+        response.headers["X-Wizard-Steps-Failed"] = str(len([t for t in timings if not t.success]))
+
+    logger.info(
+        "wizard_evaluation_completed",
+        extra={
+            "session_key": session_key,
+            "total_time_ms": total_elapsed,
+            "steps_completed": len([t for t in timings if t.success]),
+            "steps_failed": len([t for t in timings if not t.success]),
+        }
+    )
+
+    return output
+
+
+# =============================================================================
+# State Management
+# =============================================================================
+
+@router.get(
+    "/state",
+    response_model=WizardStateResponse,
+    summary="Get wizard state",
+    description="Retrieve current wizard state for user"
+)
+async def get_state(
+    session_key: str = Depends(get_session_key),
+) -> WizardStateResponse:
+    """
+    Get current wizard state from Redis.
+    """
+    # Extract org_id and user_id from session_key
+    parts = session_key.split(":")
+    org_id = parts[1] if len(parts) > 1 else "unknown"
+    user_id = parts[2] if len(parts) > 2 else "unknown"
+
+    logger.info(
+        "Wizard: get state",
+        extra={"org_id": org_id, "user_id": user_id}
+    )
+
+    state = await get_wizard_state(org_id, user_id)
+
+    # Extract completed steps
+    steps_completed = [
+        step for step in [
+            "services", "assets", "impacts",
+            "risks", "controls", "evaluation"
+        ]
+        if step in state
+    ]
+
+    return WizardStateResponse(
+        org_id=org_id,
+        user_id=user_id,
+        steps_completed=steps_completed,
+        data=state
+    )
+
+
+@router.delete(
+    "/state",
+    summary="Clear wizard state",
+    description="Clear all wizard state for user (reset wizard)"
+)
+async def clear_state(
+    session_key: str = Depends(get_session_key),
+) -> Dict[str, str]:
+    """
+    Clear wizard state from Redis.
+    """
+    # Extract org_id and user_id from session_key
+    parts = session_key.split(":")
+    org_id = parts[1] if len(parts) > 1 else "unknown"
+    user_id = parts[2] if len(parts) > 2 else "unknown"
+
+    logger.info(
+        "Wizard: clear state",
+        extra={"org_id": org_id, "user_id": user_id}
+    )
+
+    await clear_wizard_state(org_id, user_id)
+
+    return {"message": "Wizard state cleared successfully"}

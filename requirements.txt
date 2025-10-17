@@ -1,0 +1,53 @@
+# Basic
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-dotenv
+orjson
+
+# CSV / ETL
+pandas
+python-dateutil
+tzdata
+
+# HTTP + retry + logs
+httpx
+tenacity
+structlog
+
+# Web scraping
+beautifulsoup4
+lxml
+publicsuffix2
+charset-normalizer
+ftfy
+
+# RAG (default Chroma + PDF ingest; Qdrant volitelně)
+chromadb
+pypdf
+qdrant-client[fastembed]
+onnxruntime
+
+# Lang *chain/graph*
+langchain-core
+langchain-openai
+langgraph
+langsmith
+openai
+langgraph-checkpoint-sqlite
+langgraph-checkpoint-redis
+
+# Observability (optional)
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+
+# Security / Auth
+PyJWT[crypto]
+
+# Infra / storage
+redis
+aiosqlite
+
+
+typing_extensions

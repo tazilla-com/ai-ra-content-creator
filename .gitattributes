@@ -1,0 +1,22 @@
+* text=auto
+
+# Unix LF pro zdrojáky a CSV
+*.py  text eol=lf
+*.md  text eol=lf
+*.txt text eol=lf
+*.csv text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Windows CRLF pro skripty
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# Binárky
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.onnx binary
