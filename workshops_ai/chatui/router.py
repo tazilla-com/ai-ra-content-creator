@@ -24,8 +24,8 @@ router = APIRouter()
 
 @router.get("/", include_in_schema=False)
 async def root_redirect():
-    """Redirect bare mount path to /demo."""
-    return RedirectResponse(url="/demo", status_code=302)
+    """Redirect bare mount path to /docs."""
+    return RedirectResponse(url="/docs", status_code=302)
 
 
 @router.get("/demo", include_in_schema=False, response_class=HTMLResponse)
