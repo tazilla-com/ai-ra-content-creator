@@ -28,7 +28,6 @@ langchain-openai
 langgraph
 langsmith
 openai
-langgraph-checkpoint-sqlite
 langgraph-checkpoint-redis
 
 # Observability (optional)

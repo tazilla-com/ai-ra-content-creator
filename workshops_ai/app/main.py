@@ -14,6 +14,7 @@
 #   - Use central `mask_secrets()` to redact config in the startup log (replaces settings.redacted_dict()).
 #   - Added session propagation helpers for HTTP: a stable cookie/header name and a
 #     `get_session_id_from_request()` fallback that chat_router can use when body lacks `session_id`.
+#   - ✅ NEW: Enable faulthandler at startup and register SIGUSR2 to dump stacks (for recursion/debug).
 #   - Kept the project's patch style: old code commented above new code.
 
 from __future__ import annotations
@@ -72,6 +73,10 @@ from workshops_ai.app.services.redis_pool import get_redis, close_redis
 
 # Tracing (export LANGCHAIN_* from settings.langchain, no getenv reads)
 from workshops_ai.tools.tracing import enable_tracing_if_configured
+
+# enable on-demand/full-crash Python stack dumps 
+import faulthandler  
+import signal        
 
 
 # ------------------------------------------------------------------------------
@@ -273,6 +278,15 @@ async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONRespons
 # ------------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
+    try:
+        # Dumps go to stderr → visible in `docker logs`
+        faulthandler.enable()
+        # Manual dump anytime: `docker kill -s USR2 workshops-ai-api`
+        faulthandler.register(signal.SIGUSR2, all_threads=True)
+    except Exception:
+        # Be tolerant to environments lacking signals (e.g., Windows dev shells)
+        pass
+
     # Export LANGCHAIN_* envs purely from settings (no getenv reads)
     try:
         enable_tracing_if_configured()
@@ -281,9 +295,6 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
 
     # Log redacted settings (no secrets)
     try:
-        # OLD:
-        # logger.info("startup.begin %s", settings.redacted_dict())
-        # NEW (centralized masking):
         logger.info("startup.begin %s", mask_secrets(settings))
     except Exception:
         logger.info("startup.begin")
@@ -535,8 +546,6 @@ def create_app() -> FastAPI:
         async def impacts_ping() -> dict[str, Any]:
             return {"status": "not_ready", "router": "impacts"}
         app.include_router(router)
-
-    _mount_or_fallback("impacts_router", _mount_impacts, _fallback_impacts)
 
     return app
 

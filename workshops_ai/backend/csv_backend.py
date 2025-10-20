@@ -52,7 +52,9 @@ from workshops_ai.backend.port import (
     BackendNotFound,
 )
 from workshops_ai.settings import get_settings
-from workshops_ai.api.schema import Asset  # canonical DTO
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from workshops_ai.api.schema import Asset 
 
 # Optional telemetry (best-effort, never fail)
 try:  # pragma: no cover
@@ -637,6 +639,7 @@ def _map_ia_int_to_canonical(i: int | None) -> str | None:
 
 
 def _build_asset_with_cia_fallback(payload: dict[str, Any]) -> Asset:
+    from workshops_ai.api.schema import Asset
     """
     Build Asset while being robust to CIA representation and ID type.
     - If 'id' is not a valid UUID v7, set it to None (DTO may still accept).

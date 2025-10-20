@@ -12,22 +12,17 @@
 #   - If the LLM doesn't pick any tool, we return a natural-language reply (clarify/explain).
 #   - No tool execution happens here; this node only decides & validates.
 #   - Supports multiple client shapes: OpenAI Chat Completions, OpenAI Responses, LangChain ChatModel.
-#   - Integrated lightweight debug telemetry (telemetry_debug.DecideSpan).
+#   - Integrated lightweight debug telemetry (telemetry_debug.DecideSpan) — best effort.
 #   - Language policy: the agent must always respond in the user's language (cs/sk/en) inferred from
-#     `language` or `locale`. We inject a compact **system.md** plus an optional domain prompt
-#     to enforce style, one-tool-per-turn, slot-filling, and **full list** rules.
-#
-# Changes in this version (LLM-first planner):
-#   - Injects `prompts/system.md` (compact) + optional domain prompt for the current `tab`.
-#   - Feeds a compact `{{tools}}` JSON (from ToolRegistry) into the system prompt.
-#   - Removes any notion of pseudo "help/chitchat" actions — reply-only text is used when no tool is chosen.
-#   - Preserves existing client compatibility and telemetry.
-#
+#     `language` or `locale`. We inject a compact system prompt plus an optional domain prompt
+#     to enforce style, one-tool-per-turn, slot-filling, and full-list rules.
+
 from __future__ import annotations
 
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Literal, Tuple, TYPE_CHECKING
 
@@ -221,6 +216,46 @@ def _render_system_prompt(
 
 
 # =============================================================================
+# Create-flow lock helper
+#   🔒 During slot-filling for asset creation, restrict the LLM to *only*
+#   `asset.create` to prevent escapes to other tools mid-flow.
+#   The detection is tolerant to several selector shapes used by the graph.
+# =============================================================================
+def _should_lock_to_asset_create(selection: Dict[str, Any] | None) -> bool:
+    sel = selection or {}
+    # direct boolean flag
+    if sel.get("force_to_asset_create") is True:
+        return True
+
+    # common "create_flow" container
+    cf = sel.get("create_flow")
+    if cf is True:
+        return True
+    if isinstance(cf, dict):
+        if cf.get("active") is True:
+            return True
+        # look for target/op/action hints
+        tgt = (cf.get("target") or cf.get("action") or cf.get("op") or cf.get("tool") or "").strip().lower()
+        if tgt in {"asset.create", "create_asset"}:
+            return True
+        # presence of pending_fields typically implies slot-fill in progress
+        if isinstance(cf.get("pending_fields"), (list, tuple)) and cf.get("pending_fields"):
+            return True
+
+    # top-level hints used by some callers
+    pending_action = str(sel.get("pending_action") or sel.get("pending_op") or "").strip().lower()
+    if pending_action in {"asset.create", "create_asset"}:
+        return True
+    if isinstance(sel.get("pending_fields"), (list, tuple)) and sel.get("pending_fields"):
+        # treat as create-flow only if an explicit target is creation
+        tgt = str(sel.get("pending_target") or sel.get("target") or "").strip().lower()
+        if tgt in {"asset.create", "create_asset"}:
+            return True
+
+    return False
+
+
+# =============================================================================
 # LLM client adapter (OpenAI Chat/Responses + LangChain compatible)
 #   Returns (tool_name, tool_args, assistant_text) where only one branch is non-None.
 # =============================================================================
@@ -335,18 +370,16 @@ def _call_llm_with_tools(
                 # Some SDKs require "input" wrapper
                 resp = create(input={"messages": messages}, tools=safe_functions, tool_choice="auto", temperature=temp)  # type: ignore[arg-type]
 
-            # Try to normalize explicit tool_use items
+            # Normalize explicit tool_use items if present
             try:
                 items = getattr(resp, "output", None)
                 if isinstance(items, list):
                     for it in items:
-                        # some SDKs return dicts, some objects
                         t = getattr(it, "type", None) or (it.get("type") if isinstance(it, dict) else None)
                         if t == "tool_use":
                             name = getattr(it, "name", None) or (it.get("name") if isinstance(it, dict) else None)
                             tool_input = getattr(it, "input", None) or (it.get("input") if isinstance(it, dict) else None)
                             if isinstance(name, str) and isinstance(tool_input, dict):
-                                # ⬇️ map safe -> canonical (e.g., "asset_create" -> "asset.create")
                                 name = canonical_name(name, name_map)
                                 return name, tool_input, None
 
@@ -356,7 +389,6 @@ def _call_llm_with_tools(
                     text = getattr(resp.choices[0].message, "content", None)  # type: ignore[index]
                 return None, None, (str(text) if text else "")
             except Exception:
-                # Fallback to text on any parsing error
                 text = getattr(resp, "output_text", None)
                 return None, None, (str(text) if text else "")
 
@@ -474,24 +506,30 @@ async def agent_decide(
       - Invoke LLM with tool-calling
       - Validate args and resolve registry endpoint/op
       - Emit AgentDecision or a short natural-language reply
-      - Emit debug telemetry spans (best-effort, non-fatal)
+      - Emit optional debug telemetry spans (best-effort, non-fatal)
 
     ✨ Language & prompt behavior in this version:
       - Compute `lang` from `language` or `locale` (default 'en').
-      - Inject compact **system.md** with runtime placeholders ({{tools}}, {{language}}, {{history}}, …).
+      - Inject compact system prompt with runtime placeholders ({{tools}}, {{language}}, {{history}}, …).
       - Optionally inject a domain prompt for the current `tab` if present.
-      - Add a tiny guardrail line (reply in lang, one tool if needed, one clarify max).
+      - Add a tiny guardrail line (reply in lang, one tool if needed, one concise clarify).
     """
     lang = (language or locale or "en").strip().lower()
     ToolRegistry.ensure_initialized()
     tab_key = (tab or "").strip().lower()
+    history = history or []
+    msg_len = len((message or "").strip())
 
     # Resolve available tools from registry for the tab
-    # NOTE: We do NOT add any pseudo "help/chitchat" actions here.
     registry_functions_all = ToolRegistry.as_openai_functions(tab_key)
     if not registry_functions_all:
         logger.warning("agent_decide: no tools registered for tab='%s'; reply-only fallback.", tab_key)
         return AgentDecision(reply=_fallback_clarify(lang))
+
+    # 🔒 Create-flow lock: if we're in the middle of asset creation slot-fill,
+    #     clamp allowed_actions to only ['asset.create'] to avoid tool escape.
+    if tab_key == "assets" and _should_lock_to_asset_create(selection):
+        allowed_actions = ["asset.create"]
 
     # If Manager provided a whitelist (allowed_actions), filter by function name.
     if allowed_actions:
@@ -551,11 +589,7 @@ async def agent_decide(
         pass  # prioritization must never break the flow
 
     # ---- Build LLM messages (system + optional domain + history + user) ----
-    # History: keep original chat history for the model AND a compact summary for the system prompt.
-    history = history or []
     history_compact = _compact_history(history)
-
-    # Compact tools JSON for {{tools}} injection
     tools_json = _tools_for_prompt(registry_functions)
 
     # Best-effort org/thread/policy from deps (optional)
@@ -634,8 +668,7 @@ async def agent_decide(
         _ds = None  # telemetry must never break the flow
 
     # ---- Invoke LLM with tool-calling ----
-    import time as _t
-    _started = _t.time()
+    started = time.perf_counter()
     try:
         # Clamp/override temperature only if not provided in deps; keep your explicit settings intact.
         _temp = getattr(deps, "llm_temperature", None)
@@ -659,7 +692,7 @@ async def agent_decide(
                     action=None,
                     args=None,
                     reason="llm_invoke_failed",
-                    started_at=_started,
+                    started_at=started,
                 )
         except Exception:
             pass
@@ -675,7 +708,7 @@ async def agent_decide(
                     action=None,
                     args=None,
                     reason="no_tool_selected",
-                    started_at=_started,
+                    started_at=started,
                 )
         except Exception:
             pass
@@ -694,7 +727,7 @@ async def agent_decide(
                     action=tool_name,
                     args=(tool_args or {}),
                     reason="args_invalid",
-                    started_at=_started,
+                    started_at=started,
                 )
         except Exception:
             pass
@@ -714,7 +747,7 @@ async def agent_decide(
                     action=tool_name,
                     args=validated.model_dump(),
                     reason="endpoint_or_op_unresolved",
-                    started_at=_started,
+                    started_at=started,
                 )
         except Exception:
             pass
@@ -729,7 +762,7 @@ async def agent_decide(
                 action=tool_name,
                 args=validated.model_dump(),
                 reason=None,
-                started_at=_started,
+                started_at=started,
             )
     except Exception:
         pass

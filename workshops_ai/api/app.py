@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -27,7 +27,11 @@ from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 
 # Centralized HTTP auth (API-key/JWT).
 # Keep import location consistent with the rest of the app.
-from workshops_ai.app.deps.auth import require_auth  # type: ignore
+try:
+    from workshops_ai.app.security import require_auth  # ✅ correct import
+except Exception as _imp_err:  # pragma: no cover
+    # If security middleware isn't available at import time, make it explicit.
+    raise RuntimeError("Auth dependency 'require_auth' not available") from _imp_err
 
 # Telemetry (best-effort, no-op if missing)
 try:
@@ -51,6 +55,7 @@ settings = get_settings()
 CHAT_TIMEOUT_SEC: float = float(getattr(getattr(settings, "chat", object()), "timeout_sec", 60))
 MAX_MESSAGE_LEN: int = int(getattr(getattr(settings, "chat", object()), "max_message_len", 4000))
 
+# Auth applies to all routes mounted under this router
 router = APIRouter(dependencies=[Depends(require_auth)])
 
 
@@ -64,6 +69,7 @@ class ChatAcceptedResponse(UIResponse):
 def _read_request_id(request: Request) -> str:
     """
     Read request id injected by RequestIDMiddleware. Fallback to 'n/a' if missing.
+    Supports common header names (lower/upper).
     """
     for h in ("x-request-id", "x-correlation-id"):
         rid = request.headers.get(h) or request.headers.get(h.upper())
@@ -72,8 +78,8 @@ def _read_request_id(request: Request) -> str:
     return "n/a"
 
 
-def _truncate_for_log(text: str | None, limit: int = 512) -> str | None:
-    """Truncate long strings for telemetry logs."""
+def _truncate_for_log(text: Optional[str], limit: int = 512) -> Optional[str]:
+    """Truncate long strings for telemetry logs (keeps logs bounded)."""
     if text is None:
         return None
     return text if len(text) <= limit else (text[:limit] + "…")
@@ -139,6 +145,8 @@ async def chat_endpoint(
 
     # 3) Telemetry (best-effort)
     try:
+        sel = getattr(ui_req, "selection", None)
+        sel_dump = sel.model_dump(mode="json") if hasattr(sel, "model_dump") else (sel or None)
         telemetry_log(
             "chat.request",
             {
@@ -146,7 +154,7 @@ async def chat_endpoint(
                 "user_id": ui_req.user_id,
                 "org_id": ui_req.org_id,
                 "active_tab": ui_req.active_tab,
-                "selection": ui_req.selection.model_dump(mode="json") if hasattr(ui_req, "selection") else None,
+                "selection": sel_dump,
                 "staging": ui_req.staging,
                 "message_preview": _truncate_for_log(ui_req.message, 256),
                 "locale": getattr(ui_req, "locale", None),
@@ -155,6 +163,7 @@ async def chat_endpoint(
             },
         )
     except Exception:
+        # Telemetry must never break the request
         pass
 
     # 4) Route strictly via our component (Manager/Router)

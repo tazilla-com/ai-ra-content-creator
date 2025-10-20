@@ -7,3 +7,8 @@ python -m uvicorn workshops_ai.app.main:app --reload --host 127.0.0.1 --port 800
 docker compose build --no-cache api
 docker compose up -d --force-recreate      
 docker compose logs -f api 
+
+
+docker compose build api
+docker compose up -d api
+docker compose logs -f api 

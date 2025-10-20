@@ -1,18 +1,6 @@
 # File: workshops_ai/routers/threats.py
 # -----------------------------------------------------------------------------
 # Threats Router (SSOT-aligned)
-#
-# What changed in this version
-# - ✅ Still validates tool payloads strictly against the central ToolRegistry.
-# - ✅ READ endpoints remain local (catalog + asset_get).
-# - 🔁 WRITE paths (threat.set_probability, threat.bulk_set, NEW: threat.upsert)
-#   no longer handcraft confirmations / submit flows. They now delegate to thin
-#   graph runners (run_set_probability / run_bulk_set / run_upsert) that execute
-#   through the Threat LangGraph and produce Asset-like confirmations:
-#   - short LLM confirm
-#   - {"kind":"changeset", ...}
-#   - {"kind":"submit_result", ...}
-# - ℹ️  threat.explain continues to use a graph runner.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -30,7 +18,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from workshops_ai.app.security import require_auth
-from workshops_ai.tools.telemetry import telemetry_log
+
+# Telemetry should never break routes (best-effort)
+try:
+    from workshops_ai.tools.telemetry import telemetry_log  # type: ignore
+except Exception:  # pragma: no cover
+    def telemetry_log(event: str, payload: dict) -> None:  # type: ignore
+        return
 
 # Backend + GraphDeps (DI consistent with other routers)
 from workshops_ai.backend.port import BackendPort
@@ -43,8 +37,8 @@ from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 # SSOT: central registry + strict args
 from workshops_ai.agents.tools.registry import (
     ToolRegistry,
+    AssetSelector,              # ✅ canonical args model for threat.asset_get
     ThreatListArgs,
-    ThreatAssetGetArgs,         # ⬅ NEW: validate asset_get payload
     ThreatSetProbabilityArgs,
     ThreatBulkSetArgs,
     ThreatExplainArgs,
@@ -71,16 +65,26 @@ graph_router = APIRouter(prefix="/graph/threats", tags=["graph:threats"])
 # Helpers
 # ---------------------------
 def _clamp_0_4(v: int) -> int:
+    """Clamp an integer to the inclusive range [0, 4]."""
     return max(0, min(4, v))
 
 
 async def _run_async(func, *args, **kwargs):
+    """
+    Execute functions that may be sync or async in a unified way.
+    - If 'func' is a coroutine function → await directly.
+    - Otherwise run the sync function in a thread (non-blocking).
+    """
     if inspect.iscoroutinefunction(func):
         return await func(*args, **kwargs)
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
 def _get_backend_from_app(request: Request) -> BackendPort:
+    """
+    Prefer a prebuilt backend instance injected into app.state.
+    Fallback to CsvBackend for dev mode if none is present.
+    """
     app_state = getattr(request.app, "state", None)
     prebuilt = getattr(app_state, "backend_port", None) if app_state else None
     if prebuilt is not None:
@@ -91,6 +95,10 @@ def _get_backend_from_app(request: Request) -> BackendPort:
 async def _resolve_asset_id(
     backend: BackendPort, *, org_id: Optional[str], asset_id: Optional[str], asset_name: Optional[str]
 ) -> str:
+    """
+    Resolve asset ID from either a provided ID or by exact name via backend resolver.
+    Raises HTTP errors with clear client-facing messages on failure.
+    """
     if asset_id:
         return str(asset_id)
     if not asset_name:
@@ -118,7 +126,8 @@ async def _resolve_asset_id(
 
 def _current_probability_from_rows(rows: List[Dict[str, Any]], threat_name: str) -> Optional[int]:
     """
-    backend.threats_for_asset(asset_id) rows may contain:
+    Inspect backend rows to find the current probability for a given threat code/name.
+    Each row may contain:
       - threat_code | code | name
       - probability | level (0..4)
     """
@@ -215,7 +224,7 @@ class ThreatSetResult(BaseModel):
 class GraphToolCall(BaseModel):
     op: Literal[
         "threat.list",
-        "threat.asset_get",          # ⬅ NEW: read risks for an asset
+        "threat.asset_get",          # read risks for an asset
         "threat.set_probability",
         "threat.bulk_set",
         "threat.upsert",
@@ -247,14 +256,17 @@ async def graph_threats_entrypoint(
     except Exception:
         pass
 
-    # Strict SSOT validation (use tab scoping if your registry expects it)
+    # Strict SSOT validation (the registry enforces exact payload shape)
     try:
         validated = ToolRegistry.validate_call(op, args)
-        # or: ToolRegistry.validate_call(tab="threats", op=op, args=args)
     except ValidationError as ve:
         return UIResponse.error(tab="threats", op=op, error=f"Invalid payload for {op}", details=ve.errors())
 
-    backend: BackendPort = deps.backend  # type: ignore[attr-defined]
+    # ✅ Use DI-provided backend (GraphDeps) with safe fallback
+    backend: BackendPort = (
+        getattr(deps, "backend", None) or getattr(deps, "backend_port", None) or CsvBackend()
+    )
+
     org_id: str = ui.get("org_id") or "demo-org"
     user_id: str = ui.get("user_id") or "demo-user"
     locale: Optional[str] = ui.get("locale")
@@ -290,7 +302,7 @@ async def graph_threats_entrypoint(
     # READ: threat.asset_get (risks for an asset)
     # ---------------------------
     if op == "threat.asset_get":
-        v = cast(ThreatAssetGetArgs, validated)
+        v = cast(AssetSelector, validated)  # ✅ aligned with registry
         asset_id = await _resolve_asset_id(
             backend, org_id=org_id, asset_id=v.assetId, asset_name=v.assetName
         )
@@ -331,7 +343,7 @@ async def graph_threats_entrypoint(
             action="set",
             set_payload={
                 "asset_id": asset_id,
-                "items": [{"threat_code": v.threatName, "probability": lvl}],
+                "items": [{"threat_code": v.threatName, "probability": lvl}],  # ✅ internal key: threat_code
             },
         )
         return await run_set_probability(deps=deps, ui_req=ui_req)
@@ -379,7 +391,7 @@ async def graph_threats_entrypoint(
             upsert_payload={
                 "asset_id": asset_id,
                 "items": [
-                    {"threatName": v.threatName, "present": bool(v.present), "note": v.note or None}
+                    {"threat_code": v.threatName, "present": bool(v.present), "note": v.note or None}  # ✅ internal key
                 ],
             },
         )

@@ -1,32 +1,16 @@
 # File: workshops_ai/tools/guard_validate_payload.py
-# Purpose:
-#   Fail-closed validation helpers for all API/agent edges.
-#   - Enforces strict Pydantic v2 parsing (no silent coercion beyond your schema).
-#   - Rejects models that are not configured with `extra="forbid"` (opt-out via flag).
-#   - Provides list/array validation via TypeAdapter.
-#   - Redacts sensitive fields in error logs.
-#   - Provides a structured "write blocked" error with a clear confirmation hint
-#     (CZ/SK/EN) so the UI/agent can guide the user when writes are gated.
+# -----------------------------------------------------------------------------
+# Purpose
+# -------
+# Fail-closed validation helpers for all API/agent edges.
+# - Enforces strict Pydantic v2 parsing (no silent coercion beyond your schema).
+# - Rejects models that are not configured with `extra="forbid"` (opt-out via flag).
+# - Validates arrays via TypeAdapter(list[Model]).
+# - Redacts sensitive fields in error logs/snapshots.
+# - Provides a structured "write blocked" error with a clear confirmation hint
+#   (CZ/SK/EN) so the UI/agent can guide the user when writes are gated.
 #
-# Usage:
-#   from workshops_ai.tools.guard_validate_payload import (
-#       guard_validate_payload,
-#       guard_validate_list,
-#       raise_write_blocked,
-#       WriteBlockedError,
-#   )
-#
-#   # Validation
-#   ui_req = guard_validate_payload(UIRequest, payload_dict)
-#   items  = guard_validate_list(ImpactItem, payload_list)  # returns list[ImpactItem]
-#
-#   # Write-gate (use in manager/graphs when staging==False or policy requires preview)
-#   if not can_write:
-#       raise_write_blocked("create", {"staging": False, "reason": "preview_required"}, language="sk")
-#
-# Notes:
-#   - Keep schemas strict: use `StrictStr`, `StrictBool`, numeric bounds, and `extra="forbid"`.
-#   - This module is dependency-light; do not import app/backends here.
+# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -53,7 +37,7 @@ T = TypeVar("T", bound=BaseModel)
 # ------------------------------------------------------------------------------
 
 class GuardValidationError(Exception):
-    """Uniform validation error used across the app (wraps pydantic's ValidationError)."""
+    """Uniform validation error used across the app (wraps Pydantic's ValidationError)."""
 
     def __init__(self, message: str, *, errors: list[dict[str, Any]] | None = None) -> None:
         super().__init__(message)
@@ -98,17 +82,25 @@ def guard_validate_payload(
 ) -> T:
     """
     Validate a single object against a Pydantic v2 model in a fail-closed way.
-    - If `payload` is already an instance of `model` and `allow_instance=True`, it is returned
-      after revalidation via .model_validate() to ensure config rules apply.
-    - If the model does not enforce `extra="forbid"` and `require_forbid_extra=True`,
-      a GuardValidationError is raised.
+
+    Behavior:
+    - If `payload` is already a `model` instance and `allow_instance=True`, it is
+      re-validated via `model.model_validate(payload.model_dump(mode="python"))`
+      so config rules (e.g., `extra="forbid"`) are re-applied.
+    - If the model is not strict (no `extra="forbid"`) and `require_forbid_extra=True`,
+      a GuardValidationError is raised preemptively.
     """
     _assert_model_is_strict(model, require_forbid_extra=require_forbid_extra)
 
     try:
         if allow_instance and isinstance(payload, model):
-            # Re-validate the instance's dict to re-apply 'extra'/'str_strip_whitespace' rules
-            data = payload.model_dump(mode="python")
+            # Use safe serialization to avoid recursion issues
+            try:
+                from workshops_ai.graph._serde import jsonable
+                data = jsonable(payload)
+            except Exception:
+                # Fallback to direct validation if jsonable fails
+                return model.model_validate(payload)
             return model.model_validate(data)
         return model.model_validate(payload)
     except ValidationError as ve:
@@ -183,7 +175,12 @@ def safe_model_dump(obj: Any, *, max_len: int = 2048) -> Any:
     """
     try:
         if isinstance(obj, BaseModel):
-            data = obj.model_dump(mode="python")
+            # Use safe serialization to avoid recursion issues
+            try:
+                from workshops_ai.graph._serde import jsonable
+                data = jsonable(obj)
+            except Exception:
+                data = {"error": "serialization_failed", "type": type(obj).__name__}
         elif isinstance(obj, Mapping):
             data = dict(obj)  # shallow copy
         elif isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
@@ -248,7 +245,7 @@ def _assert_model_is_strict(model: Type[T], *, require_forbid_extra: bool) -> No
 
 def _sanitize_errors(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Normalize pydantic errors:
+    Normalize Pydantic errors:
       - Convert loc tuples to dot-paths for readability.
       - Redact values from ctx if present and sensitive.
     """

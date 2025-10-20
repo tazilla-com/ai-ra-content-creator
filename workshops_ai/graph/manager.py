@@ -14,6 +14,8 @@ Enhancements in this version:
   * Normalizes and pins `req.language` and `req.locale` (cs-CZ / sk-SK / en-US) for downstream prompts.
   * Session language is persisted in KV and reused on subsequent turns of the thread.
 - Confirmation detector and next-step orchestration text prefer SK as the fallback language.
+- **Graph runner cache:** graphs are compiled once per (tab, version) and reused across requests,
+  dramatically reducing per-turn overhead. Bump `WSAI_GRAPH_VERSION` to force a rebuild.
 """
 
 from __future__ import annotations
@@ -25,7 +27,6 @@ import ast             # Back-compat parser for legacy str(dict) payloads
 from typing import Any, Final, Mapping, Optional, cast
 
 from pydantic import ValidationError
-
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 from workshops_ai.models.agent_event import AgentEvent as WireAgentEvent
 from workshops_ai.tools.telemetry import telemetry_log
@@ -35,9 +36,9 @@ from workshops_ai.settings import get_settings
 from workshops_ai.graph.factory import (
     GraphDeps,
     make_default_deps,
-    build_graph,
+    build_graph,          # returns a compiled LangGraph runnable for a given tab
     ainvoke_with_timeout,
-    build_graph_config,  # unified config builder (thread_id/lang/checkpoint_ns)
+    build_graph_config,   # unified config builder (thread_id/lang/checkpoint_ns)
 )
 
 # Conversation memory (rolling window; KV-backed where available)
@@ -58,12 +59,48 @@ from workshops_ai.graph.policies import (
 # Single Source of Truth for tools — the canonical registry
 from workshops_ai.agents.tools.registry import ToolRegistry
 
+
 _SETTINGS = get_settings()
 
 # Supported tabs
 _SUPPORTED_TABS: Final[set[str]] = {"assets", "impacts", "threats"}
 
-_GRAPHS = {}
+# -----------------------------------------------------------------------------
+# Compiled-graph cache
+# -----------------------------------------------------------------------------
+# Bump this when you change graph definitions/nodes so the runners are recompiled.
+WSAI_GRAPH_VERSION: Final[str] = "2025.10-iter"
+
+# Process-local cache: (version:tab) → compiled runner
+_GRAPHS: dict[str, Any] = {}
+
+# Per-key async locks to prevent duplicate compiles under bursty concurrency
+_GRAPH_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+async def _get_or_build_runner(tab: str, deps: GraphDeps) -> Any:
+    """
+    Return a compiled graph runnable for the given tab.
+    Compile once per (WSAI_GRAPH_VERSION, tab) and reuse across requests/users.
+    This is safe because per-turn state (thread_id, language, checkpoint namespace) is supplied
+    through LangGraph 'config', and the checkpointer comes from DI when the graph was compiled.
+    """
+    cache_key = f"{WSAI_GRAPH_VERSION}:{tab}"
+    runner = _GRAPHS.get(cache_key)
+    if runner is not None:
+        return runner
+
+    lock = _GRAPH_LOCKS.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        # Double-check after acquiring the lock in case another coroutine built it meanwhile.
+        runner = _GRAPHS.get(cache_key)
+        if runner is None:
+            # Note: deps.checkpointer is wired by factory. We expect a stable instance (LRU/provider);
+            # the per-turn config still sets thread_id & language so state doesn't bleed across users.
+            runner = build_graph(tab, deps)
+            _GRAPHS[cache_key] = runner
+    return runner
+
 
 # Namespaces for memory
 _CHAT_NS: Final[str] = "chat"
@@ -76,7 +113,7 @@ _SESSION_STATE_KEY: Final[str] = "thread_state"
 #   "current_asset": {"asset_id": str, "name": str | None},
 #   "recent_assets": [{"asset_id": str, "name": str | None}, ...],  # MRU (max N)
 #   "once_flags": {"asked_for_asset": bool},
-#   "language": "cs|sk|en"   # ← NEW: persisted language lock for the thread
+#   "language": "cs|sk|en"   # ← persisted language lock for the thread
 # }
 _MRU_MAX: Final[int] = 5
 
@@ -108,6 +145,7 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
 
     # 2) Build DI deps (backend, ws hub, retriever, memory, llm_client, settings, submit_changeset)
     deps = _deps(tab)
+
     # Propagate the trace to DI so that nodes (decide) can use it
     try:
         setattr(deps, "telemetry_trace", _trace)
@@ -188,7 +226,7 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
     # 7) Prepare inputs for the graph (dict-based; minimal + stable)
     selection_dump = (
         req.selection.model_dump()
-        if hasattr(req, "selection") and hasattr(req, "selection") and hasattr(req.selection, "model_dump")
+        if hasattr(req, "selection") and getattr(req, "selection") is not None and hasattr(req.selection, "model_dump")
         else dict(getattr(req, "selection", {}) or {})
     )
     inputs: dict[str, Any] = {
@@ -225,11 +263,12 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
 
     # 8) Per-tab timeout & LangGraph config (via factory.build_graph_config)
     timeout = _timeout_for_tab(tab)
-    cfg = build_graph_config(req, deps)  # single source of truth for configurable.thread_id/lang/checkpoint_ns
+    cfg = build_graph_config(req, deps)  # single source of truth for configurable.thread_id/lang/checkpoint_ns)
 
     # 9) Execute graph (graphs get deps.llm_client via DI)
     try:
-        raw_result = await ainvoke_with_timeout(build_graph(tab, deps), inputs, timeout=timeout, config=cfg)
+        runner = await _get_or_build_runner(tab, deps)
+        raw_result = await ainvoke_with_timeout(runner, inputs, timeout=timeout, config=cfg)
     except asyncio.TimeoutError:
         return _fail(f"{tab.capitalize()}Agent execution timed out.", req)
     except Exception as e:
@@ -344,9 +383,36 @@ def _resolve_backend_port() -> Any | None:
 
 
 def _resolve_ws_hub():
+    """
+    Return a WebSocket hub instance if available. We try common shapes:
+      - get_hub() factory
+      - module/global ws_hub
+      - WsHub() constructor
+    If none are available, return None (graphs will skip WS emits).
+    """
     try:
+        # Preferred: a getter that returns a singleton/instance
+        from workshops_ai.app.services.ws_hub import get_hub  # type: ignore
+        try:
+            return get_hub()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        # Next: a module-level instance
+        from workshops_ai.app.services.ws_hub import ws_hub  # type: ignore
+        if ws_hub:
+            return ws_hub
+    except Exception:
+        pass
+    try:
+        # Last resort: construct the class if available and cheap
         from workshops_ai.app.services.ws_hub import WsHub  # type: ignore
-        return WsHub
+        try:
+            return WsHub()
+        except Exception:
+            return None
     except Exception:
         return None
 
@@ -589,6 +655,7 @@ def _audit_in(req: UIRequest | dict[str, Any]) -> None:
 
 
 def _fail(msg: str, req: Optional[UIRequest], details: Any = None) -> UIResponse:
+    """Return a minimal failure envelope."""
     if req:
         telemetry_log("manager.fail", {"msg": msg, "details": details})
     return UIResponse(

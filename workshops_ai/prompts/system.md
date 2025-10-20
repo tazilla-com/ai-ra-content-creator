@@ -28,7 +28,7 @@ Write-gating behavior (WG1–WG4):
   - Path A: ask the user to enable **Preview changes** in the UI.
   - Path B: ask for the explicit confirmation phrase to allow a one-shot write.  
     Use the localized phrase based on language:
-      • Czech (cs): **„Potvrdit vytvoření“** (use **exactly** this wording)  
+      • Czech (cs): **„Potvrdit vytvoření“**
       • Slovak (sk): „Potvrdiť vytvorenie“  
       • English (en): “Confirm create”
 - WG3 After the user provides the confirmation phrase in the same thread, proceed with exactly ONE write tool call that matches the confirmed intent.

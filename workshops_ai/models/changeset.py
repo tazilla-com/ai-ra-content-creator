@@ -35,10 +35,11 @@ OP_ASSET_UPSERT_THREAT_PRESENCE     = "asset_upsert_threat_presence"
 
 # =============================================================================
 # CIA enums for normalization/validation in CreateAssetFields
+# (Keep STRICT enums – only the values listed below are accepted.)
 # =============================================================================
 
 CONF_LEVELS = {"PUBLIC", "INTERNAL", "PROTECTED", "STRICTLY_PROTECTED"}
-TRI_LEVELS = {"LOW", "MEDIUM", "HIGH"}
+TRI_LEVELS  = {"LOW", "MEDIUM", "HIGH"}
 
 # =============================================================================
 # Audit envelope (strict, snake_case on the wire)
@@ -251,7 +252,6 @@ class ActionUpsertControls(BaseModel):
     op: Literal["upsert_controls"] = OP_UPSERT_CONTROLS
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
-
     items: list[ControlUpsert]
 
     @model_validator(mode="after")
@@ -268,7 +268,6 @@ class ActionRemoveControls(BaseModel):
     op: Literal["remove_controls"] = OP_REMOVE_CONTROLS
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
-
     codes: list[StrictStr]
 
     @model_validator(mode="after")
@@ -288,7 +287,6 @@ class ActionSetAssetMeta(BaseModel):
     op: Literal["set_asset_meta"] = OP_SET_ASSET_META
     asset_id: Optional[StrictStr] = None
     asset_ref: Optional[StrictStr] = None
-
     fields: dict[str, Any]
 
     @model_validator(mode="after")
@@ -298,7 +296,7 @@ class ActionSetAssetMeta(BaseModel):
         return self
 
 # -----------------------------------------------------------------------------
-# Typed create payload with optional isPrimary and conditional CIA requirement
+# Typed create payload with conditional CIA policy (STRICT enums)
 # -----------------------------------------------------------------------------
 
 class CreateAssetFields(BaseModel):
@@ -309,7 +307,11 @@ class CreateAssetFields(BaseModel):
       - Required: name, assetType.
       - Optional: isPrimary (bool), description, id.
       - CIA (confidentiality/integrity/availability) is required ONLY when
-        isPrimary=True. Otherwise CIA must be None and is ignored by the server.
+        isPrimary=True. Otherwise CIA is forcibly set to None.
+      - "Strict enums": only {PUBLIC, INTERNAL, PROTECTED, STRICTLY_PROTECTED}
+        for confidentiality and {LOW, MEDIUM, HIGH} for integrity/availability
+        are accepted (case/spacing normalized). Any other value is rejected
+        for primary assets and nulled for supporting assets.
     """
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
@@ -339,7 +341,12 @@ class CreateAssetFields(BaseModel):
     @field_validator("confidentiality")
     @classmethod
     def _norm_conf(cls, v: Optional[str]) -> Optional[str]:
-        """Normalize confidentiality to UPPER_SNAKE and validate against whitelist."""
+        """
+        Normalize confidentiality to UPPER_SNAKE and validate against CONF_LEVELS.
+        Return:
+          - normalized value on success,
+          - None if empty/None or not in whitelist (invalid).
+        """
         if v is None:
             return None
         x = v.strip().upper().replace("-", "_").replace(" ", "_")
@@ -350,11 +357,14 @@ class CreateAssetFields(BaseModel):
     @field_validator("integrity", "availability")
     @classmethod
     def _norm_tri(cls, v: Optional[str]) -> Optional[str]:
-        """Normalize integrity/availability to UPPER_SNAKE and validate against whitelist."""
+        """
+        Normalize integrity/availability to UPPER_SNAKE and validate against TRI_LEVELS.
+        Return normalized value or None (if empty/invalid).
+        """
         if v is None:
             return None
         x = v.strip().upper().replace("-", "_").replace(" ", "_")
-        if x == "MEDIUM_":
+        if x == "MEDIUM_":  # tolerate a common typo
             x = "MEDIUM"
         return x if x in TRI_LEVELS else None
 
@@ -363,6 +373,12 @@ class CreateAssetFields(BaseModel):
         """
         Enforce CIA only for primary assets; null out CIA for supporting assets
         or when isPrimary is not specified.
+
+        - If isPrimary is True:
+            * all CIA must be present AND belong to strict enums;
+              invalid/missing values trigger an error.
+        - If isPrimary is False or None:
+            * CIA is removed from payload (set to None) regardless of input.
         """
         if self.isPrimary is True:
             missing = [k for k in ("confidentiality", "integrity", "availability") if getattr(self, k) in (None, "")]
@@ -374,6 +390,7 @@ class CreateAssetFields(BaseModel):
             self.integrity = None
             self.availability = None
         return self
+
 
 class ActionCreateAsset(BaseModel):
     """
@@ -466,7 +483,7 @@ Action = Annotated[
         ActionRemoveControls,
         ActionUpsertThreats,
         ActionUpsertImpacts,
-        ActionAssetUpsertThreatPresence,  
+        ActionAssetUpsertThreatPresence,
     ],
     Field(discriminator="op"),
 ]

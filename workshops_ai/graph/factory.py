@@ -2,22 +2,11 @@
 # =============================================================================
 # Purpose: Central LangGraph factory + lightweight DI for all tabs (assets | impacts | threats).
 # - Single source of truth for building GraphDeps (used by manager + routers)
-# - Injects a centralized llm_client (forced to LangChain ChatOpenAI) and explicit llm_temperature
-# - Preserves checkpointer, Redis-backed ephemeral memory
+# - Injects a centralized llm_client (LangChain ChatOpenAI) with explicit temperature
+# - Preserves checkpointer (**Redis-only**, fail-fast policy enforced by checkpointer module)
 # - Exposes a unified submit_changeset wrapper (online submit → OUTBOX fallback) used by all graphs
 # - Exposes helpers to build per-turn LangGraph config (thread_id/checkpoint_ns/lang)
 # - Ensures RAG retriever is wired consistently via the retriever factory
-#
-# Language stability:
-# - `_normalize_lang_iso(...)` normalizes Accept-Language-like values to ISO primaries.
-# - `build_graph_config(req, deps=None)` produces a LangGraph `configurable` with stable `lang`
-#   (and legacy `user_lang`) so agents keep replying in the user’s language (no drift).
-#
-# Thread identity (single source of truth):
-# - `_derive_thread_id(req, ...)` computes a stable thread id:
-#     1) prefer req.session_id (sticky across reconnects),
-#     2) else uuid5(org, conn_id|user_id), always scoped by tab,
-#   and GraphDeps.thread_id_for(...) delegates to it.
 # =============================================================================
 
 from __future__ import annotations
@@ -29,7 +18,8 @@ import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, Optional, Protocol, Final
-
+from workshops_ai.utils.recursion_watch import RecursionWatch
+import json as _json
 # LangGraph type (soft-optional at import-time to avoid hard dependency in tests)
 try:  # pragma: no cover
     from langgraph.types import RunnableGraph  # type: ignore
@@ -45,16 +35,15 @@ except Exception:  # pragma: no cover
 from workshops_ai.settings import get_settings, AppSettings
 from workshops_ai.graph.checkpointer import make_checkpointer as _central_make_checkpointer
 
-# Central LLM client + RAG retriever
-from workshops_ai.llm.client import make_llm_client_from_settings  # noqa: F401
+# RAG retriever factory
 from workshops_ai.rag.retriever import make_retriever as _rag_make_retriever
 
 # Enforce LangChain OpenAI chat model
 from langchain_openai import ChatOpenAI  # type: ignore
 
 # Unified submit wrapper (online → OUTBOX fallback)
-from workshops_ai.app.services.outbox_writer import (
-    submit_or_fallback,
+from workshops_ai.app.services.outbox_writer import (  # type: ignore
+    submit_or_fallback as outbox_submit_or_fallback,
     SubmitOrFallbackResult,
 )
 
@@ -70,6 +59,7 @@ logger = logging.getLogger(__name__)
 # Minimal retriever protocol + factory type
 # =============================================================================
 
+
 class Retriever(Protocol):
     """Minimal retriever interface used by 'explain' nodes inside graphs."""
     async def asearch(self, query: str, *, k: int = 4) -> list[dict]: ...
@@ -77,6 +67,74 @@ class Retriever(Protocol):
 
 
 MakeRetriever = Callable[[str, str], Optional[Retriever]]
+
+# =============================================================================
+# Helpers: unwrap & validate checkpointer
+# =============================================================================
+
+
+def _unwrap_checkpointer_if_needed(obj: Any) -> Any:
+    """
+    If 'obj' is a context manager, enter it and return the inner saver.
+    This prevents passing `_GeneratorContextManager` into LangGraph.
+
+    IMPORTANT:
+    - Never unwrap our custom async adapter (class name "_AsyncAdapter") returned
+      by the central checkpointer builder. Doing so could re-expose sync stubs.
+    - Detect context-manager capability on the *class*, not via __getattr__ on
+      the instance (avoids accidental delegation/recursion).
+    """
+    try:
+        # Do not unwrap our async adapter wrapper
+        if obj.__class__.__name__ == "_AsyncAdapter":
+            return obj
+
+        cls = type(obj)
+        has_enter = callable(getattr(cls, "__enter__", None))
+        has_exit = callable(getattr(cls, "__exit__", None))
+        has_aenter = callable(getattr(cls, "__aenter__", None))
+        has_aexit = callable(getattr(cls, "__aexit__", None))
+
+        # We do not support async context managers here
+        if has_aenter or has_aexit:
+            raise RuntimeError(
+                "Async context manager provided as checkpointer. "
+                "Ensure the checkpointer module returns a ready saver, not an async CM."
+            )
+
+        if has_enter and has_exit:
+            inner = obj.__enter__()  # type: ignore[misc]
+            try:
+                atexit.register(lambda: obj.__exit__(None, None, None))
+            except Exception:
+                pass
+            return inner
+
+        return obj
+    except Exception as e:
+        raise RuntimeError(f"Failed to unwrap checkpointer context manager: {e}") from e
+
+
+def _assert_saver_shape(saver: Any) -> None:
+    """
+    Defensive: assert we have a *real* LangGraph saver, not a CM.
+    Accept either legacy (.get_next_version/...) or async surface (aget_tuple/aput/...).
+    """
+    if hasattr(saver, "__enter__") or hasattr(saver, "__aenter__"):
+        raise RuntimeError(
+            f"Invalid checkpointer: looks like a context manager ({type(saver)!r}). "
+            "It must be the actual saver object."
+        )
+    ok = any([
+        hasattr(saver, "get_next_version"),          # legacy LG
+        hasattr(saver, "aget_tuple") and hasattr(saver, "aput"),  # async surface
+    ])
+    if not ok:
+        raise RuntimeError(
+            f"Invalid checkpointer type: {type(saver)!r}. "
+            "Expected a LangGraph saver with .get_next_version or async aget_tuple/aput."
+        )
+
 
 # =============================================================================
 # LRU-cached builders (LLM client, Checkpointer)
@@ -99,68 +157,67 @@ def _get_llm_client_cached(
     kwargs: dict[str, Any] = {
         "model": model,
         "api_key": api_key,
+        "openai_api_key": api_key,
         "temperature": float(temperature),
     }
     if base_url:
         kwargs["base_url"] = base_url
+        kwargs["openai_api_base"] = base_url
     if http_timeout_sec is not None:
+        # NOTE: ChatOpenAI param name varies across versions; our env uses 'timeout'.
         kwargs["timeout"] = int(http_timeout_sec)
+        kwargs["request_timeout"] = int(http_timeout_sec)
     if max_retries is not None:
         kwargs["max_retries"] = int(max_retries)
 
     return ChatOpenAI(**kwargs)  # type: ignore[call-arg]
 
 
+# Redis-only checkpointer cache keyed by (redis_url, namespace, ttl)
 @lru_cache(maxsize=8)
-def _get_checkpointer_cached(
-    *,
-    kind: str | None,
+def _get_checkpointer_cached_by_cfg(
     redis_url: str | None,
-    sqlite_path: str | None,
     namespace: str | None,
     ttl_sec: int | None,
 ) -> Any:
     """
-    Build the LangGraph checkpointer and cache it by its effective backend config.
-    Supports two signatures of the central builder:
-      - make_checkpointer(settings=AppSettings)
-      - make_checkpointer(kind=..., redis_url=..., sqlite_path=..., namespace=..., ttl_sec=...)
+    Build the Redis-backed LangGraph checkpointer and cache it by its effective config.
+
+    NOTE:
+    - The centralized builder reads settings; these args are only to form a stable cache key,
+      so we don't rebuild under identical effective config.
+    - The underlying builder is Redis-only and fail-fast.
+    - We *also* unwrap any context manager here to guarantee a real saver is cached.
     """
-    try:
-        return _central_make_checkpointer(
-            kind=kind,
-            redis_url=redis_url,
-            sqlite_path=sqlite_path,
-            namespace=namespace,
-            ttl_sec=ttl_sec,
-        )
-    except TypeError:
-        # Fallback if the project's builder expects settings only.
-        return _central_make_checkpointer(settings=get_settings())
+    saver = _central_make_checkpointer(settings=get_settings())
+    saver = _unwrap_checkpointer_if_needed(saver)
+    _assert_saver_shape(saver)
+    return saver
+
 
 # =============================================================================
 # Redis-backed ephemeral memory accessors (per-org/session)
 # =============================================================================
 # NOTE: Graph memory callers in our codebase are of two kinds:
 #   1) Rolling window KV adapter → calls get(key) / set(key, value, ttl=...)
-#   2) Manager/routers rich access → call with kwargs (org_id=..., thread_id=..., key=..., ...)
+#   2) Manager/routers rich access → call with kwargs (org_id=..., thread_id=..., ...)
 # We therefore provide an adapter that supports BOTH forms.
 
 class MemoryGet(Protocol):
     async def __call__(self, key: str) -> Optional[str]: ...
-    # Rich form supported via kwargs:
+    # Rich form also supported via kwargs:
     #   memory_get(org_id=..., user_id=..., thread_id=..., namespace=..., key=...)
 
 
 class MemorySet(Protocol):
     async def __call__(self, key: str, value: str, *, ttl_sec: Optional[int] = None) -> None: ...
-    # Rich form supported via kwargs:
+    # Rich form also supported via kwargs:
     #   memory_set(org_id=..., user_id=..., thread_id=..., namespace=..., key=..., value=..., ttl_sec=...)
 
 
 class MemoryDelete(Protocol):
     async def __call__(self, key: str) -> None: ...
-    # Rich form supported via kwargs:
+    # Rich form also supported via kwargs:
     #   memory_delete(org_id=..., user_id=..., thread_id=..., namespace=..., key=...)
 
 
@@ -168,7 +225,7 @@ class MemoryDelete(Protocol):
 class SubmitChangeSet(Protocol):
     async def __call__(
         self,
-        changeset: ChangeSet,
+        changeset: Any,  # může být dict / Pydantic / dataclass
         *,
         require_success: bool = False
     ) -> SubmitOrFallbackResult: ...
@@ -178,13 +235,14 @@ class SubmitChangeSet(Protocol):
 # Thread id derivation (single source of truth)
 # =============================================================================
 
+
 def _derive_thread_id(req: UIRequest, fallback_tab: str | None = None) -> str:
     """
     Build a stable thread_id for LangGraph/checkpointers and per-thread memory.
 
     Priority:
       1) If `req.session_id` is present → use it (sticky across reconnects).
-      2) Else compute uuid5(namespace=org_id, name=(conn_id | user_id)).
+      2) Else compute uuid5(namespace=org_id, name=(conn_id | user_id)).*
     Always scope by tab to avoid cross-talk between tabs.
 
     Shape:
@@ -302,6 +360,7 @@ def build_graph(tab: str, deps: GraphDeps) -> RunnableGraph:
 # Helpers for memory adapters
 # =============================================================================
 
+
 def _coerce_mem_args(*args, **kwargs) -> dict[str, Any]:
     """
     Normalize arguments for memory_get/set/delete adapter to support both calling styles.
@@ -360,6 +419,7 @@ def _coerce_mem_args(*args, **kwargs) -> dict[str, Any]:
 # =============================================================================
 # Ephemeral memory (Redis), safe no-op fallback if Redis missing
 # =============================================================================
+
 
 def make_redis_memory(settings: AppSettings):
     """
@@ -463,11 +523,15 @@ def make_redis_memory(settings: AppSettings):
     # Close client on interpreter exit (best-effort)
     def _finalizer() -> None:
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(client.close())
-            else:
-                loop.run_until_complete(client.close())
+            # Try to schedule on a running loop
+            loop = asyncio.get_running_loop()
+            loop.create_task(client.close())
+        except RuntimeError:
+            # No running loop -> create a fresh one just for the close
+            try:
+                asyncio.run(client.close())
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -479,41 +543,71 @@ def make_redis_memory(settings: AppSettings):
 # Helper: build submit_changeset callable (online → fallback OUTBOX)
 # =============================================================================
 
+
 def _make_submit_callable(settings: AppSettings) -> SubmitChangeSet:
     """
     Returns a callable that tries to submit to the primary backend
     (if an API client is available), otherwise falls back to writing
     into the OUTBOX directory via submit_or_fallback().
-
-    This is the canonical submit used by ALL graphs via deps.submit_changeset.
     """
     submitter: Any = None
     try:
         from workshops_ai.app.services.tazila_client import get_client  # type: ignore
-        submitter = get_client()  # expected to implement .submit_changeset(...)
+        submitter = None  # expected to implement .submit_changeset(...)
     except Exception:
         submitter = None
 
     outbox_dir = getattr(getattr(settings, "tazila", object()), "outbox_path", None)
 
-    async def _submit(
-        changeset: ChangeSet,
+    def _to_plain_dict(obj: Any) -> dict:
+        # 1) Pydantic
+        if hasattr(obj, "model_dump"):
+            try:
+                return obj.model_dump()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        # 2) Dataclass
+        try:
+            from dataclasses import is_dataclass, fields as dc_fields
+            if is_dataclass(obj):
+                out = {}
+                for f in dc_fields(obj):
+                    v = getattr(obj, f.name)
+                    out[f.name] = v if isinstance(v, (str,int,float,bool,type(None),dict,list,tuple)) else str(v)
+                return out
+        except Exception:
+            pass
+        # 3) Dict
+        if isinstance(obj, dict):
+            return obj
+        # 4) Generic JSON roundtrip (fallback)
+        try:
+            return _json.loads(_json.dumps(obj, default=lambda o: getattr(o, "__dict__", str(o))))
+        except Exception:
+            return {"_raw": str(obj)}
+
+    async def submit_changeset(
+        changeset: Any,
         *,
         require_success: bool = False,
     ) -> SubmitOrFallbackResult:
-        return await submit_or_fallback(
-            changeset,
-            submitter=submitter,
+        payload = _to_plain_dict(changeset)
+        # JSON guard pro jistotu
+        _json.dumps(payload, ensure_ascii=False)
+        return await outbox_submit_or_fallback(
+            payload,
+            submitter=None,
             require_success=require_success,
             outbox_dir=outbox_dir,
         )
 
-    return _submit
+    return submit_changeset
 
 
 # =============================================================================
 # Default dependencies factory (used by manager and routers)
 # =============================================================================
+
 
 def make_default_deps(
     tab: str | None = None,
@@ -539,23 +633,18 @@ def make_default_deps(
     - We *always* construct a LangChain `ChatOpenAI` from settings and inject it as `llm_client`.
       Any ad-hoc/legacy client is ignored to keep graphs clean and consistent.
     - We expose `submit_changeset` as the unified submit wrapper. Prefer it everywhere.
+    - **Redis-only** checkpointer: created centrally and cached by (redis_url, namespace, ttl).
+      We also *unwrap* any context manager to the bare saver (defensive).
     """
     # Settings first (manager may pass settings; routers often pass app.state.settings)
     s = settings or get_settings()
 
-    # --- Checkpointer (CACHED) ---
-    kind = getattr(getattr(s, "checkpointer", object()), "kind", None) or getattr(s, "checkpointer_kind", None)
-    redis_url = getattr(getattr(s, "redis", object()), "url", None)
-    sqlite_path = getattr(getattr(getattr(s, "sqlite", object()), "ckpt_path", object()), "__str__", lambda: None)()
-    ns = getattr(s, "checkpoint_ns", None)
+    # --- Checkpointer (CACHED, Redis-only) ---
+    redis_url = getattr(getattr(s, "redis", object()), "url", None) or getattr(s, "redis_url", None)
+    ns = getattr(s, "checkpoint_ns", None) or "lg:ckpt"
     ttl_sec = getattr(s, "checkpoint_ttl_sec", None)
-    saver = _get_checkpointer_cached(
-        kind=kind,
-        redis_url=redis_url,
-        sqlite_path=sqlite_path,
-        namespace=ns,
-        ttl_sec=ttl_sec,
-    )
+    saver = _get_checkpointer_cached_by_cfg(redis_url, ns, int(ttl_sec) if ttl_sec is not None else None)
+    _assert_saver_shape(saver)
 
     # Backend port (prefer provider, fallback to CSV, else None)
     if backend_port is None:
@@ -633,7 +722,7 @@ def make_default_deps(
         pass
 
     # Expose checkpoint namespace (helps routers/tests pass it to LangGraph)
-    ckpt_ns = ns or getattr(getattr(s, "checkpointer", object()), "namespace", None)
+    ckpt_ns = ns  # ns already normalized above with default "lg:ckpt"
 
     return GraphDeps(
         backend_port=backend_port,
@@ -681,21 +770,48 @@ def get_graph_deps(
 # =============================================================================
 
 async def _invoke_async(graph: RunnableGraph, inputs: Any, config: Optional[dict]) -> Any:
-    """Always prefer async. Do NOT fallback to sync for graphs with async-only nodes."""
-    if hasattr(graph, "ainvoke"):
-        if config is not None:
-            return await graph.ainvoke(inputs, config=config)  # type: ignore[arg-type]
-        return await graph.ainvoke(inputs)  # type: ignore[misc]
+    """
+    Always prefer async. Instrument calls to expose the exact recursion loop if it happens.
+    On RecursionError:
+      - log last ~200 intra-project calls (module:function @ file:line)
+      - dump full stacks of all threads via faulthandler
+    """
+    watch = RecursionWatch(module_prefixes=())  # loguj vše, nejen workshops_ai.*
+    logger.debug("factory._invoke_async tracer ACTIVE")
+    try:
+        if hasattr(graph, "ainvoke"):
+            with watch.enabled():
+                if config is not None:
+                    return await graph.ainvoke(inputs, config=config)  # type: ignore[arg-type]
+                return await graph.ainvoke(inputs)  # type: ignore[misc]
 
-    # Rare legacy case: graph has no ainvoke at all -> use sync in a thread
-    loop = asyncio.get_running_loop()
-    if config is not None and hasattr(graph, "invoke"):
-        return await loop.run_in_executor(
-            None, lambda: graph.invoke(inputs, config=config)  # type: ignore[misc]
-        )
-    if hasattr(graph, "invoke"):
-        return await loop.run_in_executor(None, lambda: graph.invoke(inputs))  # type: ignore/misc
-    return await loop.run_in_executor(None, lambda: graph(inputs))  # type: ignore[operator]
+        # Rare legacy case: graph has no ainvoke at all -> use sync in a thread
+        loop = asyncio.get_running_loop()
+        if config is not None and hasattr(graph, "invoke"):
+            with watch.enabled():
+                return await loop.run_in_executor(
+                    None, lambda: graph.invoke(inputs, config=config)  # type: ignore[misc]
+                )
+        if hasattr(graph, "invoke"):
+            with watch.enabled():
+                return await loop.run_in_executor(None, lambda: graph.invoke(inputs))  # type: ignore[misc]
+        with watch.enabled():
+            return await loop.run_in_executor(None, lambda: graph(inputs))  # type: ignore[operator]
+
+    except RecursionError:
+        # 1) Tail of recent calls inside our modules – pinpoints the loop
+        try:
+            logger.error("RecursionError: recent call tail (<=200):\n%s", watch.tail_text(200))
+        except Exception:
+            pass
+        # 2) Dump real stacks of all threads (goes to stderr → docker logs)
+        try:
+            import faulthandler, sys
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
+        # Propagate so existing telemetry/handlers run as before
+        raise
 
 
 async def ainvoke_with_timeout(
@@ -750,7 +866,7 @@ def make_langgraph_config(
     """
     Compose a LangGraph config with required 'configurable' keys for the checkpointer.
     - thread_id      : required by LangGraph checkpointers
-    - checkpoint_ns  : optional but recommended (taken from deps.checkpoint_ns)
+    - checkpoint_ns  : required (we always set it; avoids empty string drift)
     - lang/user_lang : stable per-request language hint for ALL agent prompts
 
     NOTE:
@@ -761,8 +877,13 @@ def make_langgraph_config(
     cfg: dict[str, Any] = {"configurable": {}}
     user = (user_id or "anon").strip() or "anon"
     cfg["configurable"]["thread_id"] = f"{org_id}:{tab}:{user}"
-    if deps.checkpoint_ns:
-        cfg["configurable"]["checkpoint_ns"] = deps.checkpoint_ns
+
+    # ALWAYS set checkpoint_ns (deps.checkpoint_ns or settings or default)
+    cfg["configurable"]["checkpoint_ns"] = (
+        deps.checkpoint_ns
+        or getattr(deps.settings, "checkpoint_ns", None)
+        or "lg:ckpt"
+    )
 
     # Language (stable; set both keys for back-compat)
     if user_lang:
@@ -776,11 +897,12 @@ def build_graph_config(req: UIRequest, deps: Optional[GraphDeps] = None) -> dict
     """
     Convenience wrapper to build the per-turn LangGraph config from a UIRequest.
 
-    - Extracts and normalizes language from `req.language` (already ISO by ws_router).
+    - Extracts and normalizes language from `req.language`.
     - Computes a stable thread_id via the single source of truth:
         * If deps is provided → deps.thread_id_for(req) → _derive_thread_id(...)
         * Else → _derive_thread_id(req) directly
     - Sets both `configurable.lang` (new) and `configurable.user_lang` (legacy).
+    - ALWAYS sets `configurable.checkpoint_ns` to avoid empty-string drift.
     """
     # Normalize language (defensive; ws_router already sends ISO like "cs")
     iso = _normalize_lang_iso(getattr(req, "language", None))
@@ -788,48 +910,41 @@ def build_graph_config(req: UIRequest, deps: Optional[GraphDeps] = None) -> dict
     # Thread id (single source of truth)
     if deps is not None:
         thread_id = deps.thread_id_for(req)
-        ckpt_ns = deps.checkpoint_ns
+        ckpt_ns = deps.checkpoint_ns or getattr(deps.settings, "checkpoint_ns", None) or "lg:ckpt"
     else:
         thread_id = _derive_thread_id(req)
-        ckpt_ns = None
+        ckpt_ns = "lg:ckpt"
 
-    cfg: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
-    if ckpt_ns:
-        cfg["configurable"]["checkpoint_ns"] = ckpt_ns
-
-    cfg["configurable"]["lang"] = iso
-    cfg["configurable"]["user_lang"] = iso  # back-compat
+    cfg: dict[str, Any] = {
+        "configurable": {
+            "thread_id": thread_id,
+            "checkpoint_ns": ckpt_ns,
+            "lang": iso,
+            "user_lang": iso,  # back-compat
+        }
+    }
 
     return cfg
 
 
 # =============================================================================
-# Compatibility alias (accepts optional argument)
+# Compatibility alias (accepts optional argument) — NO WRAPPING!
 # =============================================================================
 
 def build_checkpointer(settings: AppSettings | None = None) -> Any:
     """
     Compatibility wrapper.
-    - If called as build_checkpointer() -> uses get_settings() internally.
-    - If called as build_checkpointer(settings) or build_checkpointer(settings=...),
-      forwards to the centralized (CACHED) builder.
+    - Forwards to the centralized (CACHED) Redis-only builder.
+    - Returns a *real* LangGraph saver, never a context manager.
     """
     s = settings or get_settings()
-    kind = getattr(getattr(s, "checkpointer", object()), "kind", None) or getattr(s, "checkpointer_kind", None)
-    redis_url = getattr(getattr(s, "redis", object()), "url", None)
-    sqlite_path = getattr(getattr(s, "sqlite", object()), "ckpt_path", None)
-    # Some settings may wrap the path; ensure a plain string (best-effort)
-    if hasattr(sqlite_path, "__str__"):
-        sqlite_path = str(sqlite_path)
-    ns = getattr(s, "checkpoint_ns", None)
+    redis_url = getattr(getattr(s, "redis", object()), "url", None) or getattr(s, "redis_url", None)
+    ns = getattr(s, "checkpoint_ns", None) or "lg:ckpt"
     ttl_sec = getattr(s, "checkpoint_ttl_sec", None)
-    return _get_checkpointer_cached(
-        kind=kind,
-        redis_url=redis_url,
-        sqlite_path=sqlite_path,
-        namespace=ns,
-        ttl_sec=ttl_sec,
-    )
+
+    saver = _get_checkpointer_cached_by_cfg(redis_url, ns, int(ttl_sec) if ttl_sec is not None else None)
+    _assert_saver_shape(saver)
+    return saver
 
 
 __all__ = [

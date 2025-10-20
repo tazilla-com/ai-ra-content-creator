@@ -50,13 +50,16 @@
 #   - EN codes in catalogs are canonical and must not be localized.
 #   - Pydantic models are referenced only as type hints (no instantiation here).
 # ------------------------------------------------------------------------------
-
 from __future__ import annotations
 
 from typing import Mapping, Protocol, Sequence, TypedDict, runtime_checkable
 
 # Unified DTOs (type hints only)
 from workshops_ai.api.schema import Asset
+
+# Lightweight, stdlib-only bits used by the optional cache wrapper below.
+from threading import RLock  # thread-safe TTL cache for list_asset_types()
+from time import monotonic   # monotonic clock for TTL
 
 
 # ------------------------------------------------------------------------------
@@ -307,3 +310,87 @@ class BackendPort(Protocol):
           - If `level` is outside 0..4 → raise BackendValidationError.
         Returns a mapping reflecting the upserted row.
         """
+
+
+# ------------------------------------------------------------------------------
+# Optional wrapper: tiny TTL cache for list_asset_types()
+# ------------------------------------------------------------------------------
+# Why here?
+# - Keeps the cache policy colocated with the contract.
+# - Pure stdlib, thread-safe (RLock), zero external deps.
+#
+# Behavior:
+# - Caches the result of `list_asset_types()` for `asset_types_ttl_s` seconds.
+# - Single-entry (per backend instance) cache; effectively LRU(1)+TTL.
+# - Never caches failures (exceptions are propagated as-is).
+# - Returns a shallow copy to avoid callers mutating the cached list.
+# - You can call `.invalidate_asset_types_cache()` to drop it eagerly.
+# ------------------------------------------------------------------------------
+
+class CachedBackendPort:
+    """
+    Proxy/wrapper that adds a small TTL cache to `list_asset_types()` and forwards
+    everything else to the underlying backend instance.
+
+    Usage:
+        backend = CsvBackend(...)
+        port = CachedBackendPort(backend, asset_types_ttl_s=600)
+        types = port.list_asset_types()  # cached for 10 minutes
+    """
+
+    __slots__ = ("_delegate", "_ttl_s", "_lock", "_asset_types", "_asset_types_exp")
+
+    def __init__(self, delegate: BackendPort, *, asset_types_ttl_s: int = 600) -> None:
+        self._delegate: BackendPort = delegate
+        self._ttl_s: int = max(0, int(asset_types_ttl_s))
+        self._lock: RLock = RLock()
+        self._asset_types: list[str] | None = None
+        self._asset_types_exp: float = 0.0
+
+    # ---- Cached method -------------------------------------------------------
+
+    def list_asset_types(self) -> list[str]:
+        now = monotonic()
+        with self._lock:
+            if self._asset_types is not None and now < self._asset_types_exp:
+                # Return a defensive copy so callers can't mutate our cache.
+                return list(self._asset_types)
+
+        # Miss or expired → fetch outside the lock to avoid long critical section.
+        fresh = self._delegate.list_asset_types()
+
+        # Validate minimal contract: must be a sequence of strings.
+        if not isinstance(fresh, list):
+            fresh = list(fresh)
+        # Defensively cast items to str (lightweight).
+        fresh = [str(x) for x in fresh]
+
+        with self._lock:
+            self._asset_types = fresh
+            self._asset_types_exp = monotonic() + self._ttl_s if self._ttl_s > 0 else 0.0
+            return list(self._asset_types)
+
+    # ---- Manual invalidation (eager) ----------------------------------------
+
+    def invalidate_asset_types_cache(self) -> None:
+        """Drop the cached asset types immediately (e.g., after a config reload)."""
+        with self._lock:
+            self._asset_types = None
+            self._asset_types_exp = 0.0
+
+    # ---- Transparent forwarding for all other attributes/methods -------------
+
+    def __getattr__(self, name: str):
+        # Called only if `name` wasn't found on this wrapper; forward to delegate.
+        return getattr(self._delegate, name)
+
+
+def with_catalog_cache(port: BackendPort, *, asset_types_ttl_s: int = 600) -> BackendPort:
+    """
+    Convenience helper returning a `BackendPort`-compatible proxy with TTL cache.
+
+    Example:
+        real_port: BackendPort = CsvBackend(...)
+        cached_port = with_catalog_cache(real_port, asset_types_ttl_s=300)
+    """
+    return CachedBackendPort(port, asset_types_ttl_s=asset_types_ttl_s)

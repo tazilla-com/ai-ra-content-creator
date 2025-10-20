@@ -16,6 +16,12 @@ Additions in this revision
 - No forced fallback to "list" in ensure_action_is_string (let clarifying logic handle it).
 - AssetsNLU gains `question: Optional[str]` for explain flows.
 - Multilingual (CZ/SK/EN) action aliases for more natural chat inputs.
+
+Lock-branch helpers (NEW in this file)
+- `should_fetch_asset_types(pending_fields)` returns False unless "assetType" is among
+  the currently pending fields → prevents unnecessary catalog lookups.
+- `force_asset_create_route(is_draft_in_progress)` keeps the "force to asset.create" route
+  when a create draft is in progress.
 """
 
 from __future__ import annotations
@@ -35,6 +41,9 @@ __all__ = [
     "Tab",
     "parse_nlu_for_tab",
     "ensure_action_is_string",
+    # NEW helpers exported for lock-branch logic:
+    "should_fetch_asset_types",
+    "force_asset_create_route",
 ]
 
 # ---------- Helpers ----------
@@ -470,3 +479,33 @@ def ensure_action_is_string(nlu_dict: dict[str, Any], tab: str | None = None) ->
             nlu_dict["action"] = aliases_assets[act]
 
     return nlu_dict
+
+
+# ---------- Lock-branch helpers (used by the agent layer) ----------
+
+def should_fetch_asset_types(pending_fields: Optional[list[str]]) -> bool:
+    """
+    Return True iff the 'assetType' field is among the pending fields that the
+    agent still needs to fill. This prevents hitting the catalog endpoint when
+    we don't actually need asset types right now.
+
+    - Matching is case-insensitive.
+    - Accepts both "assetType" and "asset_type" just in case the caller uses
+      snake_case internally for state keys.
+    """
+    if not pending_fields:
+        return False
+    wanted = {"assettype", "asset_type"}
+    return any((f or "").strip().lower() in wanted for f in pending_fields)
+
+
+def force_asset_create_route(is_draft_in_progress: bool) -> Optional[str]:
+    """
+    Keep the "force to asset.create" route while a create flow is in progress.
+    If a draft create is active, the agent should continue routing to the
+    'asset.create' operation regardless of incidental intents detected by NLU.
+
+    Returns:
+        "asset.create" when a draft is in progress, otherwise None.
+    """
+    return "asset.create" if is_draft_in_progress else None
