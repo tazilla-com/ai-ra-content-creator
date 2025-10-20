@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from uuid import uuid4
 from datetime import datetime, timezone
 from typing import Any, Optional, Annotated, Union, Literal
 
@@ -40,6 +41,62 @@ OP_ASSET_UPSERT_THREAT_PRESENCE     = "asset_upsert_threat_presence"
 
 CONF_LEVELS = {"PUBLIC", "INTERNAL", "PROTECTED", "STRICTLY_PROTECTED"}
 TRI_LEVELS  = {"LOW", "MEDIUM", "HIGH"}
+
+# =============================================================================
+# AssetType whitelist + synonyms
+# -----------------------------------------------------------------------------
+# - The backend schema has a FIXED set of allowed assetType values (EN only).
+# - Incoming values from mappers/extractors may use "friendly" names
+#   (e.g., "Web application", "Database"). We normalize such synonyms here.
+# - If a value can't be normalized to a whitelisted code, validation fails
+#   early inside CreateAssetFields (before reaching the backend).
+# =============================================================================
+
+ASSET_TYPE_CODES: set[str] = {
+    "Application software", "Cloud services", "Data storage",
+    "Electronic data/Business process", "Other", "Information system",
+    "IoT", "Location", "Mobile devices", "Laptop", "Operating system",
+    "Paper data", "PC", "Staff", "Portable data media",
+    "Server infrastructure", "Network infrastructure",
+    "Virtualization platform", "Equipment, machines",
+}
+
+# Case-insensitive synonyms -> canonical codes from ASSET_TYPE_CODES
+ASSET_TYPE_SYNONYMS: dict[str, str] = {
+    # common categories seen in mappers/extractors
+    "web application": "Application software",
+    "mobile application": "Application software",
+    "monitoring system": "Application software",
+    "devops toolchain": "Application software",
+
+    "database": "Data storage",
+    "data warehouse": "Data storage",
+
+    "identity provider": "Cloud services",
+    "idp": "Cloud services",
+    # feel free to extend as needed:
+    "it service": "Cloud services",
+}
+
+def normalize_asset_type(v: str) -> str:
+    """
+    Normalize a human/friendly assetType to the canonical catalog code.
+
+    Rules:
+      - preserve exact matches against ASSET_TYPE_CODES
+      - try case-insensitive synonyms from ASSET_TYPE_SYNONYMS
+      - otherwise return the original string (validator will reject later)
+
+    Note:
+      Keep values strictly in English; backend expects canonical EN labels.
+    """
+    s = (v or "").strip()
+    if not s:
+        return s
+    if s in ASSET_TYPE_CODES:
+        return s
+    alt = ASSET_TYPE_SYNONYMS.get(s.lower())
+    return alt if alt in ASSET_TYPE_CODES else s
 
 # =============================================================================
 # Audit envelope (strict, snake_case on the wire)
@@ -171,7 +228,8 @@ class ThreatUpsert(BaseModel):
                 if s and s not in seen:
                     seen.add(s)
                     cleaned.append(s)
-            self.asset_type_codes = cleaned
+            # Avoid mutation warnings under pydantic v2 validators
+            object.__setattr__(self, "asset_type_codes", cleaned)
         return self
 
 
@@ -312,6 +370,8 @@ class CreateAssetFields(BaseModel):
         for confidentiality and {LOW, MEDIUM, HIGH} for integrity/availability
         are accepted (case/spacing normalized). Any other value is rejected
         for primary assets and nulled for supporting assets.
+      - assetType must be one of the FIXED catalog values (EN only).
+        Synonyms are normalized; unknown values raise a validation error.
     """
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
@@ -329,6 +389,7 @@ class CreateAssetFields(BaseModel):
     # Optional client-supplied id/reference passthrough
     id: Optional[StrictStr] = None
 
+    # --- Basic trimming for required strings ---------------------------------
     @field_validator("name", "assetType")
     @classmethod
     def _trim_required_nonempty(cls, v: str, info) -> str:
@@ -338,6 +399,24 @@ class CreateAssetFields(BaseModel):
             raise ValueError(f"{info.field_name} must be a non-empty string")
         return s
 
+    # --- Enforce canonical assetType against the fixed code list -------------
+    @field_validator("assetType")
+    @classmethod
+    def _asset_type_enum(cls, v: str) -> str:
+        """
+        Normalize + validate assetType against the fixed catalog.
+
+        - exact match -> OK
+        - synonym -> mapped to canonical code
+        - otherwise -> raise a ValueError with clear message
+        """
+        s = normalize_asset_type(v)
+        if s not in ASSET_TYPE_CODES:
+            allowed = ", ".join(sorted(ASSET_TYPE_CODES))
+            raise ValueError(f"assetType must be one of [{allowed}], got: {v!r}")
+        return s
+
+    # --- CIA normalization gates ---------------------------------------------
     @field_validator("confidentiality")
     @classmethod
     def _norm_conf(cls, v: Optional[str]) -> Optional[str]:
@@ -379,6 +458,10 @@ class CreateAssetFields(BaseModel):
               invalid/missing values trigger an error.
         - If isPrimary is False or None:
             * CIA is removed from payload (set to None) regardless of input.
+
+        Note:
+          Using Python None here ensures JSON serialization as `null`, which
+          matches the backend schema requirement for supporting assets.
         """
         if self.isPrimary is True:
             missing = [k for k in ("confidentiality", "integrity", "availability") if getattr(self, k) in (None, "")]
@@ -386,9 +469,9 @@ class CreateAssetFields(BaseModel):
                 raise ValueError(f"primary asset requires CIA fields, missing: {', '.join(missing)}")
         else:
             # Supporting (or unspecified) assets must not carry CIA in the payload
-            self.confidentiality = None
-            self.integrity = None
-            self.availability = None
+            object.__setattr__(self, "confidentiality", None)
+            object.__setattr__(self, "integrity", None)
+            object.__setattr__(self, "availability", None)
         return self
 
 
@@ -400,8 +483,9 @@ class ActionCreateAsset(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     op: Literal["create_asset"] = OP_CREATE_ASSET
-    client_token: StrictStr
-    # Typed & validated payload instead of an arbitrary dict
+    # Was: client_token: StrictStr
+    # Now: generate a token if the caller didn't provide one
+    client_token: StrictStr = Field(default_factory=lambda: uuid4().hex)
     fields: CreateAssetFields
 
     @field_validator("client_token")
@@ -411,7 +495,6 @@ class ActionCreateAsset(BaseModel):
         if not v2:
             raise ValueError("client_token must be a non-empty string")
         return v2
-
 
 class ActionUpsertThreats(BaseModel):
     """
@@ -662,6 +745,9 @@ __all__ = [
     "OP_UPSERT_THREATS",
     "OP_UPSERT_IMPACTS",
     "OP_ASSET_UPSERT_THREAT_PRESENCE",
+    "ASSET_TYPE_CODES",
+    "ASSET_TYPE_SYNONYMS",
+    "normalize_asset_type",
     # models
     "Audit",
     "ImpactItem",

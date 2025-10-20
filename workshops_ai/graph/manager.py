@@ -69,7 +69,7 @@ _SUPPORTED_TABS: Final[set[str]] = {"assets", "impacts", "threats"}
 # Compiled-graph cache
 # -----------------------------------------------------------------------------
 # Bump this when you change graph definitions/nodes so the runners are recompiled.
-WSAI_GRAPH_VERSION: Final[str] = "2025.10-iter"
+WSAI_GRAPH_VERSION: Final[str] = "2025.10-iter+ckpt"
 
 # Process-local cache: (version:tab) → compiled runner
 _GRAPHS: dict[str, Any] = {}

@@ -28,16 +28,20 @@ from typing import Callable, Literal, Optional, cast, TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 try:
-    # pydantic v2
-    from pydantic import ConfigDict
+    from pydantic import ConfigDict  # v2
+    _PYDANTIC_V2 = True
 except Exception:  # pragma: no cover
     ConfigDict = dict  # type: ignore
+    _PYDANTIC_V2 = False
 
 from typing_extensions import TypedDict
 
 if TYPE_CHECKING:
     from workshops_ai.graph.factory import GraphDeps
 
+from workshops_ai.models.changeset import (
+    ActionCreateAsset, CreateAssetFields, build_changeset
+)
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 from workshops_ai.graph.agent_node import agent_decide, AgentDecision
 
@@ -285,46 +289,52 @@ class AssetUpdateItem(BaseModel):
     description: Optional[str] = None
 
 class AssetState(BaseModel):
-    # Relaxed validation to avoid hidden deep walks; runtime-only fields are excluded from persistence
-    model_config = ConfigDict(validate_assignment=False, arbitrary_types_allowed=True)
-    class Config:  # pydantic v1 fallback (ignored by v2)
-        validate_assignment = False
-        arbitrary_types_allowed = True
+    # Pydantic v2 config (preferováno, žádný vnořený Config)
+    if _PYDANTIC_V2:
+        model_config = ConfigDict(
+            validate_assignment=False,
+            arbitrary_types_allowed=True,
+        )
+    else:
+        # Pydantic v1 fallback (použije se jen když v2 není k dispozici)
+        class Config:
+            validate_assignment = False
+            arbitrary_types_allowed = True
 
     # Request context
     org_id: str
     active_tab: str = Field(default="assets")
-    message: Optional[str] = None
-    selection: Optional[dict] = None
-    user_id: Optional[str] = None
-    locale: Optional[str] = None
-    language: Optional[str] = None
-    history: Optional[list[dict]] = None
-    staging: Optional[bool] = None
-    once_flags: Optional[dict] = None
+    message: str | None = None
+    selection: dict | None = None
+    user_id: str | None = None
+    locale: str | None = None
+    language: str | None = None
+    history: list[dict] | None = None
+    staging: bool | None = None
+    once_flags: dict | None = None
 
     # Structured inputs
-    action: Optional[Intent] = None
-    create_items: Optional[list[AssetCreateItem]] = None
-    update_items: Optional[list[AssetUpdateItem]] = None
-    question: Optional[str] = None
+    action: Literal["list","get","create","update_meta","explain","list_types","agent_reply"] | None = None
+    create_items: list["AssetCreateItem"] | None = None
+    update_items: list["AssetUpdateItem"] | None = None
+    question: str | None = None
 
     # Working outputs
-    intent: Optional[Intent] = None
+    intent: Literal["list","get","create","update_meta","explain","list_types","agent_reply"] | None = None
 
     # CRITICAL: keep heavy/complex objects out of persisted state
-    actions: Optional[list[dict]] = Field(default=None, exclude=True)  # not used anymore
+    actions: list[dict] | None = Field(default=None, exclude=True)
     has_actions: bool = False
-    change: Optional[dict] = Field(default=None, exclude=True)
-    result: Optional[dict] = Field(default=None, exclude=True)
+    change: dict | None = Field(default=None, exclude=True)
+    result: dict | None = Field(default=None, exclude=True)
 
     # Conversational slot-filling (CREATE only)
-    create_draft: Optional[dict] = None
-    pending_fields: Optional[list[str]] = None
+    create_draft: dict | None = None
+    pending_fields: list[str] | None = None
     create_flow: bool = False
 
     # Telemetry — UI-only (never persist)
-    agent_events: list[ToolEvent] = Field(default_factory=list, exclude=True)
+    agent_events: list["ToolEvent"] = Field(default_factory=list, exclude=True)
 
 # ---------- Telemetry & UI ----------
 
@@ -584,7 +594,12 @@ def _extract_create_draft_with_llm(*, deps: GraphDeps, text: str, asset_types: l
             obj["assetType"] = detected_type
         elif obj.get("assetType") not in asset_types:
             obj["assetType"] = None
-
+        # Canonicalize the label to the exact catalog spelling
+        if isinstance(obj.get("assetType"), str):
+            for t in asset_types:
+                if t.lower() == obj["assetType"].lower():
+                    obj["assetType"] = t
+                    break
         nm_det = _extract_name_from_text(text)
         if nm_det:
             obj["name"] = nm_det
@@ -618,22 +633,36 @@ def _history_tail(state: AssetState, k: int) -> list[dict]:
 # ---------- NLU (planner) ----------
 
 async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
+    """
+    NLU router for the Assets tab.
+
+    Key change (loop-breaker):
+    - When the create wizard is active (create_flow=True) but there are NO pending_fields,
+      we are effectively waiting for a simple confirmation (yes/no) OR a different intent (e.g., explain).
+      In that situation we DO NOT blindly route back to 'asset.create'. Instead:
+        * yes-like  -> route to 'asset.create' (so the node can perform the write)
+        * no-like   -> cancel the wizard and reply
+        * explain   -> allow explain during the lock
+        * anything else -> reply normally (agent_reply), avoiding a re-entry loop
+    """
+
     logger.debug(
         "nlu.enter lock=%s pending=%s intent=%s action=%s msg='%s'",
         state.create_flow, state.pending_fields, state.intent, state.action, (state.message or "")[:160],
     )
     raw = (state.message or "").strip()
 
-    # Reset intended routing every turn (prevents stale intent)
+    # Reset intended routing every turn (prevents stale intent from previous step)
     state.intent = None
 
-    # Locale pin based on CZ/SK cues
+    # Locale pin based on CZ/SK cues (cheap heuristic)
     if raw and _looks_czech(raw):
         if not state.locale or not state.locale.lower().startswith("cs"):
             state.locale = "cs-CZ"
 
     # Greeting guard: break any accidental create flow AND clear stale writes
     if _looks_like_greeting(raw):
+        # Only clear if we are NOT actively waiting for a concrete slot
         if not (state.pending_fields and len(state.pending_fields) > 0):
             state.create_flow = False
             state.pending_fields = None
@@ -644,17 +673,21 @@ async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
             logger.debug("nlu.exit(reason=greeting) -> intent=agent_reply lock=False (wizard cleared)")
             return state
 
-    # Honor explicit action
-    if state.action in ("list","get","create","update_meta","explain","list_types","agent_reply"):
+    # Honor explicit action (UI or caller may force a tool)
+    if state.action in ("list", "get", "create", "update_meta", "explain", "list_types", "agent_reply"):
         state.intent = cast(Intent, state.action)
         if state.action == "list_types" and not state.create_flow:
+            # If we are not in a locked flow, showing types shouldn't set any slot
             state.pending_fields = None
-        logger.debug("nlu.exit(reason=explicit_action) -> intent=%s lock=%s pending=%s", state.intent, state.create_flow, state.pending_fields)
+        logger.debug(
+            "nlu.exit(reason=explicit_action) -> intent=%s lock=%s pending=%s",
+            state.intent, state.create_flow, state.pending_fields
+        )
         return state
 
     sel = state.selection or {}
 
-    # Short acknowledgements shouldn't reopen create flow
+    # Short acknowledgements shouldn't (re)open the create flow
     # (prevents "ok/yes/no" from falling back into asset.create when nothing is pending)
     if not state.create_flow and not (state.pending_fields and len(state.pending_fields) > 0):
         if _is_yes_like(raw) or _is_no_like(raw):
@@ -662,15 +695,40 @@ async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
             logger.debug("nlu.exit(reason=ack_noop) -> intent=agent_reply")
             return state
 
+    # ---------------------------
     # FLOW-LOCK (during create)
+    # ---------------------------
     if state.create_flow or (state.pending_fields and len(state.pending_fields) > 0):
-        if _looks_like_greeting(raw) and not state.pending_fields and not (state.create_draft or {}):
-            state.create_flow = False
+        # CASE A: Wizard active but no pending slot -> we are effectively waiting for confirmation
+        if not (state.pending_fields and len(state.pending_fields) > 0):
+            # Confirmation continues the flow (the create node will consume the yes/no)
+            if _is_yes_like(raw):
+                state.intent = cast(Intent, "create")
+                logger.debug("nlu.lock: confirmation -> route to asset.create")
+                return state
+
+            # Negative confirmation cancels the wizard cleanly
+            if _is_no_like(raw):
+                state.create_flow = False
+                state.pending_fields = None
+                state.create_draft = None
+                state.intent = cast(Intent, "agent_reply")
+                logger.debug("nlu.lock: cancel -> agent_reply (wizard cleared)")
+                return state
+
+            # Allow explain even while in the lock (useful for clarifications)
+            if _looks_like_explain(raw):
+                state.intent = cast(Intent, "explain")
+                logger.debug("nlu.lock: explain allowed while waiting confirmation")
+                return state
+
+            # Any other text: DO NOT re-enter asset.create (break potential loop)
             state.intent = cast(Intent, "agent_reply")
-            logger.debug("nlu.lock: greeting cancels empty create_flow -> agent_reply")
+            logger.debug("nlu.lock: no pending slot & no confirmation -> agent_reply (loop broken)")
             return state
 
-        # If specifically waiting for assetType, allow type-only replies
+        # CASE B: Wizard active and waiting for specific slot(s)
+        # Special handling: if we wait for 'assetType', allow type-only replies
         if state.pending_fields and "assetType" in state.pending_fields:
             try:
                 types = [str(x) for x in (deps.backend_port.list_asset_types() or [])]
@@ -685,19 +743,26 @@ async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
                 logger.debug("nlu.lock: captured assetType=%r → intent=create", matched)
                 return state
 
+        # Still in the lock: allow explain
         if _looks_like_explain(raw):
             state.intent = cast(Intent, "explain")
             logger.debug("nlu.lock: explain allowed")
             return state
 
+        # Default while waiting for a slot: continue the create flow
         state.intent = cast(Intent, "create")
-        logger.debug("nlu.lock: force route to asset.create")
+        logger.debug("nlu.lock: pending slot -> route to asset.create")
         return state
 
-    # CREATE start
+    # ---------------------------
+    # CREATE start (free routing)
+    # ---------------------------
     create_intent = _looks_like_create(raw)
     if create_intent:
-        types = [str(x) for x in (deps.backend_port.list_asset_types() or [])]
+        try:
+            types = [str(x) for x in (deps.backend_port.list_asset_types() or [])]
+        except Exception:
+            types = []
         found_type = _extract_catalog_type_from_text(raw, types)
         state.create_draft = state.create_draft or {}
         if found_type:
@@ -711,7 +776,7 @@ async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
         logger.debug("nlu.exit(reason=create_without_type) -> intent=%s lock=%s", state.intent, state.create_flow)
         return state
 
-    # Type-only reply
+    # Type-only reply outside of an active flow (user wrote just a type)
     try:
         types = [str(x) for x in (deps.backend_port.list_asset_types() or [])]
     except Exception:
@@ -725,7 +790,9 @@ async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
         logger.debug("nlu.exit(reason=type_only_reply) -> intent=%s lock=%s", state.intent, state.create_flow)
         return state
 
-    # Default planner (dynamic allowed set)
+    # ---------------------------
+    # Default planner (agent_decide)
+    # ---------------------------
     allowed_actions: list[str] = ["llm.explain", "asset.list", "asset.get", "asset.update_meta"]
     if create_intent or matched or _mentions_types(raw):
         allowed_actions += ["asset.create", "asset.list_types"]
@@ -752,16 +819,22 @@ async def _nlu(deps: GraphDeps, state: AssetState) -> AssetState:
     chosen = tool_to_intent.get((decision.action or "").strip())
     state.intent = cast(Intent, chosen or "agent_reply")
 
+    # If listing types outside of a create flow, don't keep any pending slot
     if state.intent == "list_types" and not state.create_flow:
         state.pending_fields = None
 
+    # Pass-through for optional decision args (e.g., question for explain)
     if getattr(decision, "args", None):
         args = decision.args or {}
         if "question" in args and isinstance(args["question"], str):
             state.question = args["question"]
 
-    logger.debug("nlu.exit(reason=default_decide) -> intent=%s lock=%s pending=%s", state.intent, state.create_flow, state.pending_fields)
+    logger.debug(
+        "nlu.exit(reason=default_decide) -> intent=%s lock=%s pending=%s",
+        state.intent, state.create_flow, state.pending_fields
+    )
     return state
+
 
 # ---------- Read-only nodes ----------
 
@@ -915,36 +988,79 @@ def _validate_write_actions(actions: list[dict]) -> tuple[list[dict], Optional[s
 # ---------- APPLY actions (INLINE submit, no state.actions) ----------
 
 async def _apply_actions_async(*, deps: GraphDeps, state: AssetState, acts: list[dict]) -> AssetState:
-    """Build & submit a ChangeSet immediately. Nothing is stored in state."""
+    """
+    Build & submit a *validated* ChangeSet.
+    - Converts legacy action dicts to the typed Action union (Pydantic v2).
+    - Ensures ChangeSet includes required audit + idempotency_key via build_changeset(...).
+    - Emits WS events only on real 'submitted' (not on 'queued'/OUTBOX fallback).
+    """
     loc = (state.locale or "en")
+
+    # 1) Nothing to do → short-circuit
     if not acts:
         state.result = _ui_response("No actions to apply.", extra={"agent_events": state.agent_events})
         return state
 
+    # 2) Ensure we have a submit function on deps
     submit_fn = getattr(deps, "submit_changeset", None)
     if not callable(submit_fn):
-        state.result = _ui_response({"error":"submit_changeset not available"}, extra={"agent_events": state.agent_events})
+        state.result = _ui_response({"error": "submit_changeset not available"}, extra={"agent_events": state.agent_events})
         return state
 
+    # 3) Start telemetry span
     t0 = _event(state, kind="tool.call.start", tool="submit_changeset", meta={"actions": len(acts)})
-    try:
-        cs_dict: dict = {
-            "org_id": state.org_id,
-            "user_id": state.user_id or "unknown",
-            "intent": "apply",
-            "actions": acts,
+
+    # 4) Local helper: normalize legacy 'op' names to canonical ones
+    def _normalize_legacy_action(a: dict) -> dict:
+        op_map = {
+            # canonical(new) → legacy(model)
+            "asset.create": "create_asset",
+            "asset.update_meta": "set_asset_meta",
+            # případné další aliasy sem
         }
-        # JSON guard (cheap and safe)
-        json.dumps(cs_dict, ensure_ascii=False)
+        op = (a.get("op") or "").strip()
+        return {**a, "op": op_map.get(op, op)}
 
-        submit_result = await submit_fn(cs_dict, require_success=False)
-        ok = bool(getattr(submit_result, "submitted", False))
-        cs_dump = cs_dict
+    try:
+        # 5) Import typed Action/ChangeSet builder lazily (keeps import order simple)
+        from workshops_ai.models.changeset import build_changeset  # provides audit + idempotency_key
+        try:
+            # If the project exposes the union as Action, use it to *validate* each action dict
+            from workshops_ai.models.changeset import Action  # discriminated union by "op"
+            typed_actions = []
+            for a in acts:
+                a_norm = _normalize_legacy_action(a or {})
+                try:
+                    typed_actions.append(Action.model_validate(a_norm))
+                except Exception:
+                    # As a fallback, try minimal normalization of common legacy shapes and validate again.
+                    typed_actions.append(Action.model_validate(a_norm))
+        except Exception:
+            # If Action union is not importable, pass through normalized dicts and let build_changeset validate deeply.
+            typed_actions = [_normalize_legacy_action(a or {}) for a in acts]
 
-        if ok:
+        # 6) Build a *valid* ChangeSet model (adds audit & idempotency_key; user_id goes into audit)
+        cs_model = build_changeset(
+            org_id=state.org_id,
+            user_id=(state.user_id or "unknown"),
+            actions=typed_actions,
+            intent="apply",
+        )
+        # Keep a dump for UI echo (safe to serialize)
+        cs_dump = getattr(cs_model, "model_dump", lambda **k: cs_model)(mode="json")
+
+        # 7) Submit (writer supports Pydantic model too); do not require remote success (OUTBOX allowed)
+        submit_result = await submit_fn(cs_model, require_success=False)
+
+        # 8) Interpret result: submitted vs queued (file outbox) vs failure
+        submitted = bool(getattr(submit_result, "submitted", False))
+        queued = bool(getattr(submit_result, "fallback_path", None)) and not submitted
+
+        if submitted:
+            # --- Successful online submit ---
             _finish(state, t0, tool="submit_changeset", ok=True, meta={"actions": len(acts)})
 
-            # Emit WS events (best-effort)
+            # Emit WS events (best-effort) only on real submit (avoid dupes for queued)
             hub = getattr(deps, "ws_hub", None)
             if hub:
                 async def _emit_created_and_updated():
@@ -952,8 +1068,10 @@ async def _apply_actions_async(*, deps: GraphDeps, state: AssetState, acts: list
                         created_ids = _guess_created_ids(submit_result)
                         idx = 0
                         for a in acts:
-                            if (a.get("op") == "create_asset"):
-                                f = a.get("fields") or {}
+                            a_op = (_normalize_legacy_action(a).get("op") or "").strip()
+                            # handle both canonical and legacy names
+                            if a_op in ("asset.create", "create_asset"):
+                                f = (a.get("fields") or {})
                                 item = {
                                     "org_id": state.org_id,
                                     "asset_id": created_ids[idx] if idx < len(created_ids) else (f.get("id") or f.get("asset_id")),
@@ -966,11 +1084,11 @@ async def _apply_actions_async(*, deps: GraphDeps, state: AssetState, acts: list
                                 }
                                 idx += 1
                                 await hub.aemit_asset_created(item)
-                            elif (a.get("op") == "set_asset_meta"):
-                                f = a.get("fields") or {}
+                            elif a_op in ("asset.update_meta", "set_asset_meta", "update_asset_meta"):
+                                f = (a.get("fields") or {})
                                 item = {
                                     "org_id": state.org_id,
-                                    "asset_id": a.get("asset_id"),
+                                    "asset_id": (a.get("asset_id") or f.get("asset_id")),
                                     "name": f.get("name"),
                                     "description": f.get("description"),
                                     "ts": _now_iso(),
@@ -978,6 +1096,7 @@ async def _apply_actions_async(*, deps: GraphDeps, state: AssetState, acts: list
                                 }
                                 await hub.aemit_asset_updated(item)
                     except Exception:
+                        # Never let best-effort notifications break the flow
                         pass
                 _schedule(_emit_created_and_updated)
 
@@ -987,26 +1106,42 @@ async def _apply_actions_async(*, deps: GraphDeps, state: AssetState, acts: list
             state.create_draft = None
             state.once_flags = None
 
+            # UI confirm (submitted)
             confirm = _llm_confirm(deps=deps, loc=loc, actions=acts, queued=False)
             result = _ui_response(confirm, extra={"changeset_actions": len(acts), "agent_events": state.agent_events})
-            result["messages"].append({"kind":"changeset","changeset": cs_dump,"ts": _now_iso()})
-            result["messages"].append({"kind":"submit_result","result":{"submitted": True},"ts": _now_iso()})
+            result["messages"].append({"kind": "changeset", "changeset": cs_dump, "ts": _now_iso()})
+            result["messages"].append({"kind": "submit_result", "result": {"submitted": True}, "ts": _now_iso()})
             state.result = result
             return state
 
-        _finish(state, t0, tool="submit_changeset", ok=True, meta={"queued": True})
-        confirm = _llm_confirm(deps=deps, loc=loc, actions=acts, queued=True)
-        res = _ui_response(confirm, extra={"agent_events": state.agent_events})
-        res["messages"].append({"kind":"changeset.queued","tab":"assets","ts": _now_iso(),"org_id": state.org_id,"actor": state.user_id})
-        # Clean runtime-only fields even if queued
-        state.create_flow = False
-        state.pending_fields = None
-        state.create_draft = None
-        state.once_flags = None
-        state.result = res
+        if queued:
+            # --- Not submitted online, but safely *queued* to OUTBOX ---
+            _finish(state, t0, tool="submit_changeset", ok=True, meta={"queued": True})
+
+            confirm = _llm_confirm(deps=deps, loc=loc, actions=acts, queued=True)
+            res = _ui_response(confirm, extra={"agent_events": state.agent_events})
+            res["messages"].append({
+                "kind": "changeset.queued",
+                "tab": "assets",
+                "ts": _now_iso(),
+                "org_id": state.org_id,
+                "actor": state.user_id,
+            })
+            # Clean runtime-only fields even if queued
+            state.create_flow = False
+            state.pending_fields = None
+            state.create_draft = None
+            state.once_flags = None
+            state.result = res
+            return state
+
+        # --- Neither submitted nor queued → treat as failure (e.g., validation blocked writer) ---
+        _finish(state, t0, tool="submit_changeset", ok=False, meta={"error": "unknown submit result"})
+        state.result = _ui_response("Submission failed.", extra={"agent_events": state.agent_events})
         return state
 
     except Exception as e:
+        # Defensive failure path with a clean UI message
         _finish(state, t0, tool="submit_changeset", ok=False, meta={"error": str(e)})
         state.result = _ui_response("Submission failed.", extra={"agent_events": state.agent_events})
         return state
@@ -1024,11 +1159,21 @@ def _create_asset(deps: GraphDeps):
     """
     async def _inner(state: AssetState) -> AssetState:
         draft = dict(state.create_draft or {})
+
+        # Always load catalog types (canonical English labels) for hard validation
+        catalog_types: list[str] = [str(x) for x in (deps.backend_port.list_asset_types() or [])]
+
+        # Canonicalize assetType to the exact catalog label (case-insensitive)
+        if draft.get("assetType"):
+            for t in catalog_types:
+                if t.lower() == draft["assetType"].lower():
+                    draft["assetType"] = t
+                    break
+
+        # This list is only used to drive LLM extraction / first question.
+        # Hard checks will always use `catalog_types`.
         asset_type_known = bool((draft.get("assetType") or "").strip())
-        types: list[str] = []
-        if not asset_type_known:
-            raw_types = deps.backend_port.list_asset_types() or []
-            types = [str(x) for x in raw_types]
+        types: list[str] = catalog_types if not asset_type_known else []
 
         logger.debug(
             "create.enter types_needed=%s draft_keys=%s",
@@ -1040,7 +1185,7 @@ def _create_asset(deps: GraphDeps):
         last_msg = (state.message or "").strip()
 
         raw_pending = state.pending_fields
-        +        pending: list[str] = list(raw_pending or [])
+        pending: list[str] = list(raw_pending or [])
 
         # --- Cycle-break guard (prevents re-enter loops) -------------------
         state.once_flags = dict(state.once_flags or {})
@@ -1165,7 +1310,9 @@ def _create_asset(deps: GraphDeps):
                     state.pending_fields = ["description"]
                     state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
                     return state
+
             else:
+                # Free merge via LLM extraction (respects single-slot mode if active)
                 inc = _extract_create_draft_with_llm(deps=deps, text=last_msg, asset_types=types) if last_msg else {}
                 allowed_keys = set(pending) if (raw_pending is not None) else None
                 if prev_type and inc.get("assetType") and inc["assetType"] != prev_type:
@@ -1189,13 +1336,21 @@ def _create_asset(deps: GraphDeps):
 
         # 3) Normalize & detect missing
         draft["name"] = _normalize_name(draft.get("name"))
-        draft["assetType"] = _normalize_type(draft.get("assetType"), allowed=(types or None))
+        draft["assetType"] = _normalize_type(draft.get("assetType"), allowed=catalog_types)
         if draft.get("isPrimary") is not None and not isinstance(draft.get("isPrimary"), bool):
             draft["isPrimary"] = _normalize_is_primary(draft["isPrimary"])
         try:
-            draft = _normalize_create_fields(draft, catalog_types=(types or None))
+            # IMPORTANT: always pass the full catalog here (not 'types')
+            draft = _normalize_create_fields(draft, catalog_types=catalog_types)
         except Exception:
             pass
+
+        # --- Hard guard AFTER normalization ---
+        # If assetType is missing or not a member of the catalog, show the catalog list.
+        if not draft.get("assetType") or draft["assetType"] not in catalog_types:
+            state.create_draft = draft
+            state.pending_fields = ["assetType"]
+            return _list_asset_types(deps)(state)
 
         def _miss(k: str) -> bool:
             return (draft.get(k) in (None, "", []) or k not in draft)
@@ -1242,7 +1397,7 @@ def _create_asset(deps: GraphDeps):
         fields = {k: v for k, v in fields.items() if v is not None}
         logger.debug("create.prepare fields=%r", fields)
 
-        # Validate write payload
+        # Validate write payload (kept simple; TypeAdapter check happens later on backend)
         actions = [{"op": "create_asset", "client_token": f"tmp-{uuid.uuid4().hex[:10]}", "fields": fields}]
         try:
             logger.debug("create.validate.start actions=%d", len(actions))
@@ -1310,6 +1465,7 @@ def _create_asset(deps: GraphDeps):
         return await _apply_actions_async(deps=deps, state=state, acts=acts)
 
     return _inner
+
 
 # ---------- Update meta (INLINE submit) ----------
 
@@ -1582,7 +1738,7 @@ def create_graph(deps: GraphDeps):
     for node in ("agent.reply","asset.list","asset.list_types","asset.get","llm.explain","submit_changeset"):
         graph.add_edge(node, END)
 
-    return graph.compile(checkpointer=None)
+    return graph.compile(checkpointer=deps.checkpointer)
 
 # ---------- Thin runners ----------
 

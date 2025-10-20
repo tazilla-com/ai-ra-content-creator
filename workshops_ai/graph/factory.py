@@ -18,7 +18,8 @@ import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, Optional, Protocol, Final
-from workshops_ai.utils.recursion_watch import RecursionWatch
+from contextlib import nullcontext, contextmanager
+import os
 import json as _json
 # LangGraph type (soft-optional at import-time to avoid hard dependency in tests)
 try:  # pragma: no cover
@@ -769,6 +770,68 @@ def get_graph_deps(
 # Invoke helpers with timeout (support optional 'config'), robust async→sync fallback
 # =============================================================================
 
+@contextmanager
+def _safe_recursion_watch():
+    """
+    Best-effort wrapper around RecursionWatch with zero import-time risk.
+
+    - We do NOT import RecursionWatch at module import time.
+    - We attempt to import & enable it only inside this function.
+    - Any failure (import/init/enter/exit) falls back to a no-op context.
+    - You can force-disable it via env var WSAI_RECURSION_WATCH=0 (default).
+      Set to 1/true to try enabling in environments that support it.
+    """
+    # Feature flag: disabled by default; enable explicitly if you want tracing.
+    if os.getenv("WSAI_RECURSION_WATCH", "0") not in ("1", "true", "True", "yes"):
+        with nullcontext():
+            yield
+        return
+
+    try:
+        # Import inside the guard to avoid import-time AttributeError on some Pythons
+        try:
+            from workshops_ai.utils.recursion_watch import RecursionWatch as _RW  # type: ignore
+        except Exception as e:
+            try:
+                logger.debug("RecursionWatch import failed, using no-op: %s", e)
+            except Exception:
+                pass
+            with nullcontext():
+                yield
+            return
+
+        # Construct and get its context manager; each can fail independently
+        try:
+            rw = _RW(module_prefixes=())   # may raise
+            cm = rw.enabled()              # returns a CM, may raise
+        except Exception as e:
+            try:
+                logger.debug("RecursionWatch init failed, using no-op: %s", e)
+            except Exception:
+                pass
+            with nullcontext():
+                yield
+            return
+
+        # Enter the CM. If __enter__/__exit__ fails, fall back to no-op.
+        try:
+            with cm:
+                yield
+            return
+        except Exception as e:
+            try:
+                logger.debug("RecursionWatch enter/exit failed, using no-op: %s", e)
+            except Exception:
+                pass
+            with nullcontext():
+                yield
+            return
+
+    except Exception:
+        # Absolute last-resort safety net
+        with nullcontext():
+            yield
+
 async def _invoke_async(graph: RunnableGraph, inputs: Any, config: Optional[dict]) -> Any:
     """
     Always prefer async. Instrument calls to expose the exact recursion loop if it happens.
@@ -776,11 +839,10 @@ async def _invoke_async(graph: RunnableGraph, inputs: Any, config: Optional[dict
       - log last ~200 intra-project calls (module:function @ file:line)
       - dump full stacks of all threads via faulthandler
     """
-    watch = RecursionWatch(module_prefixes=())  # loguj vše, nejen workshops_ai.*
-    logger.debug("factory._invoke_async tracer ACTIVE")
+    logger.debug("factory._invoke_async tracer ACTIVE (best-effort)")
     try:
         if hasattr(graph, "ainvoke"):
-            with watch.enabled():
+            with _safe_recursion_watch():
                 if config is not None:
                     return await graph.ainvoke(inputs, config=config)  # type: ignore[arg-type]
                 return await graph.ainvoke(inputs)  # type: ignore[misc]
@@ -788,30 +850,29 @@ async def _invoke_async(graph: RunnableGraph, inputs: Any, config: Optional[dict
         # Rare legacy case: graph has no ainvoke at all -> use sync in a thread
         loop = asyncio.get_running_loop()
         if config is not None and hasattr(graph, "invoke"):
-            with watch.enabled():
+            with _safe_recursion_watch():
                 return await loop.run_in_executor(
                     None, lambda: graph.invoke(inputs, config=config)  # type: ignore[misc]
                 )
         if hasattr(graph, "invoke"):
-            with watch.enabled():
+            with _safe_recursion_watch():
                 return await loop.run_in_executor(None, lambda: graph.invoke(inputs))  # type: ignore[misc]
-        with watch.enabled():
+        with _safe_recursion_watch():
             return await loop.run_in_executor(None, lambda: graph(inputs))  # type: ignore[operator]
 
     except RecursionError:
-        # 1) Tail of recent calls inside our modules – pinpoints the loop
+        # Recursion tracing pouze pokud je k dispozici; když ne, zaloguj placeholder
         try:
-            logger.error("RecursionError: recent call tail (<=200):\n%s", watch.tail_text(200))
+            logger.error("RecursionError: recent call tail (<=200):\n%s", "unavailable (RecursionWatch inactive)")
         except Exception:
             pass
-        # 2) Dump real stacks of all threads (goes to stderr → docker logs)
         try:
             import faulthandler, sys
             faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
         except Exception:
             pass
-        # Propagate so existing telemetry/handlers run as before
         raise
+
 
 
 async def ainvoke_with_timeout(
