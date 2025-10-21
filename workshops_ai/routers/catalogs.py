@@ -2,29 +2,32 @@
 """
 FastAPI router for catalog endpoints.
 
-Provides read-only access to CSV-based catalogs:
-- /api/catalogs/impacts - Impact catalog with categories and weights
-- /api/catalogs/threats - Threat catalog with categories and types
-- /api/catalogs/controls - Control catalog with categories
-- /api/catalogs/controls/coverage - Control-to-Threat coverage mappings
-- /api/catalogs/asset-types/threats - Asset type to Threat priors
+Provider Pattern:
+Uses configurable catalog provider (CSV or Tazilla API) based on WORKSHOPS_AI_TAZILA__MODE:
+- mode=file: CSVCatalogProvider (dev/mockup, ignores session_id)
+- mode=http: TazillaAPICatalogProvider (production, requires session_id)
 
-All endpoints support language parameter (en/sk/cs) for localized names.
+Endpoints:
+- GET /api/catalogs/impacts - Impact catalog with categories and weights
+- GET /api/catalogs/threats - Threat catalog with categories and types
+- GET /api/catalogs/controls - Control catalog with categories
+- GET /api/catalogs/asset-types - Asset type catalog with dependencies
+- GET /api/catalogs/impact-categories - Impact category catalog
+- GET /api/catalogs/threat-categories - Threat category catalog
+- GET /api/catalogs/control-categories - Control category catalog
+
+All endpoints support:
+- language parameter (en/sk/cs) for localized names
+- X-Session-Id header for client-specific catalogs (required for Tazilla API mode)
 """
 from __future__ import annotations
 
 import logging
 from typing import List, Dict, Any, Optional
-from fastapi import APIRouter, Query, HTTPException, status
+from fastapi import APIRouter, Query, HTTPException, status, Header
 from pydantic import BaseModel, Field, ConfigDict
 
-from workshops_ai.wizard.catalog_loader import (
-    load_impact_catalog,
-    load_threat_catalog,
-    load_control_catalog,
-    load_control_threat_coverage,
-    load_asset_type_threat_priors,
-)
+from workshops_ai.wizard.catalog_provider import get_catalog_provider
 from workshops_ai.api.schema.impact import Impact
 from workshops_ai.api.schema.threat import Threat
 from workshops_ai.api.schema.control import PlannedControl
@@ -72,43 +75,39 @@ class ControlCatalogResponse(BaseModel):
     )
 
 
-class ControlThreatCoverage(BaseModel):
-    """Control to Threat coverage entry."""
+class AssetTypeItem(BaseModel):
+    """Single asset type item."""
     model_config = ConfigDict(extra="forbid")
 
-    control: str = Field(..., description="Control name")
-    threat: str = Field(..., description="Threat name")
-    coverage: int = Field(..., ge=0, le=100, description="Coverage percentage (0-100)")
+    name: str = Field(..., description="Asset type name (localized)")
+    description: str = Field(..., description="Asset type notes/description (localized)")
+    isDependent: bool = Field(..., description="Whether this asset type is dependent on other assets")
 
 
-class ControlThreatCoverageResponse(BaseModel):
-    """Response for control-threat coverage endpoint."""
+class AssetTypeCatalogResponse(BaseModel):
+    """Response for asset type catalog endpoint."""
     model_config = ConfigDict(extra="forbid")
 
-    total: int = Field(..., description="Total number of control-threat mappings")
-    coverage: List[ControlThreatCoverage] = Field(
-        ...,
-        description="List of control → threat coverage mappings"
-    )
-
-
-class AssetTypeThreatPrior(BaseModel):
-    """Asset type to Threat prior mapping."""
-    model_config = ConfigDict(extra="forbid")
-
-    asset_type: str = Field(..., description="Asset type")
-    threats: List[str] = Field(..., description="List of relevant threat names")
-
-
-class AssetTypeThreatPriorsResponse(BaseModel):
-    """Response for asset type threat priors endpoint."""
-    model_config = ConfigDict(extra="forbid")
-
+    language: str = Field(..., description="Language code (en/sk/cs)")
     total: int = Field(..., description="Total number of asset types")
-    priors: List[AssetTypeThreatPrior] = Field(
-        ...,
-        description="List of asset type → threat priors"
-    )
+    assetTypes: List[AssetTypeItem] = Field(..., description="List of asset types")
+
+
+class CategoryItem(BaseModel):
+    """Single category item."""
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., description="Category name (localized)")
+    description: str = Field(..., description="Category description/notes (localized)")
+
+
+class CategoryCatalogResponse(BaseModel):
+    """Response for category catalog endpoints."""
+    model_config = ConfigDict(extra="forbid")
+
+    language: str = Field(..., description="Language code (en/sk/cs)")
+    total: int = Field(..., description="Total number of categories")
+    categories: List[CategoryItem] = Field(..., description="List of categories")
 
 
 # =============================================================================
@@ -126,6 +125,11 @@ async def get_impact_catalog(
         default="en",
         regex="^(en|sk|cs)$",
         description="Language code for localized names (en/sk/cs)"
+    ),
+    x_session_id: Optional[str] = Header(
+        None,
+        alias="X-Session-Id",
+        description="Session ID for client-specific catalogs (optional for CSV provider)"
     )
 ) -> ImpactCatalogResponse:
     """
@@ -139,6 +143,7 @@ async def get_impact_catalog(
 
     Args:
         language: Language code (en/sk/cs)
+        x_session_id: Session ID for client-specific catalogs
 
     Returns:
         ImpactCatalogResponse with list of impacts
@@ -147,12 +152,17 @@ async def get_impact_catalog(
         HTTPException: If catalog loading fails
     """
     try:
-        impacts = load_impact_catalog(language=language)
+        provider = get_catalog_provider()
+        impacts = await provider.load_impact_catalog(
+            language=language,
+            session_id=x_session_id
+        )
 
         logger.info(
             "impact_catalog_retrieved",
             extra={
                 "language": language,
+                "session_id": x_session_id,
                 "count": len(impacts),
             }
         )
@@ -189,6 +199,11 @@ async def get_threat_catalog(
         default="en",
         regex="^(en|sk|cs)$",
         description="Language code for localized names (en/sk/cs)"
+    ),
+    x_session_id: Optional[str] = Header(
+        None,
+        alias="X-Session-Id",
+        description="Session ID for client-specific catalogs (optional for CSV provider)"
     )
 ) -> ThreatCatalogResponse:
     """
@@ -202,6 +217,7 @@ async def get_threat_catalog(
 
     Args:
         language: Language code (en/sk/cs)
+        x_session_id: Session ID for client-specific catalogs
 
     Returns:
         ThreatCatalogResponse with list of threats
@@ -210,12 +226,17 @@ async def get_threat_catalog(
         HTTPException: If catalog loading fails
     """
     try:
-        threats = load_threat_catalog(language=language)
+        provider = get_catalog_provider()
+        threats = await provider.load_threat_catalog(
+            language=language,
+            session_id=x_session_id
+        )
 
         logger.info(
             "threat_catalog_retrieved",
             extra={
                 "language": language,
+                "session_id": x_session_id,
                 "count": len(threats),
             }
         )
@@ -252,6 +273,11 @@ async def get_control_catalog(
         default="en",
         regex="^(en|sk|cs)$",
         description="Language code for localized names (en/sk/cs)"
+    ),
+    x_session_id: Optional[str] = Header(
+        None,
+        alias="X-Session-Id",
+        description="Session ID for client-specific catalogs (optional for CSV provider)"
     )
 ) -> ControlCatalogResponse:
     """
@@ -267,6 +293,7 @@ async def get_control_catalog(
 
     Args:
         language: Language code (en/sk/cs)
+        x_session_id: Session ID for client-specific catalogs
 
     Returns:
         ControlCatalogResponse with list of controls
@@ -275,12 +302,17 @@ async def get_control_catalog(
         HTTPException: If catalog loading fails
     """
     try:
-        controls = load_control_catalog(language=language)
+        provider = get_catalog_provider()
+        controls = await provider.load_control_catalog(
+            language=language,
+            session_id=x_session_id
+        )
 
         logger.info(
             "control_catalog_retrieved",
             extra={
                 "language": language,
+                "session_id": x_session_id,
                 "count": len(controls),
             }
         )
@@ -307,153 +339,292 @@ async def get_control_catalog(
 
 
 @router.get(
-    "/controls/coverage",
-    response_model=ControlThreatCoverageResponse,
-    summary="Get Control-to-Threat coverage mappings",
-    description="Retrieve control effectiveness against specific threats (0-100% coverage)"
+    "/asset-types",
+    response_model=AssetTypeCatalogResponse,
+    summary="Get Asset Type catalog",
+    description="Retrieve the official Asset Type catalog with localized names"
 )
-async def get_control_threat_coverage(
-    control: Optional[str] = Query(
-        None,
-        description="Filter by specific control name (optional)"
+async def get_asset_type_catalog(
+    language: str = Query(
+        default="en",
+        regex="^(en|sk|cs)$",
+        description="Language code for localized names (en/sk/cs)"
     ),
-    threat: Optional[str] = Query(
+    x_session_id: Optional[str] = Header(
         None,
-        description="Filter by specific threat name (optional)"
-    ),
-) -> ControlThreatCoverageResponse:
+        alias="X-Session-Id",
+        description="Session ID for client-specific catalogs (optional for CSV provider)"
+    )
+) -> AssetTypeCatalogResponse:
     """
-    Get Control → Threat coverage mappings.
+    Get Asset Type catalog with localized names and descriptions.
 
-    Each mapping indicates how effective a control is against a specific threat
-    (0-100% coverage). These are baseline values from the catalog; the AI may
-    adjust them based on asset context.
+    The catalog includes:
+    - Asset type name (localized)
+    - Description/notes (localized)
+    - isDependent flag (whether asset depends on other assets)
 
     Args:
-        control: Optional control name filter (exact match)
-        threat: Optional threat name filter (exact match)
+        language: Language code (en/sk/cs)
+        x_session_id: Session ID for client-specific catalogs
 
     Returns:
-        ControlThreatCoverageResponse with filtered coverage mappings
+        AssetTypeCatalogResponse with list of asset types
 
     Raises:
         HTTPException: If catalog loading fails
     """
     try:
-        # Load full coverage mapping
-        coverage_dict = load_control_threat_coverage()
+        provider = get_catalog_provider()
+        asset_types_data = await provider.load_asset_type_catalog(
+            language=language,
+            session_id=x_session_id
+        )
 
-        # Build flat list
-        coverage_list = []
-        for ctrl_name, threat_dict in coverage_dict.items():
-            # Filter by control if specified
-            if control and ctrl_name != control:
-                continue
-
-            for threat_name, cov_value in threat_dict.items():
-                # Filter by threat if specified
-                if threat and threat_name != threat:
-                    continue
-
-                coverage_list.append(ControlThreatCoverage(
-                    control=ctrl_name,
-                    threat=threat_name,
-                    coverage=cov_value
-                ))
+        # Convert dict format to Pydantic models
+        asset_types = [
+            AssetTypeItem(**item)
+            for item in asset_types_data
+        ]
 
         logger.info(
-            "control_threat_coverage_retrieved",
+            "asset_type_catalog_retrieved",
             extra={
-                "total_mappings": len(coverage_list),
-                "control_filter": control,
-                "threat_filter": threat,
+                "language": language,
+                "session_id": x_session_id,
+                "count": len(asset_types),
             }
         )
 
-        return ControlThreatCoverageResponse(
-            total=len(coverage_list),
-            coverage=coverage_list
+        return AssetTypeCatalogResponse(
+            language=language,
+            total=len(asset_types),
+            assetTypes=asset_types
         )
 
     except Exception as e:
         logger.error(
-            "control_threat_coverage_load_failed",
+            "asset_type_catalog_load_failed",
             extra={
+                "language": language,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to load control-threat coverage: {str(e)}"
+            detail=f"Failed to load asset type catalog: {str(e)}"
         )
 
 
 @router.get(
-    "/asset-types/threats",
-    response_model=AssetTypeThreatPriorsResponse,
-    summary="Get Asset Type to Threat priors",
-    description="Retrieve relevant threats for each asset type (used for smart threat selection)"
+    "/impact-categories",
+    response_model=CategoryCatalogResponse,
+    summary="Get Impact Categories catalog",
+    description="Retrieve the official Impact Categories catalog with localized names"
 )
-async def get_asset_type_threat_priors(
-    asset_type: Optional[str] = Query(
+async def get_impact_category_catalog(
+    language: str = Query(
+        default="en",
+        regex="^(en|sk|cs)$",
+        description="Language code for localized names (en/sk/cs)"
+    ),
+    x_session_id: Optional[str] = Header(
         None,
-        description="Filter by specific asset type (optional)"
+        alias="X-Session-Id",
+        description="Session ID for client-specific catalogs (optional for CSV provider)"
     )
-) -> AssetTypeThreatPriorsResponse:
+) -> CategoryCatalogResponse:
     """
-    Get Asset Type → Threat prior mappings.
-
-    These priors indicate which threats are most relevant for each asset type,
-    used by the risk generator to pre-filter threats before LLM evaluation.
+    Get Impact Categories catalog with localized names.
 
     Args:
-        asset_type: Optional asset type filter (exact match)
+        language: Language code (en/sk/cs)
+        x_session_id: Session ID for client-specific catalogs
 
     Returns:
-        AssetTypeThreatPriorsResponse with filtered priors
+        CategoryCatalogResponse with list of impact categories
 
     Raises:
         HTTPException: If catalog loading fails
     """
     try:
-        # Load priors
-        priors_dict = load_asset_type_threat_priors()
+        provider = get_catalog_provider()
+        categories_data = await provider.load_impact_category_catalog(
+            language=language,
+            session_id=x_session_id
+        )
 
-        # Build list
-        priors_list = []
-        for at, threats in priors_dict.items():
-            # Filter by asset type if specified
-            if asset_type and at != asset_type:
-                continue
-
-            priors_list.append(AssetTypeThreatPrior(
-                asset_type=at,
-                threats=threats
-            ))
+        categories = [CategoryItem(**item) for item in categories_data]
 
         logger.info(
-            "asset_type_threat_priors_retrieved",
+            "impact_category_catalog_retrieved",
             extra={
-                "total_asset_types": len(priors_list),
-                "asset_type_filter": asset_type,
+                "language": language,
+                "session_id": x_session_id,
+                "count": len(categories),
             }
         )
 
-        return AssetTypeThreatPriorsResponse(
-            total=len(priors_list),
-            priors=priors_list
+        return CategoryCatalogResponse(
+            language=language,
+            total=len(categories),
+            categories=categories
         )
 
     except Exception as e:
         logger.error(
-            "asset_type_threat_priors_load_failed",
+            "impact_category_catalog_load_failed",
             extra={
+                "language": language,
+                "session_id": x_session_id,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to load asset type threat priors: {str(e)}"
+            detail=f"Failed to load impact category catalog: {str(e)}"
+        )
+
+
+@router.get(
+    "/threat-categories",
+    response_model=CategoryCatalogResponse,
+    summary="Get Threat Categories catalog",
+    description="Retrieve the official Threat Categories catalog with localized names"
+)
+async def get_threat_category_catalog(
+    language: str = Query(
+        default="en",
+        regex="^(en|sk|cs)$",
+        description="Language code for localized names (en/sk/cs)"
+    ),
+    x_session_id: Optional[str] = Header(
+        None,
+        alias="X-Session-Id",
+        description="Session ID for client-specific catalogs (optional for CSV provider)"
+    )
+) -> CategoryCatalogResponse:
+    """
+    Get Threat Categories catalog with localized names.
+
+    Args:
+        language: Language code (en/sk/cs)
+        x_session_id: Session ID for client-specific catalogs
+
+    Returns:
+        CategoryCatalogResponse with list of threat categories
+
+    Raises:
+        HTTPException: If catalog loading fails
+    """
+    try:
+        provider = get_catalog_provider()
+        categories_data = await provider.load_threat_category_catalog(
+            language=language,
+            session_id=x_session_id
+        )
+
+        categories = [CategoryItem(**item) for item in categories_data]
+
+        logger.info(
+            "threat_category_catalog_retrieved",
+            extra={
+                "language": language,
+                "session_id": x_session_id,
+                "count": len(categories),
+            }
+        )
+
+        return CategoryCatalogResponse(
+            language=language,
+            total=len(categories),
+            categories=categories
+        )
+
+    except Exception as e:
+        logger.error(
+            "threat_category_catalog_load_failed",
+            extra={
+                "language": language,
+                "session_id": x_session_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load threat category catalog: {str(e)}"
+        )
+
+
+@router.get(
+    "/control-categories",
+    response_model=CategoryCatalogResponse,
+    summary="Get Control Categories catalog",
+    description="Retrieve the official Control Categories catalog with localized names"
+)
+async def get_control_category_catalog(
+    language: str = Query(
+        default="en",
+        regex="^(en|sk|cs)$",
+        description="Language code for localized names (en/sk/cs)"
+    ),
+    x_session_id: Optional[str] = Header(
+        None,
+        alias="X-Session-Id",
+        description="Session ID for client-specific catalogs (optional for CSV provider)"
+    )
+) -> CategoryCatalogResponse:
+    """
+    Get Control Categories catalog with localized names.
+
+    Args:
+        language: Language code (en/sk/cs)
+        x_session_id: Session ID for client-specific catalogs
+
+    Returns:
+        CategoryCatalogResponse with list of control categories
+
+    Raises:
+        HTTPException: If catalog loading fails
+    """
+    try:
+        provider = get_catalog_provider()
+        categories_data = await provider.load_control_category_catalog(
+            language=language,
+            session_id=x_session_id
+        )
+
+        categories = [CategoryItem(**item) for item in categories_data]
+
+        logger.info(
+            "control_category_catalog_retrieved",
+            extra={
+                "language": language,
+                "session_id": x_session_id,
+                "count": len(categories),
+            }
+        )
+
+        return CategoryCatalogResponse(
+            language=language,
+            total=len(categories),
+            categories=categories
+        )
+
+    except Exception as e:
+        logger.error(
+            "control_category_catalog_load_failed",
+            extra={
+                "language": language,
+                "session_id": x_session_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load control category catalog: {str(e)}"
         )

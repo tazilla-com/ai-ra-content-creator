@@ -539,7 +539,6 @@ class EvaluationOutput(BaseModel):
 
 class WizardStateResponse(BaseModel):
     """Response for GET /wizard/state."""
-    org_id: str
-    user_id: str
+    session_id: str
     steps_completed: List[str]
     data: dict

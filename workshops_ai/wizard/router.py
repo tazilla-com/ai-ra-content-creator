@@ -21,8 +21,9 @@ Each endpoint:
 from __future__ import annotations
 
 import logging
+import secrets
 import time
-from fastapi import APIRouter, Depends, HTTPException, status, Response, Header
+from fastapi import APIRouter, Depends, HTTPException, status, Response, Header, Request
 from typing import Dict, Any, Optional
 
 from workshops_ai.app.security import require_auth
@@ -54,6 +55,7 @@ from workshops_ai.wizard.session import (
     save_wizard_step,
     get_wizard_step,
     clear_wizard_state,
+    validate_session_id,
 )
 from workshops_ai.wizard.llm_helper import call_llm_with_structured_output
 # Note: Old placeholder prompts (SERVICES_PROMPT, etc.) are not used in new implementation
@@ -76,89 +78,107 @@ router = APIRouter(
 
 
 # =============================================================================
-# Dependencies: Session key and identity extraction
+# Dependencies: Session ID management
 # =============================================================================
 
-async def get_session_key(
-    identity: Dict[str, Any] = Depends(require_auth),
-    x_org_id: Optional[str] = Header(None, alias="X-Org-ID"),
-    x_user_id: Optional[str] = Header(None, alias="X-User-ID"),
+async def get_session_id(
+    request: Request,
+    response: Response,
+    x_session_id: Optional[str] = Header(None, alias="X-Session-Id"),
 ) -> str:
     """
-    Dependency: Extract session key from auth identity and headers.
+    Dependency: Extract or generate session ID for wizard state.
 
-    For API key auth, reads X-Org-ID and X-User-ID headers.
-    For JWT auth, extracts from token claims.
-
-    Returns:
-        Session key in format "wizard:{org_id}:{user_id}"
-
-    Raises:
-        HTTPException: If authentication fails or required fields missing
-    """
-    org_id, user_id = _extract_identity(identity, x_org_id, x_user_id)
-    return f"wizard:{org_id}:{user_id}"
-
-
-def _extract_identity(
-    identity: Dict[str, Any],
-    x_org_id: Optional[str] = None,
-    x_user_id: Optional[str] = None
-) -> tuple[str, str]:
-    """
-    Extract org_id and user_id from auth identity or headers.
-
-    Priority for API key auth:
-    1. X-Org-ID and X-User-ID headers
-    2. Fallback to test values for local development
-
-    Args:
-        identity: Auth identity dict from require_auth
-        x_org_id: Optional org_id from X-Org-ID header
-        x_user_id: Optional user_id from X-User-ID header
+    Flow:
+    1. If client provides X-Session-Id header:
+       - Validate format (22 base64url chars)
+       - Return session ID (session will be created/loaded by endpoint)
+    2. If client doesn't provide session ID:
+       - Check rate limit for new session creation (per IP)
+       - Generate new session ID
+       - Set X-Session-Id in response header
+       - Return session ID
 
     Returns:
-        Tuple of (org_id, user_id)
+        Session ID (format: 22 random base64url characters)
 
     Raises:
-        HTTPException: If org_id or user_id missing for JWT auth
+        HTTPException:
+            - 400 if session ID format invalid
+            - 429 if rate limit exceeded for new sessions
     """
-    # For JWT, extract from claims
-    if identity.get("method") == "jwt":
-        claims = identity.get("claims", {})
-        org_id = claims.get("org_id") or claims.get("organization_id")
-        user_id = claims.get("sub") or claims.get("user_id") or claims.get("uid")
+    settings = get_settings()
 
-        if not org_id or not user_id:
+    # Case 1: Client provided session ID
+    if x_session_id and x_session_id.strip():
+        # Validate format
+        if not validate_session_id(x_session_id):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="JWT must contain org_id and sub/user_id claims"
+                detail="Invalid session ID format. Expected: 22 alphanumeric characters (a-z, A-Z, 0-9, _, -)"
             )
 
-        return str(org_id), str(user_id)
+        response.headers["X-Session-Id"] = x_session_id
 
-    # For API key, use headers if provided, otherwise fallback to test values
-    if identity.get("method") == "api_key":
-        # Production: use X-Org-ID and X-User-ID headers
-        if x_org_id and x_user_id:
-            return x_org_id, x_user_id
-
-        # Development fallback: use test values
-        logger.warning(
-            "X-Org-ID and X-User-ID headers not provided, using test values for API key auth",
-            extra={
-                "x_org_id": x_org_id,
-                "x_user_id": x_user_id,
-                "fallback_org": "test_org",
-                "fallback_user": "test_user",
-            }
+        logger.debug(
+            "Using client-provided session ID",
+            extra={"session_id": x_session_id}
         )
-        return "test_org", "test_user"
+        return x_session_id
 
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Unknown authentication method"
+    # Case 2: Generate new session ID
+    # Apply rate limit for new session creation
+    rate_limit = settings.wizard.session_creation_rate_limit
+    if rate_limit > 0:
+        redis = await get_redis()
+        if redis:
+            try:
+                # Get client IP
+                client_ip = request.client.host if request.client else "unknown"
+                rl_key = f"session_create_rl:{client_ip}"
+
+                # Increment counter
+                count = await redis.incr(rl_key)
+
+                # Set expiry on first increment (1 hour window)
+                if count == 1:
+                    await redis.expire(rl_key, 3600)
+
+                # Check limit
+                if count > rate_limit:
+                    logger.warning(
+                        "Session creation rate limit exceeded",
+                        extra={
+                            "client_ip": client_ip,
+                            "count": count,
+                            "limit": rate_limit
+                        }
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail=f"Too many new sessions created. Limit: {rate_limit} per hour per IP."
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                # Log error but don't block session creation
+                logger.error(
+                    "Failed to check session creation rate limit",
+                    extra={"error": str(e)}
+                )
+
+    # Generate new session ID (22 characters base64url)
+    new_id = secrets.token_urlsafe(16)
+
+    # Set in response header
+    response.headers["X-Session-Id"] = new_id
+
+    logger.info(
+        "Generated new session ID",
+        extra={"session_id": new_id}
     )
+
+    return new_id
 
 
 # =============================================================================
@@ -174,7 +194,7 @@ def _extract_identity(
 async def generate_services(
     request: ServicesInput,
     response: Response,
-    session_key: str = Depends(get_session_key),
+    session_id: str = Depends(get_session_id),
 ) -> ServicesOutput:
     """
     Generate critical business services from website content.
@@ -187,7 +207,7 @@ async def generate_services(
     Args:
         request: ServicesInput with website content and generation params
         response: FastAPI Response for injecting headers
-        session_key: Session key from dependency (format: wizard:{org_id}:{user_id})
+        session_id: Session ID (22 random base64url chars)
 
     Returns:
         ServicesOutput with generated services and optional debug info
@@ -200,17 +220,10 @@ async def generate_services(
     """
     settings = get_settings()
 
-    # Extract org_id and user_id from session_key for logging
-    parts = session_key.split(":")
-    org_id = parts[1] if len(parts) > 1 else "unknown"
-    user_id = parts[2] if len(parts) > 2 else "unknown"
-
     logger.info(
         "wizard_services_started",
         extra={
-            "org_id": org_id,
-            "user_id": user_id,
-            "session_key": session_key,
+            "session_id": session_id,
             "model": request.ai_model,
             "language": request.language,
             "number_of_services": request.number_of_services,
@@ -225,7 +238,7 @@ async def generate_services(
     # Step 1: Resolve website content
     try:
         website_content, content_metadata = await content_resolver.resolve_content(
-            session_key=session_key,
+            session_id=session_id,
             website_text=request.website_content.content if request.website_content else None,
             website_url=request.website_url,
             search_method=request.search_method,
@@ -235,7 +248,7 @@ async def generate_services(
         logger.info(
             "content_resolved",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "source": content_metadata.get("source"),
                 "content_length": content_metadata.get("content_length"),
             }
@@ -245,7 +258,7 @@ async def generate_services(
         logger.error(
             "content_resolution_failed",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "error": str(e),
             }
         )
@@ -265,7 +278,7 @@ async def generate_services(
     previous_services = None
     if request.user_instructions:
         # User is refining - load previous services
-        previous_step = await get_wizard_step(org_id, user_id, "services")
+        previous_step = await get_wizard_step(session_id, "services")
         if previous_step and previous_step.get("services"):
             from workshops_ai.wizard.schemas import Service
             previous_services = [
@@ -274,7 +287,7 @@ async def generate_services(
             logger.info(
                 "previous_services_loaded",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "count": len(previous_services),
                 }
             )
@@ -293,7 +306,7 @@ async def generate_services(
         logger.info(
             "services_generated",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "services_count": len(services),
                 "tokens": usage_metrics.total_tokens,
                 "cost_usd": usage_metrics.cost_usd,
@@ -304,7 +317,7 @@ async def generate_services(
         logger.error(
             "service_generation_failed",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
@@ -319,11 +332,11 @@ async def generate_services(
         "usage": usage_metrics.model_dump(),
     }
 
-    await save_wizard_step(org_id, user_id, "services", step_data)
+    await save_wizard_step(session_id, "services", step_data)
 
     logger.info(
         "services_saved_to_session",
-        extra={"session_key": session_key}
+        extra={"session_id": session_id}
     )
 
     # Step 6: Add response headers (if enabled)
@@ -336,7 +349,6 @@ async def generate_services(
         response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
 
         # Wizard headers (session-level metrics)
-        response.headers["X-Wizard-Session-Key"] = session_key
         response.headers["X-Wizard-Content-Source"] = content_metadata.get("source", "unknown")
 
     # Step 7: Build response
@@ -356,7 +368,7 @@ async def generate_services(
     logger.info(
         "wizard_services_completed",
         extra={
-            "session_key": session_key,
+            "session_id": session_id,
             "services_count": len(services),
         }
     )
@@ -373,7 +385,7 @@ async def generate_services(
 async def generate_assets(
     request: AssetsInput,
     response: Response,
-    session_key: str = Depends(get_session_key),
+    session_id: str = Depends(get_session_id),
 ) -> AssetsOutput:
     """
     Generate IT and business assets from services and website content.
@@ -386,7 +398,7 @@ async def generate_assets(
     Args:
         request: AssetsInput with services, website content, and generation params
         response: FastAPI Response for injecting headers
-        session_key: Session key from dependency (format: wizard:{org_id}:{user_id})
+        session_id: Session ID (22 random base64url chars)
 
     Returns:
         AssetsOutput with generated assets and optional debug info
@@ -399,17 +411,10 @@ async def generate_assets(
     """
     settings = get_settings()
 
-    # Extract org_id and user_id from session_key for logging
-    parts = session_key.split(":")
-    org_id = parts[1] if len(parts) > 1 else "unknown"
-    user_id = parts[2] if len(parts) > 2 else "unknown"
-
     logger.info(
         "wizard_assets_started",
         extra={
-            "org_id": org_id,
-            "user_id": user_id,
-            "session_key": session_key,
+            "session_id": session_id,
             "model": request.ai_model,
             "language": request.language,
             "number_of_assets": request.number_of_assets,
@@ -424,7 +429,7 @@ async def generate_assets(
     # Step 1: Resolve services (from request or previous step)
     services = request.services
     if not services:
-        services_step = await get_wizard_step(org_id, user_id, "services")
+        services_step = await get_wizard_step(session_id, "services")
         if services_step and services_step.get("services"):
             from workshops_ai.wizard.schemas import Service
             services = [
@@ -433,7 +438,7 @@ async def generate_assets(
             logger.info(
                 "services_loaded_from_session",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "count": len(services),
                 }
             )
@@ -444,7 +449,7 @@ async def generate_assets(
 
     try:
         website_content, content_metadata = await content_resolver.resolve_content(
-            session_key=session_key,
+            session_id=session_id,
             website_text=request.website_content.content if request.website_content else None,
             website_url=request.website_url,
             search_method=request.search_method,
@@ -454,7 +459,7 @@ async def generate_assets(
         logger.info(
             "content_resolved",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "source": content_metadata.get("source"),
                 "content_length": content_metadata.get("content_length"),
             }
@@ -464,7 +469,7 @@ async def generate_assets(
         # Website content is optional for assets (services are primary input)
         logger.info(
             "no_website_content_available",
-            extra={"session_key": session_key}
+            extra={"session_id": session_id}
         )
 
     # Step 3: Build organization profile from request
@@ -481,7 +486,7 @@ async def generate_assets(
     previous_assets = request.previous_assets
     if not previous_assets and request.user_instructions:
         # User is refining - load previous assets
-        previous_step = await get_wizard_step(org_id, user_id, "assets")
+        previous_step = await get_wizard_step(session_id, "assets")
         if previous_step and previous_step.get("assets"):
             from workshops_ai.api.schema.asset import Asset
             previous_assets = [
@@ -490,7 +495,7 @@ async def generate_assets(
             logger.info(
                 "previous_assets_loaded",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "count": len(previous_assets),
                 }
             )
@@ -510,7 +515,7 @@ async def generate_assets(
         logger.info(
             "assets_generated",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "assets_count": len(assets),
                 "tokens": usage_metrics.total_tokens,
                 "cost_usd": usage_metrics.cost_usd,
@@ -521,7 +526,7 @@ async def generate_assets(
         logger.error(
             "asset_generation_failed",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
@@ -536,11 +541,11 @@ async def generate_assets(
         "usage": usage_metrics.model_dump(),
     }
 
-    await save_wizard_step(org_id, user_id, "assets", step_data)
+    await save_wizard_step(session_id, "assets", step_data)
 
     logger.info(
         "assets_saved_to_session",
-        extra={"session_key": session_key}
+        extra={"session_id": session_id}
     )
 
     # Step 7: Add response headers (if enabled)
@@ -553,7 +558,7 @@ async def generate_assets(
         response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
 
         # Wizard headers (session-level metrics)
-        response.headers["X-Wizard-Session-Key"] = session_key
+        # Session ID already set in response header by get_session_id dependency
         response.headers["X-Wizard-Content-Source"] = content_metadata.get("source", "unknown")
 
     # Step 8: Build response
@@ -575,7 +580,7 @@ async def generate_assets(
     logger.info(
         "wizard_assets_completed",
         extra={
-            "session_key": session_key,
+            "session_id": session_id,
             "assets_count": len(assets),
         }
     )
@@ -592,7 +597,7 @@ async def generate_assets(
 async def generate_impacts(
     request: ImpactsInput,
     response: Response,
-    session_key: str = Depends(get_session_key),
+    session_id: str = Depends(get_session_id),
 ) -> ImpactsOutput:
     """
     Generate impact evaluations for assets using catalog-based approach.
@@ -605,7 +610,7 @@ async def generate_impacts(
     Args:
         request: ImpactsInput with assets and generation params
         response: FastAPI Response for injecting headers
-        session_key: Session key from dependency (format: wizard:{org_id}:{user_id})
+        session_id: Session ID (22 random base64url chars)
 
     Returns:
         ImpactsOutput with asset impact evaluations and optional debug info
@@ -618,17 +623,10 @@ async def generate_impacts(
     """
     settings = get_settings()
 
-    # Extract org_id and user_id from session_key for logging
-    parts = session_key.split(":")
-    org_id = parts[1] if len(parts) > 1 else "unknown"
-    user_id = parts[2] if len(parts) > 2 else "unknown"
-
     logger.info(
         "wizard_impacts_started",
         extra={
-            "org_id": org_id,
-            "user_id": user_id,
-            "session_key": session_key,
+            "session_id": session_id,
             "model": request.ai_model,
             "language": request.language,
         }
@@ -640,7 +638,7 @@ async def generate_impacts(
     # Step 1: Resolve assets (from request or previous step)
     assets = request.assets
     if not assets:
-        assets_step = await get_wizard_step(org_id, user_id, "assets")
+        assets_step = await get_wizard_step(session_id, "assets")
         if assets_step and assets_step.get("assets"):
             from workshops_ai.api.schema.asset import Asset
             assets = [
@@ -649,7 +647,7 @@ async def generate_impacts(
             logger.info(
                 "assets_loaded_from_session",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "count": len(assets),
                 }
             )
@@ -664,7 +662,7 @@ async def generate_impacts(
     # Step 2: Resolve services (optional, for context)
     services = request.services
     if not services:
-        services_step = await get_wizard_step(org_id, user_id, "services")
+        services_step = await get_wizard_step(session_id, "services")
         if services_step and services_step.get("services"):
             from workshops_ai.wizard.schemas import Service
             services = [
@@ -673,7 +671,7 @@ async def generate_impacts(
             logger.info(
                 "services_loaded_from_session",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "count": len(services),
                 }
             )
@@ -701,7 +699,7 @@ async def generate_impacts(
         logger.info(
             "impacts_generated",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "assets_count": len(assets),
                 "asset_impacts_count": len(asset_impacts),
                 "tokens": usage_metrics.total_tokens,
@@ -713,7 +711,7 @@ async def generate_impacts(
         logger.error(
             "impact_generation_failed",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
@@ -728,11 +726,11 @@ async def generate_impacts(
         "usage": usage_metrics.model_dump(),
     }
 
-    await save_wizard_step(org_id, user_id, "impacts", step_data)
+    await save_wizard_step(session_id, "impacts", step_data)
 
     logger.info(
         "impacts_saved_to_session",
-        extra={"session_key": session_key}
+        extra={"session_id": session_id}
     )
 
     # Step 6: Add response headers (if enabled)
@@ -745,7 +743,7 @@ async def generate_impacts(
         response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
 
         # Wizard headers (session-level metrics)
-        response.headers["X-Wizard-Session-Key"] = session_key
+        # Session ID already set in response header by get_session_id dependency
 
     # Step 7: Build response
     output = ImpactsOutput(asset_impacts=asset_impacts)
@@ -765,7 +763,7 @@ async def generate_impacts(
     logger.info(
         "wizard_impacts_completed",
         extra={
-            "session_key": session_key,
+            "session_id": session_id,
             "asset_impacts_count": len(asset_impacts),
         }
     )
@@ -782,7 +780,7 @@ async def generate_impacts(
 async def generate_risks(
     request: RisksInput,
     response: Response,
-    session_key: str = Depends(get_session_key),
+    session_id: str = Depends(get_session_id),
 ) -> RisksOutput:
     """
     Generate risk evaluations for assets using catalog-based approach.
@@ -795,7 +793,7 @@ async def generate_risks(
     Args:
         request: RisksInput with assets and generation params
         response: FastAPI Response for injecting headers
-        session_key: Session key from dependency (format: wizard:{org_id}:{user_id})
+        session_id: Session ID (22 random base64url chars)
 
     Returns:
         RisksOutput with asset risk evaluations and optional debug info
@@ -808,17 +806,10 @@ async def generate_risks(
     """
     settings = get_settings()
 
-    # Extract org_id and user_id from session_key for logging
-    parts = session_key.split(":")
-    org_id = parts[1] if len(parts) > 1 else "unknown"
-    user_id = parts[2] if len(parts) > 2 else "unknown"
-
     logger.info(
         "wizard_risks_started",
         extra={
-            "org_id": org_id,
-            "user_id": user_id,
-            "session_key": session_key,
+            "session_id": session_id,
             "model": request.ai_model,
             "language": request.language,
         }
@@ -830,7 +821,7 @@ async def generate_risks(
     # Step 1: Resolve assets (from request or previous step)
     assets = request.assets
     if not assets:
-        assets_step = await get_wizard_step(org_id, user_id, "assets")
+        assets_step = await get_wizard_step(session_id, "assets")
         if assets_step and assets_step.get("assets"):
             from workshops_ai.api.schema.asset import Asset
             assets = [
@@ -839,7 +830,7 @@ async def generate_risks(
             logger.info(
                 "assets_loaded_from_session",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "count": len(assets),
                 }
             )
@@ -854,7 +845,7 @@ async def generate_risks(
     # Step 2: Resolve asset impacts (optional, for context)
     asset_impacts = request.asset_impacts
     if not asset_impacts:
-        impacts_step = await get_wizard_step(org_id, user_id, "impacts")
+        impacts_step = await get_wizard_step(session_id, "impacts")
         if impacts_step and impacts_step.get("asset_impacts"):
             from workshops_ai.api.schema.impact import AssetImpact
             asset_impacts = [
@@ -863,7 +854,7 @@ async def generate_risks(
             logger.info(
                 "asset_impacts_loaded_from_session",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "count": len(asset_impacts),
                 }
             )
@@ -871,7 +862,7 @@ async def generate_risks(
     # Step 3: Resolve services (optional, for context)
     services = request.services
     if not services:
-        services_step = await get_wizard_step(org_id, user_id, "services")
+        services_step = await get_wizard_step(session_id, "services")
         if services_step and services_step.get("services"):
             from workshops_ai.wizard.schemas import Service
             services = [
@@ -880,7 +871,7 @@ async def generate_risks(
             logger.info(
                 "services_loaded_from_session",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "count": len(services),
                 }
             )
@@ -909,7 +900,7 @@ async def generate_risks(
         logger.info(
             "risks_generated",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "assets_count": len(assets),
                 "asset_risks_count": len(asset_risks),
                 "tokens": usage_metrics.total_tokens,
@@ -921,7 +912,7 @@ async def generate_risks(
         logger.error(
             "risk_generation_failed",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
@@ -936,11 +927,11 @@ async def generate_risks(
         "usage": usage_metrics.model_dump(),
     }
 
-    await save_wizard_step(org_id, user_id, "risks", step_data)
+    await save_wizard_step(session_id, "risks", step_data)
 
     logger.info(
         "risks_saved_to_session",
-        extra={"session_key": session_key}
+        extra={"session_id": session_id}
     )
 
     # Step 7: Add response headers (if enabled)
@@ -953,7 +944,7 @@ async def generate_risks(
         response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
 
         # Wizard headers (session-level metrics)
-        response.headers["X-Wizard-Session-Key"] = session_key
+        # Session ID already set in response header by get_session_id dependency
 
     # Step 8: Build response
     output = RisksOutput(asset_risks=asset_risks)
@@ -977,7 +968,7 @@ async def generate_risks(
     logger.info(
         "wizard_risks_completed",
         extra={
-            "session_key": session_key,
+            "session_id": session_id,
             "asset_risks_count": len(asset_risks),
         }
     )
@@ -994,7 +985,7 @@ async def generate_risks(
 async def generate_controls(
     request: ControlsInput,
     response: Response,
-    session_key: str = Depends(get_session_key),
+    session_id: str = Depends(get_session_id),
 ) -> ControlsOutput:
     """
     Generate control recommendations for assets using hybrid catalog + AI approach.
@@ -1008,7 +999,7 @@ async def generate_controls(
     Args:
         request: ControlsInput with assets, asset risks, and generation params
         response: FastAPI Response for injecting headers
-        session_key: Session key from dependency (format: wizard:{org_id}:{user_id})
+        session_id: Session ID (22 random base64url chars)
 
     Returns:
         ControlsOutput with asset control recommendations and optional debug info
@@ -1021,17 +1012,10 @@ async def generate_controls(
     """
     settings = get_settings()
 
-    # Extract org_id and user_id from session_key for logging
-    parts = session_key.split(":")
-    org_id = parts[1] if len(parts) > 1 else "unknown"
-    user_id = parts[2] if len(parts) > 2 else "unknown"
-
     logger.info(
         "wizard_controls_started",
         extra={
-            "org_id": org_id,
-            "user_id": user_id,
-            "session_key": session_key,
+            "session_id": session_id,
             "model": request.ai_model,
             "language": request.language,
             "max_controls_per_asset": request.max_controls_per_asset,
@@ -1044,7 +1028,7 @@ async def generate_controls(
     # Step 1: Resolve assets (from request or previous step)
     assets = request.assets
     if not assets:
-        assets_step = await get_wizard_step(org_id, user_id, "assets")
+        assets_step = await get_wizard_step(session_id, "assets")
         if assets_step and assets_step.get("assets"):
             from workshops_ai.api.schema.asset import Asset
             assets = [
@@ -1053,7 +1037,7 @@ async def generate_controls(
             logger.info(
                 "assets_loaded_from_session",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "count": len(assets),
                 }
             )
@@ -1068,7 +1052,7 @@ async def generate_controls(
     # Step 2: Resolve asset risks (REQUIRED - from request or previous step)
     asset_risks = request.asset_risks
     if not asset_risks:
-        risks_step = await get_wizard_step(org_id, user_id, "risks")
+        risks_step = await get_wizard_step(session_id, "risks")
         if risks_step and risks_step.get("asset_risks"):
             from workshops_ai.api.schema.threat import AssetRisk
             asset_risks = [
@@ -1077,7 +1061,7 @@ async def generate_controls(
             logger.info(
                 "asset_risks_loaded_from_session",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "count": len(asset_risks),
                 }
             )
@@ -1112,7 +1096,7 @@ async def generate_controls(
         logger.info(
             "controls_generated",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "assets_count": len(assets),
                 "asset_controls_count": len(asset_controls),
                 "tokens": usage_metrics.total_tokens,
@@ -1124,7 +1108,7 @@ async def generate_controls(
         logger.error(
             "control_generation_failed",
             extra={
-                "session_key": session_key,
+                "session_id": session_id,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
@@ -1139,11 +1123,11 @@ async def generate_controls(
         "usage": usage_metrics.model_dump(),
     }
 
-    await save_wizard_step(org_id, user_id, "controls", step_data)
+    await save_wizard_step(session_id, "controls", step_data)
 
     logger.info(
         "controls_saved_to_session",
-        extra={"session_key": session_key}
+        extra={"session_id": session_id}
     )
 
     # Step 6: Add response headers (if enabled)
@@ -1156,7 +1140,7 @@ async def generate_controls(
         response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
 
         # Wizard headers (session-level metrics)
-        response.headers["X-Wizard-Session-Key"] = session_key
+        # Session ID already set in response header by get_session_id dependency
 
     # Step 7: Build response
     output = ControlsOutput(asset_controls=asset_controls)
@@ -1177,7 +1161,7 @@ async def generate_controls(
     logger.info(
         "wizard_controls_completed",
         extra={
-            "session_key": session_key,
+            "session_id": session_id,
             "asset_controls_count": len(asset_controls),
         }
     )
@@ -1194,7 +1178,7 @@ async def generate_controls(
 async def generate_evaluation(
     request: EvaluationInput,
     response: Response,
-    session_key: str = Depends(get_session_key),
+    session_id: str = Depends(get_session_id),
 ) -> EvaluationOutput:
     """
     Run complete wizard evaluation: services → assets → impacts → risks → controls.
@@ -1205,7 +1189,7 @@ async def generate_evaluation(
     Args:
         request: EvaluationInput with website content and generation params
         response: FastAPI Response for injecting headers
-        session_key: Session key from dependency (format: wizard:{org_id}:{user_id})
+        session_id: Session ID (22 random base64url chars)
 
     Returns:
         EvaluationOutput with all step results, timings, and optional errors
@@ -1216,17 +1200,10 @@ async def generate_evaluation(
     settings = get_settings()
     start_total = time.time()
 
-    # Extract org_id and user_id from session_key
-    parts = session_key.split(":")
-    org_id = parts[1] if len(parts) > 1 else "unknown"
-    user_id = parts[2] if len(parts) > 2 else "unknown"
-
     logger.info(
         "wizard_evaluation_started",
         extra={
-            "org_id": org_id,
-            "user_id": user_id,
-            "session_key": session_key,
+            "session_id": session_id,
             "model": request.ai_model,
             "language": request.language,
             "skip_existing": request.skip_existing,
@@ -1262,7 +1239,7 @@ async def generate_evaluation(
 
         # Check skip_existing
         if request.skip_existing:
-            existing = await get_wizard_step(org_id, user_id, "services")
+            existing = await get_wizard_step(session_id, "services")
             if existing and existing.get("services"):
                 from workshops_ai.wizard.schemas import Service
                 results.services = [Service(**s) for s in existing["services"]]
@@ -1274,13 +1251,13 @@ async def generate_evaluation(
                 ))
                 logger.info(
                     "evaluate_step_skipped",
-                    extra={"session_key": session_key, "step": "services"}
+                    extra={"session_id": session_id, "step": "services"}
                 )
 
         if results.services is None:
             # Resolve website content
             website_content, content_metadata = await content_resolver.resolve_content(
-                session_key=session_key,
+                session_id=session_id,
                 website_text=request.website_content.content if request.website_content else None,
                 website_url=request.website_url,
                 search_method=request.search_method,
@@ -1305,7 +1282,7 @@ async def generate_evaluation(
             )
 
             results.services = services
-            await save_wizard_step(org_id, user_id, "services", {
+            await save_wizard_step(session_id, "services", {
                 "services": [s.model_dump() for s in services],
                 "language": request.language,
                 "model": service_generator.model_name,
@@ -1325,7 +1302,7 @@ async def generate_evaluation(
             ))
             logger.info(
                 "evaluate_step_completed",
-                extra={"session_key": session_key, "step": "services", "elapsed_ms": elapsed}
+                extra={"session_id": session_id, "step": "services", "elapsed_ms": elapsed}
             )
 
     except Exception as e:
@@ -1340,7 +1317,7 @@ async def generate_evaluation(
         ))
         logger.error(
             "evaluate_step_failed",
-            extra={"session_key": session_key, "step": "services", "error": str(e)}
+            extra={"session_id": session_id, "step": "services", "error": str(e)}
         )
 
         if not request.continue_on_error:
@@ -1355,7 +1332,7 @@ async def generate_evaluation(
 
             # Check skip_existing
             if request.skip_existing:
-                existing = await get_wizard_step(org_id, user_id, "assets")
+                existing = await get_wizard_step(session_id, "assets")
                 if existing and existing.get("assets"):
                     from workshops_ai.api.schema.asset import Asset
                     results.assets = [Asset(**a) for a in existing["assets"]]
@@ -1367,13 +1344,13 @@ async def generate_evaluation(
                     ))
                     logger.info(
                         "evaluate_step_skipped",
-                        extra={"session_key": session_key, "step": "assets"}
+                        extra={"session_id": session_id, "step": "assets"}
                     )
 
             if results.assets is None and results.services:
                 # Get website content from session (or re-scrape if cache fails)
                 website_content, _ = await content_resolver.resolve_content(
-                    session_key=session_key,
+                    session_id=session_id,
                     website_text=request.website_content.content if request.website_content else None,
                     website_url=request.website_url,
                     search_method=request.search_method,
@@ -1393,7 +1370,7 @@ async def generate_evaluation(
                 )
 
                 results.assets = assets
-                await save_wizard_step(org_id, user_id, "assets", {
+                await save_wizard_step(session_id, "assets", {
                     "assets": [a.model_dump() for a in assets],
                     "language": request.language,
                     "model": asset_generator.model_name,
@@ -1413,7 +1390,7 @@ async def generate_evaluation(
                 ))
                 logger.info(
                     "evaluate_step_completed",
-                    extra={"session_key": session_key, "step": "assets", "elapsed_ms": elapsed}
+                    extra={"session_id": session_id, "step": "assets", "elapsed_ms": elapsed}
                 )
 
         except Exception as e:
@@ -1428,7 +1405,7 @@ async def generate_evaluation(
             ))
             logger.error(
                 "evaluate_step_failed",
-                extra={"session_key": session_key, "step": "assets", "error": str(e)}
+                extra={"session_id": session_id, "step": "assets", "error": str(e)}
             )
 
             if not request.continue_on_error:
@@ -1443,7 +1420,7 @@ async def generate_evaluation(
 
             # Check skip_existing
             if request.skip_existing:
-                existing = await get_wizard_step(org_id, user_id, "impacts")
+                existing = await get_wizard_step(session_id, "impacts")
                 if existing and existing.get("asset_impacts"):
                     from workshops_ai.api.schema.impact import AssetImpact
                     results.asset_impacts = [AssetImpact(**ai) for ai in existing["asset_impacts"]]
@@ -1455,7 +1432,7 @@ async def generate_evaluation(
                     ))
                     logger.info(
                         "evaluate_step_skipped",
-                        extra={"session_key": session_key, "step": "impacts"}
+                        extra={"session_id": session_id, "step": "impacts"}
                     )
 
             if results.asset_impacts is None and results.assets:
@@ -1470,7 +1447,7 @@ async def generate_evaluation(
                 )
 
                 results.asset_impacts = asset_impacts
-                await save_wizard_step(org_id, user_id, "impacts", {
+                await save_wizard_step(session_id, "impacts", {
                     "asset_impacts": [ai.model_dump() for ai in asset_impacts],
                     "language": request.language,
                     "model": impact_generator.model_name,
@@ -1490,7 +1467,7 @@ async def generate_evaluation(
                 ))
                 logger.info(
                     "evaluate_step_completed",
-                    extra={"session_key": session_key, "step": "impacts", "elapsed_ms": elapsed}
+                    extra={"session_id": session_id, "step": "impacts", "elapsed_ms": elapsed}
                 )
 
         except Exception as e:
@@ -1505,7 +1482,7 @@ async def generate_evaluation(
             ))
             logger.error(
                 "evaluate_step_failed",
-                extra={"session_key": session_key, "step": "impacts", "error": str(e)}
+                extra={"session_id": session_id, "step": "impacts", "error": str(e)}
             )
 
             if not request.continue_on_error:
@@ -1520,7 +1497,7 @@ async def generate_evaluation(
 
             # Check skip_existing
             if request.skip_existing:
-                existing = await get_wizard_step(org_id, user_id, "risks")
+                existing = await get_wizard_step(session_id, "risks")
                 if existing and existing.get("asset_risks"):
                     from workshops_ai.api.schema.threat import AssetRisk
                     results.asset_risks = [AssetRisk(**ar) for ar in existing["asset_risks"]]
@@ -1532,7 +1509,7 @@ async def generate_evaluation(
                     ))
                     logger.info(
                         "evaluate_step_skipped",
-                        extra={"session_key": session_key, "step": "risks"}
+                        extra={"session_id": session_id, "step": "risks"}
                     )
 
             if results.asset_risks is None and results.assets:
@@ -1548,7 +1525,7 @@ async def generate_evaluation(
                 )
 
                 results.asset_risks = asset_risks
-                await save_wizard_step(org_id, user_id, "risks", {
+                await save_wizard_step(session_id, "risks", {
                     "asset_risks": [ar.model_dump() for ar in asset_risks],
                     "language": request.language,
                     "model": risk_generator.model_name,
@@ -1568,7 +1545,7 @@ async def generate_evaluation(
                 ))
                 logger.info(
                     "evaluate_step_completed",
-                    extra={"session_key": session_key, "step": "risks", "elapsed_ms": elapsed}
+                    extra={"session_id": session_id, "step": "risks", "elapsed_ms": elapsed}
                 )
 
         except Exception as e:
@@ -1583,7 +1560,7 @@ async def generate_evaluation(
             ))
             logger.error(
                 "evaluate_step_failed",
-                extra={"session_key": session_key, "step": "risks", "error": str(e)}
+                extra={"session_id": session_id, "step": "risks", "error": str(e)}
             )
 
             if not request.continue_on_error:
@@ -1598,7 +1575,7 @@ async def generate_evaluation(
 
             # Check skip_existing
             if request.skip_existing:
-                existing = await get_wizard_step(org_id, user_id, "controls")
+                existing = await get_wizard_step(session_id, "controls")
                 if existing and existing.get("asset_controls"):
                     from workshops_ai.api.schema.control import AssetControls
                     results.asset_controls = [AssetControls(**ac) for ac in existing["asset_controls"]]
@@ -1610,7 +1587,7 @@ async def generate_evaluation(
                     ))
                     logger.info(
                         "evaluate_step_skipped",
-                        extra={"session_key": session_key, "step": "controls"}
+                        extra={"session_id": session_id, "step": "controls"}
                     )
 
             if results.asset_controls is None and results.assets and results.asset_risks:
@@ -1625,7 +1602,7 @@ async def generate_evaluation(
                 )
 
                 results.asset_controls = asset_controls
-                await save_wizard_step(org_id, user_id, "controls", {
+                await save_wizard_step(session_id, "controls", {
                     "asset_controls": [ac.model_dump() for ac in asset_controls],
                     "language": request.language,
                     "model": control_generator.model_name,
@@ -1645,7 +1622,7 @@ async def generate_evaluation(
                 ))
                 logger.info(
                     "evaluate_step_completed",
-                    extra={"session_key": session_key, "step": "controls", "elapsed_ms": elapsed}
+                    extra={"session_id": session_id, "step": "controls", "elapsed_ms": elapsed}
                 )
 
         except Exception as e:
@@ -1660,7 +1637,7 @@ async def generate_evaluation(
             ))
             logger.error(
                 "evaluate_step_failed",
-                extra={"session_key": session_key, "step": "controls", "error": str(e)}
+                extra={"session_id": session_id, "step": "controls", "error": str(e)}
             )
 
             if not request.continue_on_error:
@@ -1682,7 +1659,7 @@ async def generate_evaluation(
 
     # Add response headers if enabled
     if settings.wizard.expose_debug_info:
-        response.headers["X-Wizard-Session-Key"] = session_key
+        # Session ID already set in response header by get_session_id dependency
         response.headers["X-Wizard-Total-Time-MS"] = str(total_elapsed)
         response.headers["X-Wizard-Steps-Completed"] = str(len([t for t in timings if t.success]))
         response.headers["X-Wizard-Steps-Failed"] = str(len([t for t in timings if not t.success]))
@@ -1690,7 +1667,7 @@ async def generate_evaluation(
     logger.info(
         "wizard_evaluation_completed",
         extra={
-            "session_key": session_key,
+            "session_id": session_id,
             "total_time_ms": total_elapsed,
             "steps_completed": len([t for t in timings if t.success]),
             "steps_failed": len([t for t in timings if not t.success]),
@@ -1711,22 +1688,17 @@ async def generate_evaluation(
     description="Retrieve current wizard state for user"
 )
 async def get_state(
-    session_key: str = Depends(get_session_key),
+    session_id: str = Depends(get_session_id),
 ) -> WizardStateResponse:
     """
     Get current wizard state from Redis.
     """
-    # Extract org_id and user_id from session_key
-    parts = session_key.split(":")
-    org_id = parts[1] if len(parts) > 1 else "unknown"
-    user_id = parts[2] if len(parts) > 2 else "unknown"
-
     logger.info(
         "Wizard: get state",
-        extra={"org_id": org_id, "user_id": user_id}
+        extra={"session_id": session_id}
     )
 
-    state = await get_wizard_state(org_id, user_id)
+    state = await get_wizard_state(session_id)
 
     # Extract completed steps
     steps_completed = [
@@ -1738,8 +1710,7 @@ async def get_state(
     ]
 
     return WizardStateResponse(
-        org_id=org_id,
-        user_id=user_id,
+        session_id=session_id,
         steps_completed=steps_completed,
         data=state
     )
@@ -1751,21 +1722,16 @@ async def get_state(
     description="Clear all wizard state for user (reset wizard)"
 )
 async def clear_state(
-    session_key: str = Depends(get_session_key),
+    session_id: str = Depends(get_session_id),
 ) -> Dict[str, str]:
     """
     Clear wizard state from Redis.
     """
-    # Extract org_id and user_id from session_key
-    parts = session_key.split(":")
-    org_id = parts[1] if len(parts) > 1 else "unknown"
-    user_id = parts[2] if len(parts) > 2 else "unknown"
-
     logger.info(
         "Wizard: clear state",
-        extra={"org_id": org_id, "user_id": user_id}
+        extra={"session_id": session_id}
     )
 
-    await clear_wizard_state(org_id, user_id)
+    await clear_wizard_state(session_id)
 
     return {"message": "Wizard state cleared successfully"}

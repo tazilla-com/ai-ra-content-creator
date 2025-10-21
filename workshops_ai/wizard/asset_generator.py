@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import asyncio
-from typing import List, Tuple, Dict, Any, Optional, Literal, get_args, get_origin
+from typing import List, Tuple, Dict, Any, Optional
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -29,6 +29,7 @@ from workshops_ai.wizard.prompts import (
     ASSETS_SYSTEM_PROMPT,
     ASSETS_HUMAN_PROMPT_TEMPLATE,
 )
+from workshops_ai.wizard.catalog_loader import get_asset_type_names
 from workshops_ai.wizard.cost_calculator import create_usage_metrics, UsageMetrics
 from workshops_ai.wizard.exceptions import (
     AIResponseError,
@@ -88,28 +89,6 @@ class AssetGenerator:
             }
         )
 
-    @staticmethod
-    def _allowed_asset_types_from_model() -> List[str]:
-        """
-        Extract allowed asset types from Asset model Literal annotation.
-
-        Returns:
-            List of asset type strings from Asset.assetType Literal
-        """
-        typ = Asset.__annotations__.get("assetType")
-        if typ is None:
-            return []
-
-        # Handle Literal type
-        if get_origin(typ) is Literal:
-            return list(get_args(typ))
-
-        # Handle nested Literal (e.g., Optional[Literal[...]])
-        for arg in get_args(typ):
-            if get_origin(arg) is Literal:
-                return list(get_args(arg))
-
-        return []
 
     def _build_prompt_sections(
         self,
@@ -448,10 +427,10 @@ class AssetGenerator:
         # Clamp number of assets to valid range
         number_of_assets = max(1, min(50, number_of_assets))
 
-        # Extract allowed asset types from Asset model
-        allowed_asset_types = self._allowed_asset_types_from_model()
+        # Get allowed asset types from catalog (always in English for validation)
+        allowed_asset_types = get_asset_type_names(language="en")
         if not allowed_asset_types:
-            raise RuntimeError("Failed to extract asset types from Asset model")
+            raise RuntimeError("Failed to load asset types from catalog")
 
         # Build prompt sections
         sections = self._build_prompt_sections(

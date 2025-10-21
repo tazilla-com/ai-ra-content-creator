@@ -57,6 +57,132 @@ def _read_csv(file_path: Path) -> List[Dict[str, str]]:
     return rows
 
 
+def load_impact_category_catalog(language: str = "en", session_id: Optional[str] = None) -> List[Dict[str, str]]:
+    """
+    Load impact category catalog from CSV file with localization.
+
+    Args:
+        language: Output language (en/sk/cs)
+        session_id: Session ID for client-specific catalogs (CSV provider ignores this)
+
+    Returns:
+        List of dicts with name and description
+    """
+    # CSV provider: ignores session_id, uses static catalog files
+    rows = _read_csv(CATALOG_BASE / "Impact category.csv")
+    categories: List[Dict[str, str]] = []
+
+    for r in rows:
+        # Get base name (always EN)
+        base_name = (r.get("EN Name") or r.get("Name") or "").strip()
+        if not base_name:
+            continue
+
+        # Get localized name and notes
+        if language == "sk":
+            name = (r.get("SK Name") or base_name).strip()
+            notes = (r.get("SK Notes") or r.get("Notes") or "").strip()
+        elif language == "cs":
+            # CS not in this CSV, fallback to EN
+            name = base_name
+            notes = (r.get("EN Notes") or r.get("Notes") or "").strip()
+        else:  # en
+            name = base_name
+            notes = (r.get("EN Notes") or r.get("Notes") or "").strip()
+
+        categories.append({
+            "name": name,
+            "description": notes
+        })
+
+    logger.info(f"Loaded {len(categories)} impact categories for language '{language}'")
+    return categories
+
+
+def load_threat_category_catalog(language: str = "en", session_id: Optional[str] = None) -> List[Dict[str, str]]:
+    """
+    Load threat category catalog from CSV file with localization.
+
+    Args:
+        language: Output language (en/sk/cs)
+        session_id: Session ID for client-specific catalogs (CSV provider ignores this)
+
+    Returns:
+        List of dicts with name and description
+    """
+    # CSV provider: ignores session_id, uses static catalog files
+    rows = _read_csv(CATALOG_BASE / "Threat category.csv")
+    categories: List[Dict[str, str]] = []
+
+    for r in rows:
+        # Get base name (always EN)
+        base_name = (r.get("EN Name") or r.get("Name") or "").strip()
+        if not base_name:
+            continue
+
+        # Get localized name and notes
+        if language == "sk":
+            name = (r.get("SK Name") or base_name).strip()
+            notes = (r.get("SK Notes") or r.get("Notes") or "").strip()
+        elif language == "cs":
+            # CS not in this CSV, fallback to EN
+            name = base_name
+            notes = (r.get("EN Notes") or r.get("Notes") or "").strip()
+        else:  # en
+            name = base_name
+            notes = (r.get("EN Notes") or r.get("Notes") or "").strip()
+
+        categories.append({
+            "name": name,
+            "description": notes
+        })
+
+    logger.info(f"Loaded {len(categories)} threat categories for language '{language}'")
+    return categories
+
+
+def load_control_category_catalog(language: str = "en", session_id: Optional[str] = None) -> List[Dict[str, str]]:
+    """
+    Load control category catalog from CSV file with localization.
+
+    Args:
+        language: Output language (en/sk/cs)
+        session_id: Session ID for client-specific catalogs (CSV provider ignores this)
+
+    Returns:
+        List of dicts with name and description
+    """
+    # CSV provider: ignores session_id, uses static catalog files
+    rows = _read_csv(CATALOG_BASE / "Control category.csv")
+    categories: List[Dict[str, str]] = []
+
+    for r in rows:
+        # Get base name (always EN)
+        base_name = (r.get("EN Name") or r.get("Name") or "").strip()
+        if not base_name:
+            continue
+
+        # Get localized name and notes
+        if language == "sk":
+            name = (r.get("SK Name") or base_name).strip()
+            notes = (r.get("SK Notes") or r.get("Notes") or "").strip()
+        elif language == "cs":
+            # CS not in this CSV, fallback to EN
+            name = base_name
+            notes = (r.get("EN Notes") or r.get("Notes") or "").strip()
+        else:  # en
+            name = base_name
+            notes = (r.get("EN Notes") or r.get("Notes") or "").strip()
+
+        categories.append({
+            "name": name,
+            "description": notes
+        })
+
+    logger.info(f"Loaded {len(categories)} control categories for language '{language}'")
+    return categories
+
+
 def load_impact_to_category() -> Dict[str, str]:
     """
     Load impact-to-category mapping from CSV.
@@ -84,18 +210,20 @@ def load_impact_to_category() -> Dict[str, str]:
     return mapping
 
 
-def load_impact_catalog(language: str = "en") -> List[Impact]:
+def load_impact_catalog(language: str = "en", session_id: Optional[str] = None) -> List[Impact]:
     """
     Load impact catalog from CSV file with localization.
 
     Args:
         language: Output language (en/sk/cs)
+        session_id: Session ID for client-specific catalogs (CSV provider ignores this)
 
     Returns:
         List of Impact objects with name, description, weight, and category
     """
     global _impact_cache
 
+    # CSV provider: ignores session_id, uses static catalog files
     # Use cache only if language is EN (base language)
     # For other languages, always reload to get localized names
     if language == "en" and _impact_cache is not None:
@@ -166,17 +294,18 @@ def load_impact_catalog(language: str = "en") -> List[Impact]:
     return impacts
 
 
-def get_impact_names(language: str = "en") -> List[str]:
+def get_impact_names(language: str = "en", session_id: Optional[str] = None) -> List[str]:
     """
     Get ordered list of impact names from catalog.
 
     Args:
         language: Output language (en/sk/cs)
+        session_id: Session ID for client-specific catalogs (CSV provider ignores this)
 
     Returns:
         List of impact names in catalog order
     """
-    impacts = load_impact_catalog(language)
+    impacts = load_impact_catalog(language, session_id=session_id)
     return [imp.name for imp in impacts]
 
 
@@ -224,18 +353,20 @@ def load_threat_to_category() -> Dict[str, str]:
     return mapping
 
 
-def load_threat_catalog(language: str = "en") -> List[Threat]:
+def load_threat_catalog(language: str = "en", session_id: Optional[str] = None) -> List[Threat]:
     """
     Load threat catalog from CSV file with localization.
 
     Args:
         language: Output language (en/sk/cs)
+        session_id: Session ID for client-specific catalogs (CSV provider ignores this)
 
     Returns:
         List of Threat objects with name, description, category, and threat type flags
     """
     global _threat_cache
 
+    # CSV provider: ignores session_id, uses static catalog files
     # Use cache only if language is EN (base language)
     # For other languages, always reload to get localized names
     if language == "en" and _threat_cache is not None:
@@ -305,18 +436,81 @@ def load_threat_catalog(language: str = "en") -> List[Threat]:
     return threats
 
 
-def get_threat_names(language: str = "en") -> List[str]:
+def get_threat_names(language: str = "en", session_id: Optional[str] = None) -> List[str]:
     """
     Get ordered list of threat names from catalog.
 
     Args:
         language: Output language (en/sk/cs)
+        session_id: Session ID for client-specific catalogs (CSV provider ignores this)
 
     Returns:
         List of threat names in catalog order
     """
-    threats = load_threat_catalog(language)
+    threats = load_threat_catalog(language, session_id=session_id)
     return [threat.name for threat in threats]
+
+
+def load_asset_type_catalog(language: str = "en", session_id: Optional[str] = None) -> List[Dict[str, any]]:
+    """
+    Load asset type catalog from CSV file with localization.
+
+    Args:
+        language: Output language (en/sk/cs)
+        session_id: Session ID for client-specific catalogs (CSV provider ignores this)
+
+    Returns:
+        List of dicts with name, description/notes, and isDependent flag
+    """
+    # CSV provider: ignores session_id, uses static catalog files
+    rows = _read_csv(CATALOG_BASE / "Asset type.csv")
+    asset_types: List[Dict[str, any]] = []
+
+    for r in rows:
+        # Get base name (always EN)
+        base_name = (r.get("EN Name") or r.get("Name") or "").strip()
+        if not base_name:
+            continue
+
+        # Get localized name and notes
+        if language == "sk":
+            name = (r.get("SK Name") or base_name).strip()
+            notes = (r.get("SK Notes") or r.get("Notes") or "").strip()
+        elif language == "cs":
+            # CS not in this CSV, fallback to EN
+            name = base_name
+            notes = (r.get("EN Notes") or r.get("Notes") or "").strip()
+        else:  # en
+            name = base_name
+            notes = (r.get("EN Notes") or r.get("Notes") or "").strip()
+
+        # Parse isDependent flag
+        is_dependent_str = (r.get("Is dependent") or "FALSE").strip().upper()
+        is_dependent = is_dependent_str in ("TRUE", "1", "YES")
+
+        asset_types.append({
+            "name": name,
+            "description": notes,
+            "isDependent": is_dependent
+        })
+
+    logger.info(f"Loaded {len(asset_types)} asset types for language '{language}'")
+    return asset_types
+
+
+def get_asset_type_names(language: str = "en", session_id: Optional[str] = None) -> List[str]:
+    """
+    Get ordered list of asset type names from catalog.
+
+    Args:
+        language: Output language (en/sk/cs)
+        session_id: Session ID for client-specific catalogs (CSV provider ignores this)
+
+    Returns:
+        List of asset type names in catalog order
+    """
+    asset_types = load_asset_type_catalog(language, session_id=session_id)
+    return [at["name"] for at in asset_types]
 
 
 def load_asset_type_threat_priors() -> Dict[str, List[str]]:
@@ -376,7 +570,7 @@ def load_control_to_category() -> Dict[str, str]:
     return mapping
 
 
-def load_control_catalog(language: str = "en") -> List[PlannedControl]:
+def load_control_catalog(language: str = "en", session_id: Optional[str] = None) -> List[PlannedControl]:
     """
     Load control catalog from CSV file with localization.
 
@@ -385,12 +579,14 @@ def load_control_catalog(language: str = "en") -> List[PlannedControl]:
 
     Args:
         language: Output language (en/sk/cs)
+        session_id: Session ID for client-specific catalogs (CSV provider ignores this)
 
     Returns:
         List of PlannedControl objects with empty threats list
     """
     global _control_cache
 
+    # CSV provider: ignores session_id, uses static catalog files
     # Use cache only if language is EN (base language)
     # For other languages, always reload to get localized names
     if language == "en" and _control_cache is not None:

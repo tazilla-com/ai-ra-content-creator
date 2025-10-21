@@ -423,6 +423,10 @@ class WizardSettings(BaseModel):
         default=8,
         description="Session TTL in hours (wizard state expiration)"
     )
+    session_creation_rate_limit: int = Field(
+        default=10,
+        description="Max new sessions per IP per hour (0 = unlimited)"
+    )
 
     @field_validator("allowed_models", mode="before")
     @classmethod

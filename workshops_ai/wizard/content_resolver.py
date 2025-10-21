@@ -120,36 +120,39 @@ class ContentResolver:
 
     async def _get_cached_content(
         self,
-        session_key: str,
+        session_id: str,
         url: Optional[str]
     ) -> Optional[str]:
         """
         Get cached website content from Redis session.
 
         Args:
-            session_key: Redis session key (e.g., "wizard:org123:user456")
+            session_id: Session ID
             url: Website URL (optional, for logging)
 
         Returns:
             Cached content if found, None otherwise
         """
+        from workshops_ai.wizard.session import get_wizard_state
+
         try:
-            content = await self.redis.hget(session_key, "website_content")
+            state = await get_wizard_state(session_id)
+            content = state.get("website_content")
 
             if content:
                 logger.info(
                     "content_cache_hit",
                     extra={
-                        "session_key": session_key,
+                        "session_id": session_id,
                         "url": url,
                         "content_length": len(content),
                     }
                 )
-                return content.decode("utf-8") if isinstance(content, bytes) else content
+                return content
 
             logger.debug(
                 "content_cache_miss",
-                extra={"session_key": session_key, "url": url}
+                extra={"session_id": session_id, "url": url}
             )
             return None
 
@@ -157,7 +160,7 @@ class ContentResolver:
             logger.error(
                 "content_cache_read_failed",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "error": str(e),
                     "error_type": type(e).__name__,
                 }
@@ -166,7 +169,7 @@ class ContentResolver:
 
     async def _set_cached_content(
         self,
-        session_key: str,
+        session_id: str,
         content: str,
         url: Optional[str] = None
     ) -> None:
@@ -174,25 +177,23 @@ class ContentResolver:
         Cache website content in Redis session.
 
         Args:
-            session_key: Redis session key
+            session_id: Session ID
             content: Website content to cache
             url: Website URL (optional, for logging)
         """
-        try:
-            await self.redis.hset(
-                session_key,
-                "website_content",
-                content
-            )
+        from workshops_ai.wizard.session import update_session_data
 
-            # Also store URL if provided
+        try:
+            updates = {"website_content": content}
             if url:
-                await self.redis.hset(session_key, "website_url", url)
+                updates["website_url"] = url
+
+            await update_session_data(session_id, updates)
 
             logger.info(
                 "content_cached",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "url": url,
                     "content_length": len(content),
                 }
@@ -202,7 +203,7 @@ class ContentResolver:
             logger.error(
                 "content_cache_write_failed",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "error": str(e),
                     "error_type": type(e).__name__,
                 }
@@ -291,7 +292,7 @@ class ContentResolver:
 
     async def resolve_content(
         self,
-        session_key: str,
+        session_id: str,
         website_text: Optional[str] = None,
         website_url: Optional[str] = None,
         search_method: SearchMethod = "scrape",
@@ -308,7 +309,7 @@ class ContentResolver:
            - "web_search": AI-powered web search using OpenAI
 
         Args:
-            session_key: Redis session key
+            session_id: Session ID
             website_text: Optional direct website content
             website_url: Optional website URL to scrape/search
             search_method: Content retrieval method ("scrape" or "web_search")
@@ -330,14 +331,14 @@ class ContentResolver:
             logger.info(
                 "content_resolved_from_text",
                 extra={
-                    "session_key": session_key,
+                    "session_id": session_id,
                     "content_length": len(website_text),
                 }
             )
 
             # Cache for future requests
             await self._set_cached_content(
-                session_key=session_key,
+                session_id=session_id,
                 content=website_text,
                 url=website_url
             )
@@ -347,7 +348,7 @@ class ContentResolver:
             return website_text, metadata
 
         # Priority 2: Cached content
-        cached_content = await self._get_cached_content(session_key, website_url)
+        cached_content = await self._get_cached_content(session_id, website_url)
         if cached_content:
             metadata["source"] = "cache"
             metadata["content_length"] = len(cached_content)
@@ -366,11 +367,11 @@ class ContentResolver:
                     blocking_timeout=10,  # Wait up to 10s for lock
                 ):
                     # Double-check cache (another request might have fetched while we waited)
-                    cached_content = await self._get_cached_content(session_key, website_url)
+                    cached_content = await self._get_cached_content(session_id, website_url)
                     if cached_content:
                         logger.info(
                             "content_resolved_from_cache_after_lock",
-                            extra={"session_key": session_key, "url": website_url}
+                            extra={"session_id": session_id, "url": website_url}
                         )
                         metadata["source"] = "cache_after_lock"
                         metadata["content_length"] = len(cached_content)
@@ -402,7 +403,7 @@ class ContentResolver:
 
                     # Cache the result
                     await self._set_cached_content(
-                        session_key=session_key,
+                        session_id=session_id,
                         content=content,
                         url=website_url
                     )
