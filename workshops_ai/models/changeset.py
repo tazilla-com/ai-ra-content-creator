@@ -33,6 +33,7 @@ OP_REMOVE_CONTROLS                  = "remove_controls"
 OP_UPSERT_THREATS                   = "upsert_threats"
 OP_UPSERT_IMPACTS                   = "upsert_impacts"
 OP_ASSET_UPSERT_THREAT_PRESENCE     = "asset_upsert_threat_presence"
+OP_SET_ASSET_CIA                    = "set_asset_cia"
 
 # =============================================================================
 # CIA enums for normalization/validation in CreateAssetFields
@@ -353,6 +354,52 @@ class ActionSetAssetMeta(BaseModel):
             raise ValueError("One of 'asset_id' or 'asset_ref' must be provided.")
         return self
 
+# --- CIA update (asset-scoped) ----------------------------------------------
+
+class CIAUpdateFields(BaseModel):
+    """
+    CIA levels as numeric policy values:
+      - confidentiality: 1..4
+      - integrity:       1..3
+      - availability:    1..3
+
+    None means "clear the value". Zero must not appear here (callers should
+    map it to None upstream if they use zero as a sentinel).
+    """
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    confidentiality: Optional[StrictInt] = Field(default=None, ge=1, le=4)
+    integrity:       Optional[StrictInt] = Field(default=None, ge=1, le=3)
+    availability:    Optional[StrictInt] = Field(default=None, ge=1, le=3)
+
+    @model_validator(mode="after")
+    def _at_least_one(self) -> "CIAUpdateFields":
+        if (self.confidentiality is None and
+            self.integrity       is None and
+            self.availability    is None):
+            raise ValueError("At least one of confidentiality/integrity/availability must be provided")
+        return self
+
+
+class ActionSetAssetCIA(BaseModel):
+    """
+    Set/clear CIA values for a given asset.
+    - Zero values are not allowed (should be mapped to None by the caller).
+    - Requires either asset_id or asset_ref.
+    """
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    op: Literal["set_asset_cia"] = OP_SET_ASSET_CIA
+    asset_id: Optional[StrictStr] = None
+    asset_ref: Optional[StrictStr] = None
+    fields: CIAUpdateFields
+
+    @model_validator(mode="after")
+    def _require_asset_selector(self) -> "ActionSetAssetCIA":
+        if not (self.asset_id or self.asset_ref):
+            raise ValueError("One of 'asset_id' or 'asset_ref' must be provided.")
+        return self
+
 # -----------------------------------------------------------------------------
 # Typed create payload with conditional CIA policy (STRICT enums)
 # -----------------------------------------------------------------------------
@@ -560,6 +607,7 @@ Action = Annotated[
     Union[
         ActionCreateAsset,
         ActionSetAssetMeta,
+        ActionSetAssetCIA,
         ActionSetImpacts,
         ActionSetRisks,
         ActionUpsertControls,
@@ -738,6 +786,7 @@ __all__ = [
     # constants
     "OP_CREATE_ASSET",
     "OP_SET_ASSET_META",
+    "OP_SET_ASSET_CIA",
     "OP_SET_IMPACTS",
     "OP_SET_RISKS",
     "OP_UPSERT_CONTROLS",
@@ -760,6 +809,7 @@ __all__ = [
     "ActionUpsertControls",
     "ActionRemoveControls",
     "ActionSetAssetMeta",
+    "ActionSetAssetCIA",
     "CreateAssetFields",
     "ActionCreateAsset",
     "ActionUpsertThreats",

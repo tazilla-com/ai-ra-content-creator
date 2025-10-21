@@ -16,7 +16,7 @@
 #
 # Catalog files (relative to resolved catalogs dir) – read-only helpers:
 #   Asset type.csv
-#   Threat.csv
+#   Threat.csv 
 #   Threat category.csv
 #   Threat x Threat category.csv
 #   Asset type x Threat.csv

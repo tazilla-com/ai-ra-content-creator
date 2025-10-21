@@ -326,21 +326,28 @@ async def submit_or_fallback(
     Try to submit the ChangeSet via the provided submitter; on failure (or if
     no submitter is given), persist it into the OUTBOX directory.
 
-    Robustness improvements:
+    Key behavior (unchanged):
       - Accepts either a ChangeSet instance or a plain dict.
-      - Immediately normalizes dict -> ChangeSet using pydantic validation so
-        downstream code always deals with a canonical model.
-      - Keeps the same behavior for 'require_success':
+      - Validates/normalizes dict -> ChangeSet so downstream always sees a model.
+      - 'require_success':
           * True  -> raise SubmitError on any online submission failure.
           * False -> fall back to OUTBOX on failure.
 
+    UX improvement:
+      - When we fall back to OUTBOX, we now include the original submission error
+        in reason["submit_error"]. This lets the UI display a helpful message
+        like "Saved to outbox; online submit failed: <error>".
+
     Special case:
       - If the ChangeSet has 0 actions, do not submit or write. Return a
-        structured reason for the UI (helps render 'nothing to do' states).
+        structured reason for the UI ("empty_changeset").
     """
     # Normalize to a canonical model once (dicts are validated & coerced here)
     try:
-        cs_model: ChangeSet = changeset if isinstance(changeset, ChangeSet) else ChangeSet.model_validate(changeset)
+        cs_model: ChangeSet = (
+            changeset if isinstance(changeset, ChangeSet)
+            else ChangeSet.model_validate(changeset)
+        )
     except Exception as exc:
         # Invalid shape should surface clearly; if require_success is set, escalate
         logger.warning("Invalid ChangeSet payload (cannot validate): %s", exc, exc_info=True)
@@ -351,14 +358,29 @@ async def submit_or_fallback(
             submitted=False,
             submit_result=None,
             fallback_path=None,
-            reason={"code": "invalid_changeset", "message": "Payload failed ChangeSet validation."},
+            reason={
+                "code": "invalid_changeset",
+                "message": "Payload failed ChangeSet validation.",
+            },
         )
 
     # Short-circuit: empty changeset → structured reason, no I/O
     if _get_actions_len(cs_model) == 0:
-        reason = {"code": "empty_changeset", "message": "No actions to submit.", "actions": 0}
+        reason = {
+            "code": "empty_changeset",
+            "message": "No actions to submit.",
+            "actions": 0,
+        }
         logger.info("Empty ChangeSet: %s", reason)
-        return SubmitOrFallbackResult(submitted=False, submit_result=None, fallback_path=None, reason=reason)
+        return SubmitOrFallbackResult(
+            submitted=False,
+            submit_result=None,
+            fallback_path=None,
+            reason=reason,
+        )
+
+    # Hold the last submit error so we can surface it alongside the OUTBOX fallback
+    submit_error: Optional[str] = None
 
     # Try online submit when submitter is provided
     if submitter is not None:
@@ -370,26 +392,41 @@ async def submit_or_fallback(
                     submit_result.transport,
                     submit_result.status_code,
                 )
-                return SubmitOrFallbackResult(submitted=True, submit_result=submit_result, fallback_path=None, reason=None)
+                return SubmitOrFallbackResult(
+                    submitted=True,
+                    submit_result=submit_result,
+                    fallback_path=None,
+                    reason=None,
+                )
 
             # Submission returned a failure result (e.g., non-2xx)
             err_msg = submit_result.error or f"submit failed (status={submit_result.status_code})"
             logger.warning("ChangeSet submission failed: %s", err_msg)
+            submit_error = err_msg  # <— capture for UX
             if require_success:
                 # Caller demanded success: escalate to exception
                 raise SubmitError(err_msg)
+
             # Otherwise fall through to OUTBOX fallback
+
         except Exception as exc:
             logger.warning("ChangeSet submission error: %s", exc, exc_info=True)
+            submit_error = str(exc)  # <— capture exception text for UX
             if require_success:
                 raise SubmitError(str(exc)) from exc
             # Otherwise, fall through to OUTBOX fallback
 
     # Fallback to OUTBOX (authoritative path is settings.tazila.outbox_path)
     path = write_changeset_to_outbox(cs_model, outbox_dir=outbox_dir)
+
+    # Reason now includes the OUTBOX path and (if present) the original submit error
+    reason: dict[str, Any] = {"code": "queued_outbox", "path": str(path)}
+    if submit_error:
+        reason["submit_error"] = submit_error
+
     return SubmitOrFallbackResult(
         submitted=False,
-        submit_result=None,
+        submit_result=None,   # kept None for backward compatibility on fallback
         fallback_path=path,
-        reason={"code": "queued_outbox", "path": str(path)},
+        reason=reason,
     )

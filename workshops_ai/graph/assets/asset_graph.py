@@ -23,7 +23,7 @@ import re
 import time
 import uuid
 from collections import deque
-from collections.abc import Mapping, Iterable
+from collections.abc import Mapping
 from typing import Callable, Literal, Optional, cast, TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
@@ -39,9 +39,6 @@ from typing_extensions import TypedDict
 if TYPE_CHECKING:
     from workshops_ai.graph.factory import GraphDeps
 
-from workshops_ai.models.changeset import (
-    ActionCreateAsset, CreateAssetFields, build_changeset
-)
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 from workshops_ai.graph.agent_node import agent_decide, AgentDecision
 
@@ -979,6 +976,30 @@ def _validate_write_actions(actions: list[dict]) -> tuple[list[dict], Optional[s
                 if not payload["fields"]:
                     return [], "set_asset_meta requires at least one field (name/description)"
                 validated.append(payload)
+
+            elif op == "set_asset_cia":  # <-- NEW: CIA writer op
+                asset_id = a.get("asset_id")
+                fields = (a.get("fields") or {})
+                if not asset_id:
+                    return [], "set_asset_cia requires asset_id"
+                allowed = {"confidentiality","integrity","availability"}
+                illegal = set(fields.keys()) - allowed
+                if illegal:
+                    return [], f"set_asset_cia: illegal fields: {sorted(illegal)}"
+                # Numbers are already normalized; accept None to clear.
+                for k, v in fields.items():
+                    if v is None:
+                        continue
+                    if not isinstance(v, int):
+                        return [], f"set_asset_cia: {k} must be int or null"
+                    if k == "confidentiality":
+                        if v < 1 or v > 4:
+                            return [], "confidentiality must be 1..4 (or None)"
+                    else:
+                        if v < 1 or v > 3:
+                            return [], f"{k} must be 1..3 (or None)"
+                validated.append({"op":"set_asset_cia","asset_id": asset_id,"fields": fields})
+
             else:
                 return [], f"unsupported operation '{op}'"
         except Exception as e:
@@ -989,11 +1010,17 @@ def _validate_write_actions(actions: list[dict]) -> tuple[list[dict], Optional[s
 
 async def _apply_actions_async(*, deps: GraphDeps, state: AssetState, acts: list[dict]) -> AssetState:
     """
-    Build & submit a *validated* ChangeSet.
-    - Converts legacy action dicts to the typed Action union (Pydantic v2).
-    - Ensures ChangeSet includes required audit + idempotency_key via build_changeset(...).
-    - Emits WS events only on real 'submitted' (not on 'queued'/OUTBOX fallback).
+    Build & submit a validated ChangeSet; surface user-friendly UX:
+
+    - Validates/normalizes actions (accepts canonical + legacy op names).
+    - Builds a Pydantic ChangeSet (adds audit + idempotency_key).
+    - Submits via deps.submit_changeset(...) with OUTBOX fallback allowed.
+    - If the submit fell back to OUTBOX (queued), flips response.staging.needs_commit = True
+      and produces a meaningful one-line chat message explaining what happened.
+    - Emits WS asset events only on a real online submission (never for queued).
+    - Never raises into the graph: returns a UI-shaped result on all paths.
     """
+    # Localized confirmations later (one-liner)
     loc = (state.locale or "en")
 
     # 1) Nothing to do → short-circuit
@@ -1010,49 +1037,67 @@ async def _apply_actions_async(*, deps: GraphDeps, state: AssetState, acts: list
     # 3) Start telemetry span
     t0 = _event(state, kind="tool.call.start", tool="submit_changeset", meta={"actions": len(acts)})
 
-    # 4) Local helper: normalize legacy 'op' names to canonical ones
+    # 4) Normalize canonical -> writer op names for backward compatibility
+    #    (If callers used "asset.create"/"asset.update_meta"/"asset.set_meta",
+    #     map them to writer ops understood by the backend.)
     def _normalize_legacy_action(a: dict) -> dict:
         op_map = {
-            # canonical(new) → legacy(model)
             "asset.create": "create_asset",
             "asset.update_meta": "set_asset_meta",
-            # případné další aliasy sem
+            "asset.set_meta": "set_asset_cia",
         }
         op = (a.get("op") or "").strip()
         return {**a, "op": op_map.get(op, op)}
 
     try:
         # 5) Import typed Action/ChangeSet builder lazily (keeps import order simple)
-        from workshops_ai.models.changeset import build_changeset  # provides audit + idempotency_key
+        from workshops_ai.models.changeset import build_changeset  # adds audit + idempotency_key
         try:
-            # If the project exposes the union as Action, use it to *validate* each action dict
-            from workshops_ai.models.changeset import Action  # discriminated union by "op"
+            # If the union is available, use it to validate each action dict strictly
+            from workshops_ai.models.changeset import Action  # discriminated union by "op" (Pydantic v2)
             typed_actions = []
             for a in acts:
                 a_norm = _normalize_legacy_action(a or {})
                 try:
                     typed_actions.append(Action.model_validate(a_norm))
                 except Exception:
-                    # As a fallback, try minimal normalization of common legacy shapes and validate again.
-                    typed_actions.append(Action.model_validate(a_norm))
+                    # Be permissive: on validation drift, pass through normalized dict
+                    typed_actions.append(a_norm)
         except Exception:
-            # If Action union is not importable, pass through normalized dicts and let build_changeset validate deeply.
+            # If Action union is not importable, pass normalized dicts; build_changeset will validate deeply.
             typed_actions = [_normalize_legacy_action(a or {}) for a in acts]
 
-        # 6) Build a *valid* ChangeSet model (adds audit & idempotency_key; user_id goes into audit)
+        # 6) Build a ChangeSet model (adds audit & idempotency_key; puts user into audit)
         cs_model = build_changeset(
             org_id=state.org_id,
             user_id=(state.user_id or "unknown"),
             actions=typed_actions,
             intent="apply",
         )
-        # Keep a dump for UI echo (safe to serialize)
+
+        # Safe echo for UI (never stores heavy runtime objects)
         cs_dump = getattr(cs_model, "model_dump", lambda **k: cs_model)(mode="json")
 
-        # 7) Submit (writer supports Pydantic model too); do not require remote success (OUTBOX allowed)
+        # 7) Submit (do NOT require remote success; OUTBOX fallback is allowed here)
         submit_result = await submit_fn(cs_model, require_success=False)
 
-        # 8) Interpret result: submitted vs queued (file outbox) vs failure
+        # 8) UX helper: build one-line chat message and (optionally) adjust staging state
+        #    - On queued/outbox: the helper composes a friendly sentence mentioning the fallback
+        #      and the reason; we also mark response.staging.needs_commit=True.
+        try:
+            from workshops_ai.utils.submit_feedback import apply_submit_outcome_and_message
+            chat_msg = apply_submit_outcome_and_message(
+                state=state,
+                changeset=cs_model,
+                result=submit_result,
+            )
+        except Exception:
+            # If the helper is unavailable, fall back to legacy one-liners
+            submitted_flag = bool(getattr(submit_result, "submitted", False))
+            queued_flag = bool(getattr(submit_result, "fallback_path", None)) and not submitted_flag
+            chat_msg = _llm_confirm(deps=deps, loc=loc, actions=acts, queued=queued_flag)
+
+        # 9) Interpret the result flags
         submitted = bool(getattr(submit_result, "submitted", False))
         queued = bool(getattr(submit_result, "fallback_path", None)) and not submitted
 
@@ -1064,40 +1109,86 @@ async def _apply_actions_async(*, deps: GraphDeps, state: AssetState, acts: list
             hub = getattr(deps, "ws_hub", None)
             if hub:
                 async def _emit_created_and_updated():
+                    """
+                    Best-effort WebSocket notifications for created/updated assets.
+
+                    - Uses centralized emitters (change_events) that wrap WsHub.
+                    - Emits 'asset.created' for create actions; 'asset.updated' for meta/CIA changes.
+                    - Never raises: any exception is swallowed.
+                    """
                     try:
-                        created_ids = _guess_created_ids(submit_result)
-                        idx = 0
-                        for a in acts:
-                            a_op = (_normalize_legacy_action(a).get("op") or "").strip()
-                            # handle both canonical and legacy names
-                            if a_op in ("asset.create", "create_asset"):
-                                f = (a.get("fields") or {})
-                                item = {
-                                    "org_id": state.org_id,
-                                    "asset_id": created_ids[idx] if idx < len(created_ids) else (f.get("id") or f.get("asset_id")),
-                                    "name": f.get("name"),
-                                    "assetType": f.get("assetType"),
-                                    "isPrimary": f.get("isPrimary"),
-                                    "description": f.get("description"),
-                                    "ts": _now_iso(),
-                                    "actor": state.user_id,
-                                }
-                                idx += 1
-                                await hub.aemit_asset_created(item)
-                            elif a_op in ("asset.update_meta", "set_asset_meta", "update_asset_meta"):
-                                f = (a.get("fields") or {})
-                                item = {
-                                    "org_id": state.org_id,
-                                    "asset_id": (a.get("asset_id") or f.get("asset_id")),
-                                    "name": f.get("name"),
-                                    "description": f.get("description"),
-                                    "ts": _now_iso(),
-                                    "actor": state.user_id,
-                                }
-                                await hub.aemit_asset_updated(item)
+                        from workshops_ai.app.services.change_events import (
+                            aemit_asset_created,
+                            aemit_asset_updated,
+                        )
                     except Exception:
-                        # Never let best-effort notifications break the flow
+                        return
+
+                    try:
+                        created_ids = _guess_created_ids(submit_result)  # ordered list of IDs from backend (best-effort)
+                        created_idx = 0
+
+                        for a in acts:
+                            # Accept canonical + writer ops
+                            a_norm = _normalize_legacy_action(a or {})
+                            op = str(a_norm.get("op") or "").strip()
+                            fields = (a_norm.get("fields") or {})
+                            asset_id_from_payload = (
+                                a_norm.get("asset_id") or fields.get("asset_id") or fields.get("id")
+                            )
+
+                            # CREATE
+                            if op in ("asset.create", "create_asset"):
+                                asset_id = (
+                                    created_ids[created_idx]
+                                    if created_idx < len(created_ids) and created_ids[created_idx]
+                                    else asset_id_from_payload
+                                )
+                                created_idx += 1
+                                await aemit_asset_created(
+                                    org_id=state.org_id,
+                                    asset_id=asset_id,
+                                    name=fields.get("name"),
+                                    assetType=fields.get("assetType"),
+                                    isPrimary=fields.get("isPrimary"),
+                                    description=fields.get("description"),
+                                    actor=state.user_id,
+                                    ts=_now_iso(),
+                                )
+                                continue
+
+                            # META (name/description)
+                            if op in ("asset.update_meta", "set_asset_meta", "update_asset_meta"):
+                                updated_fields = [k for k in ("name", "description") if k in fields]
+                                await aemit_asset_updated(
+                                    org_id=state.org_id,
+                                    asset_id=asset_id_from_payload,
+                                    name=fields.get("name"),
+                                    description=fields.get("description"),
+                                    updated_fields=updated_fields,
+                                    actor=state.user_id,
+                                    ts=_now_iso(),
+                                )
+                                continue
+
+                            # CIA (confidentiality / integrity / availability)
+                            if op in ("asset.set_meta", "set_asset_cia"):
+                                updated_fields = [k for k in ("confidentiality", "integrity", "availability") if k in fields]
+                                await aemit_asset_updated(
+                                    org_id=state.org_id,
+                                    asset_id=asset_id_from_payload,
+                                    updated_fields=updated_fields,
+                                    confidentiality=fields.get("confidentiality"),
+                                    integrity=fields.get("integrity"),
+                                    availability=fields.get("availability"),
+                                    actor=state.user_id,
+                                    ts=_now_iso(),
+                                )
+                                continue
+                    except Exception:
+                        # Never let best-effort notifications break the main flow
                         pass
+
                 _schedule(_emit_created_and_updated)
 
             # Clean runtime-only fields after success
@@ -1106,20 +1197,29 @@ async def _apply_actions_async(*, deps: GraphDeps, state: AssetState, acts: list
             state.create_draft = None
             state.once_flags = None
 
-            # UI confirm (submitted)
-            confirm = _llm_confirm(deps=deps, loc=loc, actions=acts, queued=False)
-            result = _ui_response(confirm, extra={"changeset_actions": len(acts), "agent_events": state.agent_events})
+            # Build UI result; also echo changeset/result
+            result = _ui_response(chat_msg, extra={"changeset_actions": len(acts), "agent_events": state.agent_events})
             result["messages"].append({"kind": "changeset", "changeset": cs_dump, "ts": _now_iso()})
             result["messages"].append({"kind": "submit_result", "result": {"submitted": True}, "ts": _now_iso()})
+            # Online submit means no staging commit is needed
+            try:
+                result["staging"]["needs_commit"] = False
+            except Exception:
+                pass
             state.result = result
             return state
 
         if queued:
-            # --- Not submitted online, but safely *queued* to OUTBOX ---
+            # --- Not submitted online, but safely queued to OUTBOX ---
             _finish(state, t0, tool="submit_changeset", ok=True, meta={"queued": True})
 
-            confirm = _llm_confirm(deps=deps, loc=loc, actions=acts, queued=True)
-            res = _ui_response(confirm, extra={"agent_events": state.agent_events})
+            # Clean runtime-only fields even if queued
+            state.create_flow = False
+            state.pending_fields = None
+            state.create_draft = None
+            state.once_flags = None
+
+            res = _ui_response(chat_msg, extra={"agent_events": state.agent_events})
             res["messages"].append({
                 "kind": "changeset.queued",
                 "tab": "assets",
@@ -1127,24 +1227,37 @@ async def _apply_actions_async(*, deps: GraphDeps, state: AssetState, acts: list
                 "org_id": state.org_id,
                 "actor": state.user_id,
             })
-            # Clean runtime-only fields even if queued
-            state.create_flow = False
-            state.pending_fields = None
-            state.create_draft = None
-            state.once_flags = None
+            # Queued → mark that a commit is needed in the UI
+            try:
+                res["staging"]["needs_commit"] = True
+            except Exception:
+                pass
             state.result = res
             return state
 
-        # --- Neither submitted nor queued → treat as failure (e.g., validation blocked writer) ---
+        # --- Neither submitted nor queued → treat as failure/validation block ---
         _finish(state, t0, tool="submit_changeset", ok=False, meta={"error": "unknown submit result"})
-        state.result = _ui_response("Submission failed.", extra={"agent_events": state.agent_events})
+        fail_msg = chat_msg or "Submission failed."
+        res = _ui_response(fail_msg, extra={"agent_events": state.agent_events})
+        try:
+            # Failure: no queued write → no staged commit needed
+            res["staging"]["needs_commit"] = False
+        except Exception:
+            pass
+        state.result = res
         return state
 
     except Exception as e:
         # Defensive failure path with a clean UI message
         _finish(state, t0, tool="submit_changeset", ok=False, meta={"error": str(e)})
-        state.result = _ui_response("Submission failed.", extra={"agent_events": state.agent_events})
+        res = _ui_response("Submission failed.", extra={"agent_events": state.agent_events})
+        try:
+            res["staging"]["needs_commit"] = False
+        except Exception:
+            pass
+        state.result = res
         return state
+
 
 # ---------- CREATE (slot-filling with INLINE submit) ----------
 
@@ -1750,6 +1863,132 @@ async def run_update_meta(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
     from workshops_ai.graph.manager import route_chat
     return await route_chat(ui_req)
 
+# runner pro asset.set_meta (CIA+description)
+async def run_set_meta(*, deps: GraphDeps, ui_req: UIRequest) -> UIResponse:
+    """
+    Handle 'asset.set_meta' as a single-turn, validated write:
+    - Accepts POLICY strings (PUBLIC/INTERNAL/PROTECTED/STRICTLY_PROTECTED, LOW/MEDIUM/HIGH).
+    - Allowed only for primary assets (isPrimary == True); otherwise returns policy error.
+    - Converts policy strings to writer numerics and writes via 'set_asset_cia'.
+    """
+    args: dict = ((ui_req.body or {}).get("args") or {})
+    asset_id: str = str(args.get("assetId") or "").strip()
+    if not asset_id:
+        return UIResponse(
+            messages=[{"error": "validation", "reason": "assetId is required"}],
+            proposals=None,
+            staging={"needs_commit": False, "batch_id": None, "diff": None},
+            policy={"emit_changes_enabled": True},
+        )
+
+    # 1) Fetch asset to verify primary flag
+    try:
+        existing = deps.backend_port.asset_get(asset_id)
+    except Exception as ex:
+        return UIResponse(
+            messages=[{"error": "backend", "reason": f"Failed to fetch asset: {ex}"}],
+            proposals=None,
+            staging={"needs_commit": False, "batch_id": None, "diff": None},
+            policy={"emit_changes_enabled": True},
+        )
+    if not existing:
+        return UIResponse(
+            messages=[{"error": "not_found", "asset_id": asset_id}],
+            proposals=None,
+            staging={"needs_commit": False, "batch_id": None, "diff": None},
+            policy={"emit_changes_enabled": True},
+        )
+
+    def _get(obj, *keys):
+        for k in keys:
+            if isinstance(obj, dict) and k in obj:
+                return obj[k]
+            if hasattr(obj, k):
+                try:
+                    return getattr(obj, k)
+                except Exception:
+                    pass
+        return None
+
+    is_primary = bool(_get(existing, "isPrimary", "primary", "is_primary"))
+
+    # 2) Map policy strings -> writer integers (None clears)
+    CONF_MAP = {"PUBLIC": 1, "INTERNAL": 2, "PROTECTED": 3, "STRICTLY_PROTECTED": 4}
+    TRI_MAP  = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+
+    def _policy_to_int(slot: str, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        s = str(value).strip().upper().replace("-", "_").replace(" ", "_")
+        if slot == "confidentiality":
+            return CONF_MAP.get(s)
+        if slot in ("integrity", "availability"):
+            return TRI_MAP.get(s)
+        return None
+
+    c_raw = args.get("confidentiality", None)  # e.g., "PROTECTED" | None
+    i_raw = args.get("integrity", None)        # e.g., "MEDIUM"    | None
+    a_raw = args.get("availability", None)     # e.g., "HIGH"      | None
+
+    cia_fields: dict[str, Optional[int]] = {}
+    if "confidentiality" in args:
+        cia_fields["confidentiality"] = _policy_to_int("confidentiality", c_raw)
+    if "integrity" in args:
+        cia_fields["integrity"] = _policy_to_int("integrity", i_raw)
+    if "availability" in args:
+        cia_fields["availability"] = _policy_to_int("availability", a_raw)
+
+    # 3) Enforce rule: CIA can be set only for primary assets
+    if cia_fields and not is_primary:
+        return UIResponse(
+            messages=[{"error": "policy", "reason": "CIA cannot be set for a supporting asset (isPrimary=false).", "asset_id": asset_id}],
+            proposals=None,
+            staging={"needs_commit": False, "batch_id": None, "diff": None},
+            policy={"emit_changes_enabled": True},
+        )
+
+    # If caller sent invalid strings (mapping -> None) AND didn't intend to clear, reject
+    for k, v in list(cia_fields.items()):
+        if k in args and args.get(k) is not None and v is None:
+            # e.g., "PROTECTD" typo
+            msg = f"{k} must be one of: " + ( "PUBLIC/INTERNAL/PROTECTED/STRICTLY_PROTECTED" if k=="confidentiality" else "LOW/MEDIUM/HIGH" )
+            return UIResponse(
+                messages=[{"error": "validation", "reason": msg}],
+                proposals=None,
+                staging={"needs_commit": False, "batch_id": None, "diff": None},
+                policy={"emit_changes_enabled": True},
+            )
+
+    if not cia_fields:
+        return UIResponse(
+            messages=["No changes to apply."],
+            proposals=None,
+            staging={"needs_commit": False, "batch_id": None, "diff": None},
+            policy={"emit_changes_enabled": True},
+        )
+
+    # 4) Build single writer action (numeric payload expected by set_asset_cia)
+    actions: list[dict] = [{"op": "set_asset_cia", "asset_id": asset_id, "fields": cia_fields}]
+
+    # 5) Validate & submit through common path
+    dummy_state = AssetState(
+        org_id=ui_req.org_id,
+        active_tab="assets",
+        message="",
+        selection={"asset_id": asset_id},
+        user_id=ui_req.user_id or "unknown",
+        locale=(ui_req.headers or {}).get("accept-language") if hasattr(ui_req, "headers") else "en",
+        agent_events=[],
+    )
+
+    validated, err = _validate_write_actions(actions)
+    if err:
+        dummy_state.result = _ui_response({"error": "validation", "reason": err}, extra={"agent_events": dummy_state.agent_events})
+        return UIResponse.model_validate(dummy_state.result)
+
+    dummy_state = await _apply_actions_async(deps=deps, state=dummy_state, acts=validated)
+    return UIResponse.model_validate(dummy_state.result or _ui_response("No result."))
+
 async def run_explain(*, deps: GraphDeps, text: str, locale: Optional[str] = None) -> dict:
     state = AssetState(
         org_id=getattr(getattr(deps, "settings", object()), "org_id", "demo-org"),
@@ -1762,4 +2001,4 @@ async def run_explain(*, deps: GraphDeps, text: str, locale: Optional[str] = Non
     state = await _explain_assets_async(deps, state)
     return state.result or {"ok": False, "error": "no_result"}
 
-__all__ = ["AssetState", "create_graph", "run_create", "run_update_meta", "run_explain"]
+__all__ = ["AssetState", "create_graph", "run_create", "run_update_meta", "run_set_meta", "run_explain"]
