@@ -30,7 +30,7 @@ from workshops_ai.backend.csv_backend import CsvBackend
 from workshops_ai.tools.telemetry import telemetry_log
 
 # Graph runners (LLM-first behavior for selected ops)
-from workshops_ai.graph.asset_graph import run_explain, run_create, run_update_meta, run_set_meta
+from workshops_ai.graph.assets.asset_graph import run_explain, run_create, run_update_meta, run_set_meta
 from workshops_ai.graph.factory import GraphDeps
 
 # Canonical public DTOs for assets (client contracts)
@@ -524,7 +524,9 @@ async def graph_assets_entrypoint(
                 status_code=500,
                 detail={"message": "Failed to list asset types", "error": str(ex)},
             ) from ex
-        items = [ToolAssetType(code=t, name=t) for t in (types or [])]
+
+        types = [str(t).strip() for t in (types or []) if str(t).strip()]
+        items = [ToolAssetType(code=t, name=t) for t in types]
         return ToolListAssetTypesResponse(items=items, total=len(items))
 
     # --- asset.get (by id or name) -------------------------------------------

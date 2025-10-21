@@ -347,7 +347,7 @@ def build_graph(tab: str, deps: GraphDeps) -> RunnableGraph:
 
     # Lazy imports avoid import-time side effects and circular deps.
     if key == "assets":
-        from workshops_ai.graph.asset_graph import create_graph  # type: ignore
+        from workshops_ai.graph.assets.asset_graph import create_graph  # type: ignore
     elif key == "impacts":
         from workshops_ai.graph.impact_graph import create_graph  # type: ignore
     else:  # "threats"
