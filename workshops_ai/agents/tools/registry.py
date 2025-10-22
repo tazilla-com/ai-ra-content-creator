@@ -6,10 +6,10 @@
 #   routing to graph endpoints.
 #
 # Scope of this version:
-#   - Assets: list/get/explain/create/update_meta/set_meta(CIA-only)
+#   - Assets: list/get/explain/create/update_meta/set_meta
 #     * create: ID assigned by platform; assetType & isPrimary required on create
-#     * update_meta: rename/description only (no type/isPrimary change)
-#     * set_meta: CIA string policy levels only; graph enforces gating
+#     * update_meta: rename/description and CIA policy levels (assetType/isPrimary immutable; CIA only applies to primary)
+#     * set_meta: CIA-only policy updates on existing assets (primary only; null clears)
 #   - Impacts: list, get levels for asset (alias provided), set single/bulk, explain
 #   - Threats: list, get for asset, set probability single/bulk, ensure/remove presence, explain
 #   - Controls: list, explain
@@ -200,12 +200,17 @@ class AssetCreateArgs(BaseModel):
 
 class AssetUpdateMetaArgs(BaseModel):
     """
-    Update asset name/description (immutable: ID/assetType/isPrimary).
+    Update asset name/description and optionally CIA policy levels.
+    Immutable in this operation: assetType, isPrimary.
+    CIA values are only applicable for primary assets (supporting assets ignore CIA server-side).
     """
     model_config = ConfigDict(extra="forbid")
     assetId: StrictStr = Field(..., description="UUID v7 of the existing asset.")
     name: Optional[StrictStr] = Field(None, description="New localized name.")
     description: Optional[StrictStr] = Field(None, description="New localized description.")
+    confidentiality: Optional[ConfidentialityLevel] = Field(None, description="Confidentiality policy level.")
+    integrity: Optional[TriadLevel] = Field(None, description="Integrity policy level.")
+    availability: Optional[TriadLevel] = Field(None, description="Availability policy level.")
 
     @field_validator("assetId")
     @classmethod
@@ -226,17 +231,18 @@ class AssetUpdateMetaArgs(BaseModel):
 
 class AssetSetMetaArgs(BaseModel):
     """
-    Update CIA policy levels for an existing asset.
-    Notes:
-      - CIA are string enums (policy), not numeric.
-      - Graph/backend will enforce that CIA can be set only if the asset is primary.
+    CIA-only policy update for an existing asset.
+    - Applies to primary assets only (enforced server-side).
+    - Omit a field to leave it unchanged; supply null to clear it.
+    - Policy values are canonical strings: confidentiality=[PUBLIC,INTERNAL,PROTECTED,STRICTLY_PROTECTED],
+      integrity/availability=[LOW,MEDIUM,HIGH].
     """
     model_config = ConfigDict(extra="forbid")
 
     assetId: StrictStr = Field(..., description="UUID v7 of the existing asset.")
-    confidentiality: Optional[ConfidentialityLevel] = Field(None, description="Confidentiality policy level.")
-    integrity: Optional[TriadLevel] = Field(None, description="Integrity policy level.")
-    availability: Optional[TriadLevel] = Field(None, description="Availability policy level.")
+    confidentiality: Optional[ConfidentialityLevel] = Field(None, description="Confidentiality policy level or null to clear.")
+    integrity: Optional[TriadLevel] = Field(None, description="Integrity policy level or null to clear.")
+    availability: Optional[TriadLevel] = Field(None, description="Availability policy level or null to clear.")
 
     @field_validator("assetId")
     @classmethod
@@ -524,12 +530,6 @@ class ToolRegistry:
             op="asset.create",
             # Ask for isPrimary first (it gates CIA questions).
             slots={
-                "isPrimary": SlotDef(
-                    required=True,
-                    autofill=False,
-                    label="Primary asset?",
-                    hint="true/false (yes/no)"
-                ),
                 "assetType": SlotDef(
                     required=True,
                     autofill=False,
@@ -543,6 +543,13 @@ class ToolRegistry:
                     label="Asset name",
                     hint="e.g., CRM, Data Warehouse",
                 ),
+                "isPrimary": SlotDef(
+                    required=True,
+                    autofill=False,
+                    label="Primary asset?",
+                    hint="true/false (yes/no)"
+                ),
+
                 # CIA: required when isPrimary=true (runtime/gate).
                 "confidentiality": SlotDef(
                     required=False,
@@ -576,33 +583,39 @@ class ToolRegistry:
         ))
         tools.append(ToolSpec(
             name="asset.update_meta",
-            description="Update asset name/description (no changes to assetType or isPrimary).",
+            description="Update asset name/description and CIA policy levels (assetType/isPrimary immutable; CIA applies only to primary).",
             args_model=AssetUpdateMetaArgs,
             tab="assets",
             endpoint="/graph/assets",
             op="asset.update_meta",
             slots={
-                "assetId":     SlotDef(required=True,  autofill=False, label="Asset ID",       hint="UUID v7"),
-                "name":        SlotDef(required=False, autofill=False, label="New name",       hint="If renaming"),
-                "description": SlotDef(required=False, autofill=True,  label="New description",hint="Short notes"),
+                "assetId":         SlotDef(required=True,  autofill=False, label="Asset ID",         hint="UUID v7"),
+                "name":            SlotDef(required=False, autofill=False, label="New name",         hint="If renaming"),
+                "description":     SlotDef(required=False, autofill=True,  label="New description",  hint="Short notes"),
+                "confidentiality": SlotDef(required=False, autofill=True,  label="Confidentiality",  hint="PUBLIC/INTERNAL/PROTECTED/STRICTLY_PROTECTED",
+                                            enum=list(get_args(ConfidentialityLevel))),
+                "integrity":       SlotDef(required=False, autofill=True,  label="Integrity",        hint="LOW/MEDIUM/HIGH",
+                                            enum=list(get_args(TriadLevel))),
+                "availability":    SlotDef(required=False, autofill=True,  label="Availability",     hint="LOW/MEDIUM/HIGH",
+                                            enum=list(get_args(TriadLevel))),
             },
-            ask_order=["assetId", "name", "description"],
+            ask_order=["assetId", "name", "description", "confidentiality", "integrity", "availability"],
         ))
         tools.append(ToolSpec(
             name="asset.set_meta",
-            description="Update CIA policy levels for an existing asset (only allowed for primary assets).",
+            description="Update CIA policy levels for an asset (primary only). Omitted fields stay unchanged; null clears.",
             args_model=AssetSetMetaArgs,
             tab="assets",
             endpoint="/graph/assets",
             op="asset.set_meta",
             slots={
-                "assetId":         SlotDef(required=True,  autofill=False, label="Asset ID",        hint="UUID v7"),
-                "confidentiality": SlotDef(required=False, autofill=True,  label="Confidentiality", hint="PUBLIC/INTERNAL/PROTECTED/STRICTLY_PROTECTED",
-                                            enum=list(get_args(ConfidentialityLevel))),
-                "integrity":       SlotDef(required=False, autofill=True,  label="Integrity",       hint="LOW/MEDIUM/HIGH",
-                                            enum=list(get_args(TriadLevel))),
-                "availability":    SlotDef(required=False, autofill=True,  label="Availability",    hint="LOW/MEDIUM/HIGH",
-                                            enum=list(get_args(TriadLevel))),
+                "assetId":         SlotDef(required=True,  autofill=False, label="Asset ID",         hint="UUID v7"),
+                "confidentiality": SlotDef(required=False, autofill=True,  label="Confidentiality",  hint="PUBLIC/INTERNAL/PROTECTED/STRICTLY_PROTECTED",
+                                           enum=list(get_args(ConfidentialityLevel))),
+                "integrity":       SlotDef(required=False, autofill=True,  label="Integrity",        hint="LOW/MEDIUM/HIGH",
+                                           enum=list(get_args(TriadLevel))),
+                "availability":    SlotDef(required=False, autofill=True,  label="Availability",     hint="LOW/MEDIUM/HIGH",
+                                           enum=list(get_args(TriadLevel))),
             },
             ask_order=["assetId", "confidentiality", "integrity", "availability"],
         ))
@@ -776,28 +789,6 @@ class ToolRegistry:
                 "threatName": SlotDef(required=True, autofill=False, label="Threat name", hint="Exact catalog name"),
             },
             ask_order=["threatName"],
-        ))
-
-        # ===== Controls =====
-        tools.append(ToolSpec(
-            name="control.list",
-            description="List controls from catalog (full list).",
-            args_model=ControlListArgs,
-            tab="controls",
-            endpoint="/graph/controls",
-            op="control.list",
-        ))
-        tools.append(ToolSpec(
-            name="control.explain",
-            description="Explain a control (by catalog name).",
-            args_model=ControlExplainArgs,
-            tab="controls",
-            endpoint="/graph/controls",
-            op="control.explain",
-            slots={
-                "controlName": SlotDef(required=True, autofill=False, label="Control name", hint="Exact catalog name"),
-            },
-            ask_order=["controlName"],
         ))
 
         return tools

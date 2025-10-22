@@ -143,6 +143,32 @@ async def demo_page() -> str:
       const t = (payload && payload.transport) || 'unknown';
       return 'Changeset submitted (' + n + ') via ' + t + '.';
     }
+    function humanizeAssetDetail(payload) {
+      try {
+        const a = (payload && payload.asset) || (payload && payload.preview) || payload;
+        if (!a || typeof a !== 'object') return null;
+
+        const id = a.id || a.asset_id || 'n/a';
+        const name = a.name || 'n/a';
+        const typ = a.assetType || 'n/a';
+        const primary = (a.isPrimary === true || a.isPrimary === 'true');
+        const primTxt = primary ? 'primary' : 'supporting';
+        const c = (a.confidentiality != null ? a.confidentiality : (primary ? '-' : 'n/a'));
+        const i = (a.integrity != null ? a.integrity : (primary ? '-' : 'n/a'));
+        const av = (a.availability != null ? a.availability : (primary ? '-' : 'n/a'));
+        const desc = a.description || '—';
+
+        let lines = [];
+        lines.push('Asset detail');
+        lines.push('Name: ' + name);
+        lines.push('Type: ' + typ);
+        lines.push('Primary: ' + (primary ? 'Yes' : 'No'));
+        lines.push('CIA: C=' + c + '  I=' + i + '  A=' + av);
+        lines.push('Description: ' + desc);
+        lines.push('ID: ' + id);
+        return lines.join('\\n');
+      } catch { return null; }
+    }
 
     function renderMessageObject(obj, source) {
       source = source || 'http';
@@ -163,6 +189,7 @@ async def demo_page() -> str:
 
       let text = null;
       if (kind === 'asset.list') text = humanizeAssetList(obj);
+      if (kind === 'asset.get' || kind === 'asset.preview') text = humanizeAssetDetail(obj);
       if (kind === 'changeset.queued') text = humanizeChangesetQueued(obj);
       if (kind === 'changeset.submitted') text = humanizeChangesetSubmitted(obj);
 

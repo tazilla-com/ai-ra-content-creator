@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import json
-from typing import Optional, Any, Dict, List
+from typing import Optional, Any, Dict, List, TypedDict
 
 from workshops_ai.graph.factory import GraphDeps
 from .text_utils import lang
 from .enums_json import norm_enum, CONF_LEVELS, TRI_LEVELS
 
+
+# -----------------------------------------------------------------------------
+# Low-level bridges & helpers
+# -----------------------------------------------------------------------------
 
 def _to_lc_messages(messages: List[Dict[str, str]]) -> List[object]:
     """
@@ -155,6 +159,39 @@ def llm_text(
     raise RuntimeError("LLM bridge failed: unsupported client shape or empty content.")
 
 
+def _strip_code_fences(raw: str) -> str:
+    """
+    Extract JSON from a code-fenced block if present.
+    """
+    s = (raw or "").strip()
+    if s.startswith("```"):
+        i, j = s.find("{"), s.rfind("}")
+        if i != -1 and j != -1 and j > i:
+            return s[i : j + 1]
+    return s
+
+
+def _minijson(raw: str) -> Dict[str, Any]:
+    """
+    Pull out the first {...} block and parse as JSON; return {} on failure.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return {}
+    i, j = s.find("{"), s.rfind("}")
+    if 0 <= i < j:
+        s = s[i:j+1]
+    try:
+        data = json.loads(s)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+# -----------------------------------------------------------------------------
+# Create flow helpers
+# -----------------------------------------------------------------------------
+
 def build_next_question(*, deps: GraphDeps, draft: Dict[str, Any], asset_types: List[str], locale: str) -> str:
     """
     Ask ONE concise follow-up question for the next missing field in the create flow.
@@ -203,18 +240,6 @@ def build_next_question(*, deps: GraphDeps, draft: Dict[str, Any], asset_types: 
     return (q or "").strip()
 
 
-def _strip_code_fences(raw: str) -> str:
-    """
-    Extract JSON from a code-fenced block if present.
-    """
-    s = (raw or "").strip()
-    if s.startswith("```"):
-        i, j = s.find("{"), s.rfind("}")
-        if i != -1 and j != -1 and j > i:
-            return s[i : j + 1]
-    return s
-
-
 def extract_create_draft_with_llm(*, deps: GraphDeps, text: str, asset_types: List[str]) -> Dict[str, Any]:
     """
     Convert a short free-text user request into a strict JSON draft for asset creation.
@@ -255,3 +280,145 @@ def extract_create_draft_with_llm(*, deps: GraphDeps, text: str, asset_types: Li
     obj["availability"] = norm_enum(obj.get("availability"), allowed=TRI_LEVELS)
 
     return obj
+
+
+# -----------------------------------------------------------------------------
+# UPDATE flow (LLM-first extractor; no brittle regexy)
+# -----------------------------------------------------------------------------
+
+class UpdateAssetIntent(TypedDict, total=False):
+    intent: str                # 'update_asset' | 'get_asset' | 'create_asset' | 'none'
+    target_id: Optional[str]
+    target_name: Optional[str]
+    # Whitelisted změny; ostatní ignorujeme
+    changes: Dict[str, Any]    # { name?, description?, isPrimary?, confidentiality?, integrity?, availability?, assetType? }
+
+
+def _to_bool_relaxed(v: Any) -> Optional[bool]:
+    if isinstance(v, bool):
+        return v
+    s = str(v or "").strip().lower()
+    pos = {"1", "true", "yes", "y", "ok", "okay", "sure", "primary", "ano", "áno", "j"}
+    neg = {"0", "false", "no", "n", "ne", "nie"}
+    if s in pos:
+        return True
+    if s in neg:
+        return False
+    return None
+
+
+def extract_update_asset_intent(*, deps: GraphDeps, text: str, locale: Optional[str] = None) -> UpdateAssetIntent:
+    """
+    Robust NLU for UPDATE without hard-coded verb lists (CZ/SK/EN).
+    Returns a strict JSON: intent + target (id/name) + sanitized changes.
+    """
+    if not text or not text.strip():
+        return {"intent": "none", "changes": {}}
+
+    l = lang(locale)
+    sys = (
+        "You are an intent and slot extractor for an asset-management assistant. "
+        "Read a single user message (Czech/Slovak/English). "
+        "Detect if the user wants to UPDATE an existing asset. "
+        "If yes, extract the target (asset_id or asset name) and the proposed changes. "
+        "Allowed change keys: name, description, isPrimary, confidentiality, integrity, availability, assetType. "
+        "Map booleans and CIA values to canonical enums. "
+        "Return ONLY a minified JSON object; no prose."
+    )
+    usr = {
+        "message": text,
+        "locale": l,
+        "allowed_changes": ["name", "description", "isPrimary", "confidentiality", "integrity", "availability", "assetType"],
+        "cia_enums": {
+            "confidentiality": list(CONF_LEVELS),
+            "integrity": list(TRI_LEVELS),
+            "availability": list(TRI_LEVELS),
+        },
+        "output_schema": {
+            "intent": "update_asset | get_asset | create_asset | none",
+            "target_id": "string | null",
+            "target_name": "string | null",
+            "changes": {
+                "name": "string?",
+                "description": "string?",
+                "isPrimary": "boolean?",
+                "confidentiality": "PUBLIC|INTERNAL|PROTECTED|STRICTLY_PROTECTED?",
+                "integrity": "LOW|MEDIUM|HIGH?",
+                "availability": "LOW|MEDIUM|HIGH?",
+                "assetType": "string?"
+            }
+        },
+        "examples": [
+            "Přejmenuj Virtualization platform na Virtualizační platforma.",
+            "Uprav popis aktiva A na '…'.",
+            "Set isPrimary true for asset 0199c6ed-10e0-72d4-b8c7-8960bbfdd03f.",
+            "Změň dostupnost na HIGH u 'DB server'."
+        ]
+    }
+
+    raw = llm_text(
+        deps=deps,
+        messages=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": json.dumps(usr, ensure_ascii=False)},
+        ],
+        temperature=getattr(deps, "llm_temperature", None) or 0.0,
+    )
+
+    data = _minijson(_strip_code_fences(raw))
+
+    # Default skeleton
+    out: UpdateAssetIntent = {"intent": "none", "changes": {}}
+
+    if not isinstance(data, dict):
+        return out
+
+    # Intent
+    intent = str(data.get("intent") or "none").strip()
+    if intent not in {"update_asset", "get_asset", "create_asset", "none"}:
+        intent = "none"
+    out["intent"] = intent
+
+    # Target
+    tid = data.get("target_id")
+    tname = data.get("target_name")
+    out["target_id"] = str(tid).strip() if isinstance(tid, str) and tid.strip() else None
+    out["target_name"] = str(tname).strip() if isinstance(tname, str) and tname.strip() else None
+
+    # Changes — whitelist + sanitizace
+    allowed = {"name", "description", "isPrimary", "confidentiality", "integrity", "availability", "assetType"}
+    changes_in = data.get("changes") or {}
+    changes = changes_in if isinstance(changes_in, dict) else {}
+    changes = {k: v for k, v in changes.items() if k in allowed and v is not None}
+
+    # CIA canonicalization
+    if "confidentiality" in changes:
+        changes["confidentiality"] = norm_enum(changes.get("confidentiality"), allowed=CONF_LEVELS)
+        if changes["confidentiality"] is None:
+            changes.pop("confidentiality", None)
+
+    for tri_k in ("integrity", "availability"):
+        if tri_k in changes:
+            changes[tri_k] = norm_enum(changes.get(tri_k), allowed=TRI_LEVELS)
+            if changes[tri_k] is None:
+                changes.pop(tri_k, None)
+
+    # isPrimary relaxed boolean mapping
+    if "isPrimary" in changes:
+        ip = _to_bool_relaxed(changes["isPrimary"])
+        if ip is None:
+            changes.pop("isPrimary", None)
+        else:
+            changes["isPrimary"] = ip
+
+    # Normalize trivial strings
+    for k in ("name", "description", "assetType"):
+        if k in changes and isinstance(changes[k], str):
+            v = changes[k].strip()
+            if not v:
+                changes.pop(k, None)
+            else:
+                changes[k] = v
+
+    out["changes"] = changes
+    return out

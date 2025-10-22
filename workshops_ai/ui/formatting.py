@@ -1,4 +1,4 @@
-# workshops_ai/ui/formatting.py
+# File: workshops_ai/ui/formatting.py
 # -*- coding: utf-8 -*-
 """
 Tiny, dependency-free helpers to render human-friendly Markdown for chat bubbles.
@@ -15,6 +15,7 @@ Design goals:
 - Predictable output (no surprises for renderers)
 - Gentle handling of edge cases (empty inputs, long lines, mixed item types)
 - Backwards compatibility for callers (e.g., chunk(..., max_chars=...))
+- Never crash: all helpers are defensive and avoid raising in normal use
 """
 
 from __future__ import annotations
@@ -29,34 +30,82 @@ __all__ = [
     "format_asset_types",
 ]
 
+# Default chunk size used when callers omit both max_len and max_chars
+_DEFAULT_CHUNK = 1800
+
+
+# -----------------------------------------------------------------------------
+# Normalization helpers (internal)
+# -----------------------------------------------------------------------------
+def _as_label(x: Any) -> str:
+    """
+    Best-effort stringify for common shapes (dicts, pydantic-like models, plain strings).
+    Never raises; returns '' on failure.
+    """
+    try:
+        if x is None:
+            return ""
+        if isinstance(x, str):
+            return x
+        if isinstance(x, dict):
+            for k in ("name", "label", "title", "id", "type"):
+                v = x.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v
+                if v is not None:
+                    return str(v)
+            return str(x)
+        # Try common attribute names on objects
+        for attr in ("name", "label", "title", "id", "type"):
+            if hasattr(x, attr):
+                v = getattr(x, attr)
+                if isinstance(v, str) and v.strip():
+                    return v
+                if v is not None:
+                    return str(v)
+        return str(x)
+    except Exception:
+        return ""
+
+
+def _to_labels_any(items: Iterable[Any]) -> List[str]:
+    """
+    Normalize an iterable of arbitrary items to a de-duplicated list of non-empty strings.
+    Preserves input order.
+    """
+    out: List[str] = []
+    if not items:
+        return out
+    seen = set()
+    for it in items:
+        lbl = (_as_label(it) or "").strip()
+        if not lbl or lbl in seen:
+            continue
+        seen.add(lbl)
+        out.append(lbl)
+    return out
+
 
 # -----------------------------------------------------------------------------
 # Markdown helpers
 # -----------------------------------------------------------------------------
-
 def bullet_list(
-    items: Iterable[str],
+    items: Iterable[Any],
     bullet: str = "-",
     indent: int = 0,
 ) -> str:
     """
     Render a simple Markdown bullet list.
 
-    - Each item becomes a single bullet line.
+    - Accepts any item types; everything is normalized to strings.
     - Empty/whitespace-only items are ignored.
     - Multiline items are indented on subsequent lines for readability.
+    - Never raises.
     """
     prefix = " " * max(indent, 0) + f"{bullet} "
     lines: List[str] = []
 
-    for raw in items:
-        if raw is None:
-            continue
-        text = str(raw).strip()
-        if not text:
-            continue
-
-        # Indent subsequent lines so the bullet stands out.
+    for text in _to_labels_any(items):
         split = text.splitlines() or [text]
         first = split[0]
         lines.append(prefix + first)
@@ -71,7 +120,7 @@ def bullet_list(
 
 
 def kv_table(
-    rows: Sequence[Tuple[str, str | None]],
+    rows: Sequence[Tuple[Any, Any]],
     header_left: str = "Field",
     header_right: str = "Value",
 ) -> str:
@@ -81,6 +130,7 @@ def kv_table(
     - Pipes '|' inside cells are escaped.
     - None values are rendered as an en dash '–'.
     - Minimal header row is added for correct rendering.
+    - Never raises.
     """
     def esc(cell: str) -> str:
         return cell.replace("|", r"\|")
@@ -89,7 +139,7 @@ def kv_table(
     out.append(f"| {esc(header_left)} | {esc(header_right)} |")
     out.append("| --- | --- |")
 
-    for label, value in rows:
+    for label, value in (rows or []):
         l = esc(str(label) if label is not None else "")
         v = "–" if value is None else esc(str(value))
         out.append(f"| {l} | {v} |")
@@ -103,6 +153,8 @@ def code_block(text: str, lang: str | None = None) -> str:
 
     - If `lang` is provided (e.g., 'json'), it's appended to the opening fence.
     - Triple backticks inside the payload are protected with a ZWJ.
+    - Always ends with a newline for proper rendering.
+    - Never raises.
     """
     safe = (text or "").replace("```", "`\u200d``")  # protect against fence collision
     fence = "```" + (lang or "")
@@ -112,9 +164,8 @@ def code_block(text: str, lang: str | None = None) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Chunking helper
+# Chunking helper (backwards compatible and defensive)
 # -----------------------------------------------------------------------------
-
 def chunk(
     text: str,
     max_len: int | None = None,   # legacy name
@@ -126,24 +177,29 @@ def chunk(
     boundaries (paragraphs, lines, sentences, words), and keeping fenced code
     blocks intact whenever reasonable.
 
-    Args:
-        text: Input string.
-        max_len: Historical parameter name for the limit.
-        max_chars: Alias used by some callers; if provided, it overrides max_len.
+    Back-compat: accepts either `max_len` or `max_chars`. If neither is provided,
+    a sensible default of 1800 is used. Negative/zero limits are coerced to 1.
+
+    Never raises in normal use.
     """
     # --- Compat: accept both parameter names
     limit = max_chars if (max_chars is not None) else max_len
-    if limit is None:
-        raise ValueError("Provide max_len or max_chars")
-    if limit <= 0:
-        raise ValueError("max_len/max_chars must be >= 1")
+    try:
+        if limit is None:
+            limit = _DEFAULT_CHUNK
+        limit = int(limit)
+        if limit <= 0:
+            limit = 1
+    except Exception:
+        limit = _DEFAULT_CHUNK
 
-    # Use a single variable name below to avoid mistakes
-    max_len = int(limit)
+    s = (text or "")
+    if not s:
+        return [""]
 
-    s = (text or "").strip()
-    if len(s) <= max_len:
-        return [s] if s else []
+    # Fast path
+    if len(s) <= limit:
+        return [s]
 
     # --- Step 0: split into alternating segments (normal text vs fenced code)
     segments: List[tuple[str, bool]] = []  # (segment_text, is_code)
@@ -159,9 +215,10 @@ def chunk(
             buf.clear()
 
     for line in lines:
-        if line.strip().startswith(fence):
+        stripped = line.strip()
+        if stripped.startswith(fence):
             if in_code:
-                # Closing fence: include it, then close the block.
+                # Closing fence: include it.
                 buf.append(line)
                 flush_buffer(is_code=True)
                 in_code = False
@@ -176,7 +233,7 @@ def chunk(
 
     chunks: List[str] = []
 
-    # Pack a list of units (strings) into <= max_len chunks.
+    # Pack a list of units (strings) into <= limit chunks.
     def pack_units(units: List[str]) -> None:
         cur: List[str] = []
         cur_len = 0
@@ -184,85 +241,82 @@ def chunk(
         def flush_cur() -> None:
             nonlocal cur, cur_len
             if cur:
-                chunks.append("".join(cur).strip())
+                chunks.append("".join(cur))
                 cur = []
                 cur_len = 0
 
         for u in units:
             u_len = len(u)
             if not cur:
-                if u_len <= max_len:
+                if u_len <= limit:
                     cur.append(u)
                     cur_len = u_len
                 else:
-                    subdivided = _subdivide(u, max_len)
-                    if len(subdivided) == 1 and len(subdivided[0]) > max_len:
-                        # Undividable (e.g., huge single word/line)
-                        chunks.append(subdivided[0].strip())
-                    else:
-                        for part in subdivided:
-                            if len(part) <= max_len:
-                                if cur and cur_len + len(part) > max_len:
-                                    flush_cur()
-                                cur.append(part)
-                                cur_len += len(part)
-                            else:
+                    for part in _subdivide(u, limit):
+                        if len(part) <= limit:
+                            if cur and cur_len + len(part) > limit:
                                 flush_cur()
-                                chunks.append(part.strip())
+                            cur.append(part)
+                            cur_len += len(part)
+                        else:
+                            flush_cur()
+                            chunks.append(part)
             else:
-                if cur_len + u_len <= max_len:
+                if cur_len + u_len <= limit:
                     cur.append(u)
                     cur_len += u_len
                 else:
                     flush_cur()
-                    if u_len <= max_len:
+                    if u_len <= limit:
                         cur.append(u)
                         cur_len = u_len
                     else:
-                        subdivided = _subdivide(u, max_len)
-                        for part in subdivided:
-                            if len(part) <= max_len:
-                                if cur and cur_len + len(part) > max_len:
+                        for part in _subdivide(u, limit):
+                            if len(part) <= limit:
+                                if cur and cur_len + len(part) > limit:
                                     flush_cur()
                                 cur.append(part)
                                 cur_len += len(part)
                             else:
                                 flush_cur()
-                                chunks.append(part.strip())
+                                chunks.append(part)
         flush_cur()
 
     # Subdivide non-code unit by natural boundaries.
-    def _subdivide(unit: str, limit: int) -> List[str]:
-        if len(unit) <= limit:
+    def _subdivide(unit: str, lim: int) -> List[str]:
+        if len(unit) <= lim:
             return [unit]
 
         # 1) Paragraphs
-        parts = _greedy_pack(unit, sep="\n\n", limit=limit)
-        if all(len(p) <= limit for p in parts):
+        parts = _greedy_pack(unit, sep="\n\n", limit=lim)
+        if all(len(p) <= lim for p in parts):
             return parts
 
         # 2) Lines
-        parts = _greedy_pack(unit, sep="\n", limit=limit)
-        if all(len(p) <= limit for p in parts):
+        parts = _greedy_pack(unit, sep="\n", limit=lim)
+        if all(len(p) <= lim for p in parts):
             return parts
 
         # 3) Sentences (naive)
-        import re
-        sent_parts = re.split(r"(?<=[.!?])\s+", unit)
-        if len(sent_parts) > 1:
-            parts = _greedy_pack_from_list(sent_parts, joiner=" ", limit=limit)
-            if all(len(p) <= limit for p in parts):
-                return parts
+        try:
+            import re
+            sent_parts = re.split(r"(?<=[.!?])\s+", unit)
+            if len(sent_parts) > 1:
+                parts = _greedy_pack_from_list(sent_parts, joiner=" ", limit=lim)
+                if all(len(p) <= lim for p in parts):
+                    return parts
+        except Exception:
+            pass
 
         # 4) Words
         words = unit.split(" ")
         if len(words) > 1:
-            parts = _greedy_pack_from_list(words, joiner=" ", limit=limit)
-            if all(len(p) <= limit for p in parts):
+            parts = _greedy_pack_from_list(words, joiner=" ", limit=lim)
+            if all(len(p) <= lim for p in parts):
                 return parts
 
-        # 5) Hard split
-        return [unit[i: i + limit] for i in range(0, len(unit), limit)]
+        # 5) Hard split as last resort
+        return [unit[i : i + lim] for i in range(0, len(unit), lim)]
 
     def _greedy_pack(text_block: str, sep: str, limit: int) -> List[str]:
         items = text_block.split(sep)
@@ -303,33 +357,22 @@ def chunk(
         if is_code:
             pack_units([seg_text])
         else:
-            units = _subdivide(seg_text, max_len)
+            units = _subdivide(seg_text, limit)
             pack_units(units)
 
-    return [c for c in (ch.strip() for ch in chunks) if c]
+    # Ensure no empty chunks leak out
+    return [c for c in chunks if c]
 
 
 # -----------------------------------------------------------------------------
 # Asset-type helpers
 # -----------------------------------------------------------------------------
-
-def _to_name(x: Any) -> str:
-    """Extract a display name from dicts, models or plain strings."""
-    if isinstance(x, dict):
-        return (x.get("name") or x.get("title") or str(x)).strip()
-    name = getattr(x, "name", None)
-    if isinstance(name, str) and name.strip():
-        return name.strip()
-    return str(x).strip()
-
-
 def format_asset_types(types: Iterable[Any]) -> str:
     """
     Render a safe, human-friendly bullet list of asset types.
-    Accepts dicts, pydantic models or strings.
+    Accepts dicts, pydantic models or strings. Never raises.
     """
-    items = [_to_name(t) for t in (types or []) if t is not None]
-    items = [i for i in items if i]  # drop empties
-    if not items:
+    labels = _to_labels_any(types)
+    if not labels:
         return "_No types found_"
-    return bullet_list(items)
+    return bullet_list(labels)

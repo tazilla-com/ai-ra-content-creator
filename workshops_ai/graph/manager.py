@@ -229,37 +229,38 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
         if hasattr(req, "selection") and getattr(req, "selection") is not None and hasattr(req.selection, "model_dump")
         else dict(getattr(req, "selection", {}) or {})
     )
+
     inputs: dict[str, Any] = {
         "org_id": req.org_id,
         "active_tab": tab,
         "message": req.message,
-        "selection": selection_dump,
         "user_id": req.user_id,
         "staging": bool(req.staging),
-        "language": language,                 # ← locked "cs|sk|en"
-        "locale": (req.locale or language),   # ← pinned IETF locale when possible
+        "language": language,                 # "cs|sk|en"
+        "locale": (req.locale or language),   # pinned locale
         "session_id": getattr(req, "session_id", None),
-        # Conversational context & policy (consumed by base system prompt)
         "history": history_msgs[: eff.max_history_messages],
         "policy": as_prompt_vars(eff),
-        # Thread-scoped session state provided to agents
         "current_asset": session_state.get("current_asset"),
         "recent_assets": session_state.get("recent_assets", []),
-        "once_flags": per_turn_flags,   # ← IMPORTANT: per-turn flags (not persisted)
-        # Optional additional context
+        "once_flags": per_turn_flags,
         "history_token": getattr(req, "history_token", None),
         "organization_profile": getattr(req, "organization_profile", None),
         "services": getattr(req, "services", None),
         "existing_assets": getattr(req, "existing_assets", None),
         "user_instructions": getattr(req, "user_instructions", None),
-        # Manager context with SSOT tool registry data for the agent/graphs
         "manager_ctx": {
             "tools_json": tools_json,
             "allowed_functions": allowed_functions,
         },
-        # (Optionally, also pass tools_json at top-level if your prompts expect it directly)
         "tools_json": tools_json,
     }
+
+    # Only add "selection" if it contains a concrete asset_id (prevents accidental wipe downstream)
+    if isinstance(selection_dump, dict):
+        _aid = str(selection_dump.get("asset_id") or "").strip()
+        if _aid:
+            inputs["selection"] = selection_dump
 
     # 8) Per-tab timeout & LangGraph config (via factory.build_graph_config)
     timeout = _timeout_for_tab(tab)
@@ -917,6 +918,7 @@ def _maybe_update_current_asset_from_result(state: dict, raw_result: Any) -> dic
     should be updated (and MRU refreshed). Handles:
       - Successful create tool call (assets_create/create_asset/asset_create/asset.create)
       - Explicit selection event (event_type == "asset.selected")
+      - NEW: asset detail payload in messages → {"kind": "asset.get", "asset": {...}}
     """
     try:
         events: list[Any] = []
@@ -931,25 +933,20 @@ def _maybe_update_current_asset_from_result(state: dict, raw_result: Any) -> dic
                 if isinstance(result, Mapping) and isinstance(result.get("agent_events"), list):
                     events = result["agent_events"]  # type: ignore[index]
 
+        # --- existing handlers (create + explicit selection) ---
         for ev in events:
-            # Tool events may be wrapped as {"event": "agent.tool_event", "data": {...}}
             data = ev
             if isinstance(ev, Mapping) and ev.get("event") == "agent.tool_event" and isinstance(ev.get("data"), Mapping):
                 data = ev["data"]
-
             if not isinstance(data, Mapping):
                 continue
 
             etype = str(data.get("event_type") or "")
             tool_raw = str(data.get("tool") or "")
+            tool_norm = tool_raw.replace(".", "_").strip().lower()
 
             # Successful "create asset"
-            tool_norm = tool_raw.replace(".", "_").strip().lower()
-            if etype == "tool.call.success" and tool_norm in {
-                "assets_create",
-                "create_asset",
-                "asset_create",
-            }:
+            if etype == "tool.call.success" and tool_norm in {"assets_create", "create_asset", "asset_create"}:
                 res = data.get("result") if isinstance(data.get("result"), Mapping) else data.get("meta")
                 if isinstance(res, Mapping):
                     asset_id = res.get("asset_id") or res.get("id")
@@ -972,8 +969,36 @@ def _maybe_update_current_asset_from_result(state: dict, raw_result: Any) -> dic
                         name=(str(name) if name is not None else None),
                     )
 
+        # derive selection from messages that carry an "asset.get" payload ---
+        def _iter_messages(container: Any) -> list[Any]:
+            if not isinstance(container, Mapping):
+                return []
+            msgs = container.get("messages")
+            if isinstance(msgs, list) and msgs:
+                return msgs
+            res = container.get("result")
+            if isinstance(res, Mapping):
+                msgs2 = res.get("messages")
+                if isinstance(msgs2, list):
+                    return msgs2
+            return []
+
+        for msg in _iter_messages(raw_result):
+            # We expect a dict payload like: {"kind": "asset.get", "asset": {"id": "...", "name": "...", ...}}
+            if not isinstance(msg, Mapping):
+                continue
+            kind = str(msg.get("kind") or msg.get("type") or "")
+            if kind != "asset.get":
+                continue
+            asset = msg.get("asset")
+            if isinstance(asset, Mapping) and asset.get("id"):
+                return _session_set_current_asset(
+                    state,
+                    asset_id=str(asset.get("id")),
+                    name=(str(asset.get("name")) if asset.get("name") is not None else None),
+                )
+
     except Exception:
-        # Best-effort
         pass
 
     return state

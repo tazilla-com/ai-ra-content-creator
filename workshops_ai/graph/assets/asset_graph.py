@@ -1,5 +1,4 @@
-# workshops_ai/graph/assets/asset_graph.py
-
+# File: workshops_ai/graph/assets/asset_graph.py
 from __future__ import annotations
 
 """
@@ -13,18 +12,19 @@ entrypoints (used by the app/manager) live in `.../assets/tools/runners.py`.
 Directory layout this file expects:
 
 assets/
-  asset_graph.py            <-- this file (thin wiring only)
-  modules/                  <-- internal implementation (nodes, nlu, utils)
+  asset_graph.py            
+  modules/                  
     state.py
     nlu.py
     nodes_read.py
-    nodes_create_update.py
+    nodes_create.py
+    nodes_update.py
     explain.py
     reply.py
     write_utils.py
     ... (helpers)
   tools/
-    runners.py              <-- public run_* helpers re-exported below
+    runners.py              
 """
 
 from typing import Callable
@@ -52,11 +52,9 @@ from .modules.nodes_read import (
     list_asset_types as _list_asset_types,
 )
 
-# Create / Update nodes
-from .modules.nodes_create_update import (
-    create_asset as _create_asset,
-    update_meta as _update_meta,
-)
+# Create / Update nodes (separated)
+from .modules.nodes_create import create_asset as _create_asset
+from .modules.nodes_update import update_meta as _update_meta, set_meta as _set_meta
 
 # Explain (LLM/RAG) and small-talk reply
 from .modules.explain import explain_assets_async as _explain_assets_async
@@ -108,6 +106,7 @@ def create_graph(deps: GraphDeps):
     graph.add_node("asset.get", _asset_get_or_preview(deps))
     graph.add_node("asset.create", _create_asset(deps))
     graph.add_node("asset.update_meta", _update_meta(deps))
+    graph.add_node("asset.set_meta", _set_meta(deps))  # alias; routed z intentu 'set_meta'
     graph.add_node("submit_changeset", _submit_node)
     graph.add_node("llm.explain", _explain_node)
 
@@ -120,7 +119,7 @@ def create_graph(deps: GraphDeps):
         Map planner intent → node name.
         Defaults to a friendly `agent.reply`.
         """
-        intent = state.intent or "agent_reply"
+        intent = (state.intent or "agent_reply").strip()
         if intent == "list":
             return "asset.list"
         if intent == "list_types":
@@ -131,6 +130,8 @@ def create_graph(deps: GraphDeps):
             return "asset.create"
         if intent == "update_meta":
             return "asset.update_meta"
+        if intent == "set_meta":
+            return "asset.set_meta"
         if intent == "explain":
             return "llm.explain"
         return "agent.reply"
@@ -145,6 +146,7 @@ def create_graph(deps: GraphDeps):
             "asset.get": "asset.get",
             "asset.create": "asset.create",
             "asset.update_meta": "asset.update_meta",
+            "asset.set_meta": "asset.set_meta",
             "llm.explain": "llm.explain",
         },
     )
@@ -153,6 +155,7 @@ def create_graph(deps: GraphDeps):
     # The old "submit_changeset" edge remains harmlessly for compatibility.
     graph.add_conditional_edges("asset.create", lambda s: "END", {"END": END, "submit_changeset": "submit_changeset"})
     graph.add_edge("asset.update_meta", END)
+    graph.add_edge("asset.set_meta", END)
 
     # All read-only / helper nodes end the turn.
     for node in ("agent.reply", "asset.list", "asset.list_types", "asset.get", "llm.explain", "submit_changeset"):
