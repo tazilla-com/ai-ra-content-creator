@@ -3,10 +3,17 @@
 # Purpose
 # WebSocket endpoint with strict event validation, centralized settings-based auth,
 # timeout handling, and integration with WsHub for broadcasting AgentEvents.
-# Adds:
-#   - Accept-Language support (query param > header) → mapped to UIRequest.language
-#   - DI parity with chat_router (make_default_deps → route_chat(..., deps=...))
-#   - Allowed tabs include "controls"
+#
+# Adds per-connection context & language stability:
+#   - Deterministic Accept-Language resolution (query param > header > default).
+#   - Normalization to ISO primary tag (e.g., "cs-CZ, cs" -> "cs") for downstream use.
+#   - Per-connection "language lock": the chosen language is stored in Conn and
+#     included on every UIRequest.language so agents keep replying in that language.
+#   - Per-connection context includes: staging (from WS_DEFAULT_STAGING), active_tab,
+#     conn_id; these are injected into every routed UIRequest even if not sent by client.
+#
+# NOTE:
+# - All other behavior (rate-limit, staging default, deps wiring) remains unchanged.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
@@ -65,19 +73,24 @@ WS_EVENT_TIMEOUT_S: int = int(_settings.ws.timeout_sec)
 COOKIE_NAME = "wsai.sid"
 
 # -----------------------------------------------------------------------------
-
-
+# Env helpers
+# -----------------------------------------------------------------------------
 def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
     return v.strip().lower() in {"1", "true", "yes", "on"}
 
-# Default staging behavior (can be overridden via WS_DEFAULT_STAGING=0/false)
+# Default staging behavior (override via WS_DEFAULT_STAGING=0/false)
 DEFAULT_STAGING: bool = _env_bool("WS_DEFAULT_STAGING", True)
 
+# Default language tag if nothing is provided by client (explicit & simple)
+DEFAULT_ACCEPT_LANGUAGE_TAG: str = os.getenv("WS_DEFAULT_LANGUAGE", "cs-CZ")
 
-# ------------------------------ Inbound schema --------------------------------
+
+# -----------------------------------------------------------------------------
+# Inbound schema
+# -----------------------------------------------------------------------------
 class InboundEvent(BaseModel):
     type: Literal["select", "chat", "export", "ping", "switch_tab"]
     message: str | None = None
@@ -87,7 +100,9 @@ class InboundEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-# ------------------------------ Connection state ------------------------------
+# -----------------------------------------------------------------------------
+# Connection state (per WebSocket)
+# -----------------------------------------------------------------------------
 @dataclass
 class Conn:
     org_id: str
@@ -99,26 +114,98 @@ class Conn:
     sid: Optional[str] = None
     request_id: str = "n/a"
     staging: bool = True
-    accept_language: Optional[str] = None  # language hint we expose to UI; mapped to UIRequest.language
+    # Language handling:
+    # - accept_language: the canonical tag (as chosen from query/header/default), e.g., "cs-CZ"
+    # - lang_iso: the normalized ISO primary tag used for agents, e.g., "cs"
+    accept_language: Optional[str] = None
+    lang_iso: Optional[str] = None
 
 
-# --------------------------------- Helpers ------------------------------------
-def _pick_accept_language(ws: WebSocket, query_value: Optional[str]) -> Optional[str]:
+# -----------------------------------------------------------------------------
+# Language helpers (deterministic selection + normalization)
+# -----------------------------------------------------------------------------
+def _parse_accept_language(raw: Optional[str]) -> list[tuple[str, float]]:
     """
-    Determine Accept-Language hint with precedence:
-      1) query ?accept_language=...
-      2) HTTP header "Accept-Language" on upgrade
+    Parse an Accept-Language-like string into [(tag, q)], sorted by descending q.
+
+    Examples:
+        "cs-CZ,cs;q=0.9,en;q=0.7" -> [("cs-CZ", 1.0), ("cs", 0.9), ("en", 0.7)]
+        None or "" -> []
     """
-    if query_value and isinstance(query_value, str) and query_value.strip():
-        return query_value.strip()[:256]
-    h = ws.headers.get("accept-language")
-    if isinstance(h, str) and h.strip():
-        return h.strip()[:256]
-    return None
+    if not raw:
+        return []
+    items: list[tuple[str, float]] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        # Match: <tag>[;q=<float>]
+        m = re.match(r"^([^;,\s]+)(?:\s*;\s*q=([0-9.]+))?$", part)
+        if not m:
+            continue
+        tag = m.group(1).strip()
+        try:
+            q = float(m.group(2)) if m.group(2) else 1.0
+        except ValueError:
+            q = 1.0
+        items.append((tag, q))
+    # Highest q first, stable sort
+    items.sort(key=lambda x: x[1], reverse=True)
+    return items
 
 
+def _to_iso_primary(tag_or_list: Optional[str]) -> str:
+    """
+    Normalize a tag or a comma-separated list to its primary ISO language code.
+
+    Examples:
+        "cs-CZ, cs" -> "cs"
+        "en-US"     -> "en"
+        "sk"        -> "sk"
+        None        -> "cs" (default)
+    """
+    if not tag_or_list:
+        return "cs"
+    head = tag_or_list.split(",")[0].split(";")[0].strip()
+    primary = head.split("-")[0].strip().lower()
+    return primary or "cs"
+
+
+def _choose_lang(query_value: Optional[str], header_value: Optional[str], default_tag: str) -> tuple[str, str]:
+    """
+    Decide the canonical tag and normalized ISO for this connection.
+
+    Precedence:
+      1) Query param ?accept_language=...
+      2) HTTP header "Accept-Language" from the WS upgrade
+      3) Server default (DEFAULT_ACCEPT_LANGUAGE_TAG)
+
+    Returns:
+      (canonical_tag, iso_primary)
+    """
+    if query_value and query_value.strip():
+        q_list = _parse_accept_language(query_value)
+        tag = q_list[0][0] if q_list else query_value.split(",")[0].strip()
+        return (tag, _to_iso_primary(tag))
+    h_list = _parse_accept_language(header_value or "")
+    if h_list:
+        tag = h_list[0][0]
+        return (tag, _to_iso_primary(tag))
+    return (default_tag, _to_iso_primary(default_tag))
+
+
+# -----------------------------------------------------------------------------
+# UIRequest builder
+# -----------------------------------------------------------------------------
 def _build_ui_request(state: Conn, message: str, *, staging: bool = False) -> UIRequest:
-    """Build UIRequest for the Manager/Router based on current connection state."""
+    """
+    Build UIRequest for the Manager/Router based on current connection state.
+
+    IMPORTANT:
+    - We pass `language=state.lang_iso` (normalized ISO, e.g., "cs") to keep a stable language.
+    - We always include active_tab, selection (asset_id), staging, session_id, **conn_id**
+      even if the client didn't include these in the inbound event.
+    """
     return UIRequest(
         org_id=state.org_id,
         active_tab=state.active_tab,
@@ -126,18 +213,24 @@ def _build_ui_request(state: Conn, message: str, *, staging: bool = False) -> UI
         message=message,
         staging=staging,
         user_id=state.user_id,
-        session_id=state.sid,
-        # IMPORTANT: UIRequest typically has `language`, not `accept_language`
-        language=state.accept_language,
+        session_id=state.sid,          # lets manager compute thread id or use provided session
+        conn_id=state.conn_id,         # explicit conn_id → manager can uuid5(org, conn_id|user_id)
+        language=state.lang_iso or _to_iso_primary(state.accept_language),
+        # Optionally include locale (canonical tag) if UIRequest supports it:
+        # locale=state.accept_language,
     )
 
 
+# -----------------------------------------------------------------------------
+# WS send/error helpers
+# -----------------------------------------------------------------------------
 async def _ws_send(ws: WebSocket, event_type: str, payload: dict[str, Any] | list[Any] | None = None) -> None:
     try:
         await ws.send_json({"type": event_type, "payload": payload or {}})
     except WebSocketDisconnect:
         return
     except RuntimeError as e:
+        # Safety: ASGI can raise if sending after close
         if "Unexpected ASGI message" in str(e) or "once a close message has been sent" in str(e):
             return
         raise
@@ -169,7 +262,9 @@ async def _ws_error(
     )
 
 
-# ----------------------------- WebSocket endpoint -----------------------------
+# -----------------------------------------------------------------------------
+# WebSocket endpoint
+# -----------------------------------------------------------------------------
 @router.websocket("/ws")
 async def ws_endpoint(
     ws: WebSocket,
@@ -179,7 +274,16 @@ async def ws_endpoint(
     accept_language: Optional[str] = Query(None, description="Optional Accept-Language hint (e.g., 'cs, sk;q=0.9, en;q=0.7')"),
 ) -> None:
     """
-    Real-time chat endpoint with Accept-Language passthrough (mapped to UIRequest.language).
+    Real-time chat endpoint.
+
+    Language behavior:
+      - We select the language ONCE per connection (query > header > default).
+      - We normalize to ISO primary (e.g., "cs") and send it on UIRequest.language.
+      - This makes agents stick to the user's language for the whole session (no drift).
+
+    Per-connection context:
+      - staging (from WS_DEFAULT_STAGING), active_tab, accept_language, conn_id
+      - These are applied on every routed UIRequest regardless of event payload.
     """
     active_tab = active_tab if active_tab in ALLOWED_TABS else "assets"
 
@@ -193,8 +297,15 @@ async def ws_endpoint(
 
     sid = ws.cookies.get(COOKIE_NAME)
     rid = get_request_id() or "n/a"
-    al = _pick_accept_language(ws, accept_language)
 
+    # Decide language once (per connection) and "lock" it into the Conn
+    lang_tag, lang_iso = _choose_lang(
+        accept_language,
+        ws.headers.get("accept-language"),
+        default_tag=DEFAULT_ACCEPT_LANGUAGE_TAG,
+    )
+
+    # Initialize per-connection state (context)
     state = Conn(
         org_id=org_id,
         user_id=user_id,
@@ -202,9 +313,11 @@ async def ws_endpoint(
         sid=sid,
         request_id=rid,
         staging=DEFAULT_STAGING,
-        accept_language=al,
+        accept_language=lang_tag,  # canonical tag (e.g., "cs-CZ")
+        lang_iso=lang_iso,         # normalized ISO (e.g., "cs")
     )
 
+    # Send hello with both values so the UI can clearly see what was chosen
     await _ws_send(
         ws,
         "hello",
@@ -218,7 +331,8 @@ async def ws_endpoint(
             "sid": state.sid,
             "agent_events": {"subscribed": True, "mode": "raw_json"},
             "staging": state.staging,
-            "accept_language": state.accept_language,
+            "accept_language": state.accept_language,  # canonical tag (e.g., "cs-CZ")
+            "lang": state.lang_iso,                    # normalized ISO (e.g., "cs")
         },
     )
 
@@ -248,6 +362,7 @@ async def ws_endpoint(
                 continue
 
             if evt.type == "switch_tab":
+                # Update stored context with the new tab (if supported)
                 new_tab = (evt.active_tab or "").strip().lower()
                 if new_tab in ALLOWED_TABS:
                     state.active_tab = new_tab
@@ -263,6 +378,7 @@ async def ws_endpoint(
                 continue
 
             if evt.type == "select":
+                # Track selection in connection state; always included in UIRequest
                 state.selected_asset_id = evt.asset_id or None
                 await _ws_send(ws, "select_ack", {"asset_id": state.selected_asset_id, "request_id": state.request_id})
                 continue
@@ -293,6 +409,9 @@ async def ws_endpoint(
                         continue
 
                     deps = make_default_deps(tab=state.active_tab)
+
+                    # Always build a complete UIRequest from connection context,
+                    # even if the client omitted fields in the event.
                     ui_req = _build_ui_request(state, text, staging=state.staging)
 
                     await _ws_send(

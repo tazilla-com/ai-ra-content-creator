@@ -1,19 +1,4 @@
 # File: workshops_ai/chatui/router.py
-# Purpose: Standalone demo UI router for WorkshopsAI.
-# Exposes:
-#   - GET /demo     → minimal HTML page to talk to /chat and /ws
-#   - GET /         → redirects to /demo (when mounted at root)
-#
-# Notes:
-# - Pure FastAPI; no templates or static deps. Safe to include in any app.
-# - UI lets you set org_id, user_id, active_tab, and optional X-API-Key header.
-# - WebSocket connects to /ws and prints incoming AgentEvent frames.
-# - Keep this file UI-only; all auth/logic is handled by /chat and /ws.
-#
-# Usage (in main.py):
-#   from workshops_ai.chatui.router import router as chatui_router
-#   app.include_router(chatui_router, tags=["_demo"])
-
 from __future__ import annotations
 
 from fastapi import APIRouter
@@ -24,13 +9,11 @@ router = APIRouter()
 
 @router.get("/", include_in_schema=False)
 async def root_redirect():
-    """Redirect bare mount path to /docs."""
-    return RedirectResponse(url="/docs", status_code=302)
+    return RedirectResponse(url="/demo", status_code=302)
 
 
 @router.get("/demo", include_in_schema=False, response_class=HTMLResponse)
 async def demo_page() -> str:
-    """Simple HTML page to exercise /chat and /ws endpoints."""
     return """
 <!doctype html>
 <html lang="en">
@@ -113,7 +96,7 @@ async def demo_page() -> str:
     // --- Chat UI helpers ------------------------------------------------------
     function line(kind, content) {
       const wrap = document.createElement('div');
-      wrap.className = `msg ${kind}`;
+      wrap.className = 'msg ' + kind;
       const el = document.createElement('div');
       el.textContent = (content === null || content === undefined)
         ? String(content)
@@ -130,7 +113,6 @@ async def demo_page() -> str:
       eventsEl.scrollTop = eventsEl.scrollHeight;
     }
 
-    // We don't decide language here — agent does. We just pass a hint.
     function browserAcceptLanguage() {
       const nav = navigator.languages && navigator.languages.length
         ? navigator.languages.join(', ')
@@ -138,44 +120,85 @@ async def demo_page() -> str:
       return nav;
     }
 
-    // --- Humanizers: show selected JSON as friendly chat lines ----------------
+    // --- Humanizers -----------------------------------------------------------
     function humanizeAssetList(payload) {
       try {
-        const n = payload.count ?? (payload.assets ? payload.assets.length : 0);
-        const names = (payload.assets || []).map(a => a.name).filter(Boolean);
-        const head = `Assets (${n}):`;
+        const n = (payload && payload.count != null)
+          ? payload.count
+          : ((payload && payload.assets) ? payload.assets.length : 0);
+        const names = ((payload && payload.assets) || []).map(a => a.name).filter(Boolean);
+        const head = 'Assets (' + n + '):';
         if (!names.length) return head;
         const shown = names.slice(0, 12).join(', ');
-        const more = names.length > 12 ? ` … +${names.length - 12} more` : '';
-        return `${head} ${shown}${more}`;
+        const more = names.length > 12 ? ' … +' + (names.length - 12) + ' more' : '';
+        return head + ' ' + shown + more;
       } catch { return null; }
     }
     function humanizeChangesetQueued(payload) {
-      const p = payload?.outbox_path || '(outbox)';
-      return `Changeset queued → ${p}`;
+      const p = (payload && payload.outbox_path) || '(outbox)';
+      return 'Changeset queued → ' + p;
     }
     function humanizeChangesetSubmitted(payload) {
-      const n = payload?.actions ?? '?';
-      const t = payload?.transport ?? 'unknown';
-      return `Changeset submitted (${n}) via ${t}.`;
+      const n = (payload && payload.actions) || '?';
+      const t = (payload && payload.transport) || 'unknown';
+      return 'Changeset submitted (' + n + ') via ' + t + '.';
+    }
+    function humanizeAssetDetail(payload) {
+      try {
+        const a = (payload && payload.asset) || (payload && payload.preview) || payload;
+        if (!a || typeof a !== 'object') return null;
+
+        const id = a.id || a.asset_id || 'n/a';
+        const name = a.name || 'n/a';
+        const typ = a.assetType || 'n/a';
+        const primary = (a.isPrimary === true || a.isPrimary === 'true');
+        const primTxt = primary ? 'primary' : 'supporting';
+        const c = (a.confidentiality != null ? a.confidentiality : (primary ? '-' : 'n/a'));
+        const i = (a.integrity != null ? a.integrity : (primary ? '-' : 'n/a'));
+        const av = (a.availability != null ? a.availability : (primary ? '-' : 'n/a'));
+        const desc = a.description || '—';
+
+        let lines = [];
+        lines.push('Asset detail');
+        lines.push('Name: ' + name);
+        lines.push('Type: ' + typ);
+        lines.push('Primary: ' + (primary ? 'Yes' : 'No'));
+        lines.push('CIA: C=' + c + '  I=' + i + '  A=' + av);
+        lines.push('Description: ' + desc);
+        lines.push('ID: ' + id);
+        return lines.join('\\n');
+      } catch { return null; }
     }
 
-    function renderMessageObject(obj, source = 'http') {
-      const kind = obj?.kind || obj?.type;
-      let text = null;
+    function renderMessageObject(obj, source) {
+      source = source || 'http';
+      const kind = (obj && (obj.kind || obj.type)) || null;
 
-      if (kind === 'asset.list') {
-        text = humanizeAssetList(obj);
-      } else if (kind === 'changeset.queued') {
-        text = humanizeChangesetQueued(obj);
-      } else if (kind === 'changeset.submitted') {
-        text = humanizeChangesetSubmitted(obj);
-      } else if (kind === 'llm.say' && typeof obj.text === 'string') {
-        text = obj.text;
+      if ((kind === 'text' || kind === 'llm.say') && obj && typeof obj.text === 'string') {
+        line('ai', obj.text);
+        ev({ type: source === 'ws' ? 'ws_message_json' : 'chat_message_json', payload: obj });
+        if (Array.isArray(obj.messages)) {
+          obj.messages.forEach(function(m) {
+            if (typeof m === 'string') return line('ai', m);
+            if (m && (m.text || m.message)) return line('ai', m.text || m.message);
+            line('ai', JSON.stringify(m));
+          });
+        }
+        return;
       }
 
+      let text = null;
+      if (kind === 'asset.list') text = humanizeAssetList(obj);
+      if (kind === 'asset.get' || kind === 'asset.preview') text = humanizeAssetDetail(obj);
+      if (kind === 'changeset.queued') text = humanizeChangesetQueued(obj);
+      if (kind === 'changeset.submitted') text = humanizeChangesetSubmitted(obj);
+
       ev({ type: source === 'ws' ? 'ws_message_json' : 'chat_message_json', payload: obj });
-      if (text) line('ai', text);
+      if (text) {
+        line('ai', text);
+      } else if (obj && obj.text) {
+        line('ai', String(obj.text));
+      }
     }
 
     // --- HTTP /api/chat -------------------------------------------------------
@@ -186,7 +209,7 @@ async def demo_page() -> str:
       const payload = {
         org_id: org.value.trim(),
         active_tab: tab.value,
-        selection: {},   // pass asset_id, etc. if needed
+        selection: {},
         message: text,
         staging: false,
         user_id: user.value.trim(),
@@ -198,7 +221,6 @@ async def demo_page() -> str:
       const headers = { 'Content-Type': 'application/json' };
       const key = apiKey.value.trim();
       if (key) headers['X-API-Key'] = key;
-      // >>> important: pass Accept-Language as HTTP header <<<
       headers['Accept-Language'] = browserAcceptLanguage();
 
       try {
@@ -220,27 +242,24 @@ async def demo_page() -> str:
         }
 
         if (res.ok) {
-          // Strings (LLM text) go straight into chat
-          (data.messages || []).forEach(item => {
+          (data.messages || []).forEach(function(item) {
             if (typeof item === 'string') {
               line('ai', item);
             } else if (item && typeof item === 'object') {
-              // Known JSON payloads → humanize into chat + mirror to Events
               renderMessageObject(item, 'http');
             }
           });
 
-          // Legacy mirrors to Events only
           if (data.outbox_path) ev({ type: 'outbox', path: data.outbox_path });
           if (data.proposals) { line('sys', '[proposals attached]'); ev({ type: 'proposals', proposals: data.proposals }); }
           if (data.staging) ev({ type: 'staging', staging: data.staging });
           if (data.agent_events) ev({ type: 'agent_events', events: data.agent_events });
         } else {
-          line('sys', `ERROR ${res.status}: ${data?.message || 'Request failed'}`);
-          ev({ type: 'error', data });
+          line('sys', 'ERROR ' + res.status + ': ' + (data && data.message ? data.message : 'Request failed'));
+          ev({ type: 'error', data: data });
         }
       } catch (e) {
-        line('sys', `Network error: ${e}`);
+        line('sys', 'Network error: ' + e);
       }
     }
 
@@ -256,22 +275,20 @@ async def demo_page() -> str:
       url.searchParams.set('active_tab', tab.value);
       url.searchParams.set('org_id', org.value.trim());
       url.searchParams.set('user_id', user.value.trim());
-      url.searchParams.set('accept_language', browserAcceptLanguage()); // pass to WS as query param
+      url.searchParams.set('accept_language', browserAcceptLanguage());
       const key = apiKey.value.trim();
       if (key) url.searchParams.set('api_key', key);
 
       ws = new WebSocket(url.toString());
-      ws.onopen = () => { line('sys', 'WS connected'); wsBtn.textContent = 'Reconnect WS'; };
-      ws.onmessage = (evt) => {
+      ws.onopen = function() { line('sys', 'WS connected'); wsBtn.textContent = 'Reconnect WS'; };
+      ws.onmessage = function(evt) {
         try {
           const data = JSON.parse(evt.data);
 
           if (data && typeof data === 'object') {
-            // Our server often wraps WS frames as { type, payload }
             if (data.type && data.payload !== undefined) {
               ev({ ws_type: data.type, payload: data.payload });
 
-              // Friendly one-liners
               if (data.type === 'info' && data.payload && data.payload.message) {
                 line('sys', data.payload.message);
               }
@@ -282,16 +299,13 @@ async def demo_page() -> str:
                 line('sys', humanizeChangesetQueued(data.payload));
               }
 
-              // Server-pushed chat JSON via WS
               if (data.type === 'chat_message_json' && data.payload) {
                 renderMessageObject(data.payload, 'ws');
               }
-              // Server-pushed plain chat strings via WS
               if (data.type === 'chat_message' && typeof data.payload === 'string') {
                 line('ai', data.payload);
               }
             } else {
-              // Raw AgentEvent → Events only
               ev(data);
             }
           }
@@ -299,24 +313,24 @@ async def demo_page() -> str:
           ev({ parse_error: String(e), raw: evt.data });
         }
       };
-      ws.onclose = (evt) => { line('sys', `WS closed (${evt.code})`); };
-      ws.onerror = () => { line('sys', 'WS error'); };
+      ws.onclose = function(evt) { line('sys', 'WS closed (' + evt.code + ')'); };
+      ws.onerror = function() { line('sys', 'WS error'); };
     }
 
     // --- Wire UI --------------------------------------------------------------
     sendBtn.addEventListener('click', sendMessage);
-    msg.addEventListener('keydown', (e) => {
+    msg.addEventListener('keydown', function(e) {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         sendMessage();
       }
     });
     wsBtn.addEventListener('click', connectWs);
-    window.addEventListener('load', () => {
+    window.addEventListener('load', function() {
       const url = new URL(location.href);
       const apiKeyEl = document.getElementById('apiKey');
       const initialKey = url.searchParams.get('api_key') || '';
-      if (initialKey && apiKeyEl) apiKeyEl.value = initialKey; // prefill the input
+      if (initialKey && apiKeyEl) apiKeyEl.value = initialKey;
 
       if (initialKey || (apiKeyEl && apiKeyEl.value.trim())) {
         connectWs();
@@ -324,7 +338,7 @@ async def demo_page() -> str:
         line('sys', 'API key missing: add ?api_key=… to URL or fill the box and click Connect.');
       }
     });
-    window.addEventListener('beforeunload', () => { if (ws) try { ws.close(1000, 'leaving'); } catch {} });
+    window.addEventListener('beforeunload', function() { if (ws) try { ws.close(1000, 'leaving'); } catch (e) {} });
   </script>
 </body>
 </html>

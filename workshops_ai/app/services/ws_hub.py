@@ -4,37 +4,21 @@
 #
 # Purpose
 # - Minimal in-memory broadcast hub for FastAPI WebSocket connections.
-# - Tracks per-connection metadata (org_id/user_id/tab) to route events.
-# - Provides schema-validated emitters for impacts/risks domain events.
-# - Adds lightweight emitters for asset create/update events.
+# - Tracks per-connection metadata so we can route/broadcast domain events.
+# - Provides schema-validated emitters for impacts/risks, plus asset events.
 # - Sends periodic JSON keepalives to prevent idle disconnects.
 #
-# Public API (class methods)
-# - register(ws, *, org_id=None, user_id=None, tab=None) -> None
-# - unregister(ws) -> None
-# - update_client_meta(ws, *, org_id=None, user_id=None, tab=None) -> None
-# - connected_count() -> int
-# - broadcast(event: str, payload: dict) -> None         # sync wrapper
-# - emit(event: str, payload: dict) -> None              # alias of broadcast
-# - broadcast_json(payload: dict) -> Awaitable[None]     # expects "event"
-# - aemit_impact_set_level(payload: dict) -> Awaitable[None]
-# - aemit_impact_set_event(payload: dict) -> Awaitable[None]
-# - aemit_risk_set_probability(payload: dict) -> Awaitable[None]
-# - aemit_risk_set_event(payload: dict) -> Awaitable[None]
-# - aemit_asset_event(payload: dict) -> Awaitable[None]            # NEW
-# - aemit_asset_created(item: dict) -> Awaitable[None]             # NEW
-# - aemit_asset_updated(item: dict) -> Awaitable[None]             # NEW
-#
-# Notes
-# - This hub is intentionally simple: no persistence, no external broker.
-# - Failures while sending to a client result in silent unregistration.
-# - Routing is best-effort: if client metadata is missing, it receives events.
+# New in this version
+# - _Client expanded metadata: staging, accept_language, active_tab, conn_id.
+# - register(...) captures initial metadata (best-effort from headers).
+# - update_context(conn_id, **kwargs) to set/patch context after "hello".
+# - Getters for the chat router to fetch per-connection context by conn_id.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -65,11 +49,22 @@ __all__ = ["WsHub"]
 
 @dataclass
 class _Client:
-    """Tracked WebSocket connection with optional routing metadata."""
+    """
+    Tracked WebSocket connection with routing/context metadata.
+
+    Notes:
+    - accept_language is the canonical header tag (e.g. "cs-CZ"). The router
+      can separately convert this to ISO primary ("cs") for model prompts.
+    - active_tab follows the UI tab ("assets"|"impacts"|"threats"|...).
+    - conn_id is the UI/router-generated connection id (stable for this socket).
+    """
     ws: WebSocket
     org_id: Optional[str] = None
     user_id: Optional[str] = None
-    tab: Optional[str] = None
+    active_tab: Optional[str] = None
+    staging: bool = True
+    accept_language: Optional[str] = None
+    conn_id: Optional[str] = None
     keepalive: Optional[asyncio.Task] = None
 
 
@@ -85,10 +80,14 @@ class WsHub:
     - Keepalive: a lightweight JSON ping prevents idle disconnects.
     """
 
+    # Primary index by WebSocket object
     _clients: Dict[WebSocket, _Client] = {}
+    # Secondary index by conn_id for quick lookups from HTTP chat router
+    _by_conn_id: Dict[str, _Client] = {}
+
     _lock: asyncio.Lock = asyncio.Lock()
 
-    # -- Registration -----------------------------------------------------------
+    # -- Registration / lifecycle ---------------------------------------------
 
     @classmethod
     async def register(
@@ -97,24 +96,57 @@ class WsHub:
         *,
         org_id: str | None = None,
         user_id: str | None = None,
-        tab: str | None = None,
+        active_tab: str | None = None,
+        staging: bool | None = None,
+        accept_language: str | None = None,
+        conn_id: str | None = None,
     ) -> None:
         """
-        Register an accepted WebSocket connection with optional routing metadata.
-        IMPORTANT: call websocket.accept() in your router before registering.
+        Register an accepted WebSocket connection with optional metadata.
+
+        IMPORTANT
+        - Call websocket.accept() before registering.
+        - The router can pass org/user/tab/staging/lang/conn_id if already known.
+          Otherwise we best-effort fill some from headers and let the router
+          patch later via update_context(conn_id, ...).
+
+        Header fallbacks:
+        - accept_language defaults to ws.headers.get("accept-language") if not given.
         """
-        client = _Client(ws=ws, org_id=org_id, user_id=user_id, tab=tab)
+        # Best-effort header fallback for language if the router didn't provide it yet
+        if not accept_language:
+            try:
+                accept_language = ws.headers.get("accept-language")
+            except Exception:
+                accept_language = None
+
+        client = _Client(
+            ws=ws,
+            org_id=org_id,
+            user_id=user_id,
+            active_tab=active_tab,
+            staging=bool(True if staging is None else staging),
+            accept_language=accept_language,
+            conn_id=conn_id,
+        )
+
         # Start keepalive ticker (JSON-level ping; ~25s is a reasonable compromise)
         client.keepalive = asyncio.create_task(cls._keepalive_task(client))
 
         async with cls._lock:
             cls._clients[ws] = client
+            # Maintain secondary index if conn_id is already known
+            if client.conn_id:
+                cls._by_conn_id[client.conn_id] = client
 
     @classmethod
     async def unregister(cls, ws: WebSocket) -> None:
         """Unregister a WebSocket connection (idempotent) and stop keepalive."""
         async with cls._lock:
             client = cls._clients.pop(ws, None)
+            # Clean secondary index
+            if client and client.conn_id:
+                cls._by_conn_id.pop(client.conn_id, None)
 
         if client and client.keepalive:
             client.keepalive.cancel()
@@ -123,6 +155,8 @@ class WsHub:
             except Exception:
                 # Swallow cancellation/transport exceptions during shutdown
                 pass
+
+    # -- Context updates / getters --------------------------------------------
 
     @classmethod
     async def update_client_meta(
@@ -133,7 +167,10 @@ class WsHub:
         user_id: str | None = None,
         tab: str | None = None,
     ) -> None:
-        """Update routing metadata for a registered client (no-op if missing)."""
+        """
+        Backward-compatible updater (legacy name/signature).
+        Prefer update_context(conn_id, ...) in new code.
+        """
         async with cls._lock:
             client = cls._clients.get(ws)
             if not client:
@@ -143,14 +180,107 @@ class WsHub:
             if user_id is not None:
                 client.user_id = user_id
             if tab is not None:
-                client.tab = tab
+                client.active_tab = tab
+
+    @classmethod
+    async def update_context(
+        cls,
+        conn_id: str,
+        *,
+        org_id: str | None = None,
+        user_id: str | None = None,
+        active_tab: str | None = None,
+        staging: bool | None = None,
+        accept_language: str | None = None,
+    ) -> None:
+        """
+        Update per-connection context by conn_id (preferred modern API).
+
+        Typical usage in the WS router:
+          - After sending "hello", call:
+              await WsHub.update_context(
+                  conn_id,
+                  org_id=...,
+                  user_id=...,
+                  active_tab=...,
+                  staging=...,
+                  accept_language=...,
+              )
+        """
+        async with cls._lock:
+            client = cls._by_conn_id.get(conn_id)
+            if not client:
+                return
+            if org_id is not None:
+                client.org_id = org_id
+            if user_id is not None:
+                client.user_id = user_id
+            if active_tab is not None:
+                client.active_tab = active_tab
+            if staging is not None:
+                client.staging = bool(staging)
+            if accept_language is not None:
+                client.accept_language = accept_language
+
+    @classmethod
+    async def set_conn_id(cls, ws: WebSocket, conn_id: str) -> None:
+        """
+        Assign or change conn_id for a registered client and refresh the secondary index.
+        Call this once you generate a conn_id in the WS router during handshake.
+        """
+        async with cls._lock:
+            client = cls._clients.get(ws)
+            if not client:
+                return
+            # Remove old index entry if any
+            if client.conn_id:
+                cls._by_conn_id.pop(client.conn_id, None)
+            client.conn_id = conn_id
+            cls._by_conn_id[conn_id] = client
+
+    @classmethod
+    def get_context(cls, conn_id: str) -> Optional[dict[str, Any]]:
+        """
+        Return a JSON-serializable view of the per-connection context for chat router.
+
+        Includes:
+          org_id, user_id, active_tab, staging, accept_language, conn_id
+
+        Returns None if not found.
+        """
+        client = cls._by_conn_id.get(conn_id)
+        if not client:
+            return None
+        data = asdict(client)
+        # Strip non-serializable WebSocket and ephemeral keepalive task from the view
+        data.pop("ws", None)
+        data.pop("keepalive", None)
+        return data  # {org_id, user_id, active_tab, staging, accept_language, conn_id}
+
+    @classmethod
+    def get_language(cls, conn_id: str) -> Optional[str]:
+        """Convenience getter: canonical Accept-Language tag for this connection."""
+        client = cls._by_conn_id.get(conn_id)
+        return client.accept_language if client else None
+
+    @classmethod
+    def get_active_tab(cls, conn_id: str) -> Optional[str]:
+        """Convenience getter: active UI tab for this connection."""
+        client = cls._by_conn_id.get(conn_id)
+        return client.active_tab if client else None
+
+    @classmethod
+    def get_staging(cls, conn_id: str) -> Optional[bool]:
+        """Convenience getter: staging flag for this connection."""
+        client = cls._by_conn_id.get(conn_id)
+        return client.staging if client else None
 
     @classmethod
     def connected_count(cls) -> int:
         """Number of currently tracked WebSocket clients."""
         return len(cls._clients)
 
-    # -- Broadcasting (sync wrappers for graphs' SEND-NOW calls) ----------------
+    # -- Broadcasting (sync wrappers for graphs' SEND-NOW calls) ---------------
 
     @classmethod
     def broadcast(cls, event: str, payload: dict[str, Any]) -> None:
@@ -158,7 +288,6 @@ class WsHub:
         Fire-and-forget broadcast of a JSON message, adding/overriding the 'event' field.
         Safe to call from non-async code (graphs use this in SEND-NOW paths).
         """
-        # Ensure the provided event name wins over any accidental 'event' in payload
         message = {**payload, "event": event}
         try:
             loop = asyncio.get_running_loop()
@@ -195,7 +324,7 @@ class WsHub:
 
         def _match(c: _Client) -> bool:
             # Tab filter: deliver to clients matching the tab OR without tab (legacy)
-            tab_ok = (c.tab is None) or (target_tab is None) or (c.tab == target_tab)
+            tab_ok = (c.active_tab is None) or (target_tab is None) or (c.active_tab == target_tab)
             # Org filter: deliver to clients matching org OR without org (legacy)
             org_ok = (c.org_id is None) or (target_org is None) or (c.org_id == target_org)
             return tab_ok and org_ok
@@ -219,14 +348,6 @@ class WsHub:
     async def aemit_impact_set_level(cls, payload: dict[str, Any]) -> None:
         """
         Validate and emit an 'impact.set_level' event (single-item) to all relevant clients.
-
-        Expected envelope (Pydantic-enforced by WSImpactSetEvent):
-          - event: "impact.set_level"
-          - payload: {
-              org_id, asset_id, asset_name?,
-              impact_code, impact_name?,
-              level, note?, ts?, idempotency_key?
-            }
         """
         evt = WSImpactSetEvent.model_validate(payload)
         await cls.broadcast_json(evt.model_dump(mode="json"))
@@ -235,13 +356,6 @@ class WsHub:
     async def aemit_impact_set_event(cls, payload: dict[str, Any]) -> None:
         """
         Validate and emit an 'impact.set_levels' event (batch/list) to all relevant clients.
-
-        Expected envelope (Pydantic-enforced by WSImpactSetListEvent):
-          - event: "impact.set_levels"
-          - payload: {
-              org_id, asset_id, asset_name?,
-              impacts: [{impact_code, level, note?, ts?, idempotency_key?}, ...]
-            }
         """
         evt = WSImpactSetListEvent.model_validate(payload)
         await cls.broadcast_json(evt.model_dump(mode="json"))
@@ -250,14 +364,7 @@ class WsHub:
     async def aemit_risk_set_probability(cls, payload: dict[str, Any]) -> None:
         """
         Validate and emit a 'risk.set_probability' event (single-item).
-
-        Accepted payloads:
-          1) Full event envelope:
-             {"event": "risk.set_probability", "payload": {...RiskChangeItem...}}
-          2) Plain item (auto-wrapped):
-             {"org_id":"...", "asset_id":"...", "threat_code":"...", "probability": 0..4, "note":"...?"}
-
-        Plain items are normalized into a RiskChangeItem, then wrapped with 'event'.
+        Accepts either a full envelope or a plain item.
         """
         # Full envelope path
         if "event" in payload and "payload" in payload:
@@ -274,13 +381,6 @@ class WsHub:
     async def aemit_risk_set_event(cls, payload: dict[str, Any]) -> None:
         """
         Validate and emit a 'risk.set_probabilities' event (batch/list).
-
-        Expected envelope (Pydantic-enforced by WSRiskSetListEvent):
-          - event: "risk.set_probabilities"
-          - payload: {
-              org_id, asset_id, asset_name?,
-              risks: [{threat_code, probability, note?, ts?, idempotency_key?}, ...]
-            }
         """
         evt = WSRiskSetListEvent.model_validate(payload)
         await cls.broadcast_json(evt.model_dump(mode="json"))
@@ -300,29 +400,8 @@ class WsHub:
 
         Accepted inputs:
           1) Full envelope:
-             {
-               "event": "asset.created" | "asset.updated",
-               "payload": {
-                  "org_id": "...",            # REQUIRED
-                  "asset_id": "...",          # REQUIRED
-                  "name": "CRM",              # OPTIONAL
-                  "assetType": "APPLICATION", # OPTIONAL
-                  "isPrimary": true,          # OPTIONAL
-                  "description": "...",       # OPTIONAL
-                  "ts": "...", "idempotency_key": "..."  # OPTIONAL
-               }
-             }
-          2) Plain item with "op":
-             {
-               "op": "created" | "updated",
-               "org_id": "...",
-               "asset_id": "...",
-               ...
-             }
-             (Will be wrapped into the envelope above.)
-
-        Raises:
-          ValueError if the shape is invalid or required keys are missing.
+             {"event": "...", "payload": {...}}
+          2) Plain item with "op": {"op":"created"|"updated", ...}
         """
         # Case 1: already an envelope with an explicit event
         if isinstance(payload, dict) and "event" in payload and "payload" in payload:
@@ -336,7 +415,6 @@ class WsHub:
                 raise ValueError("Asset event requires non-empty payload.org_id.")
             if not isinstance(inner.get("asset_id"), str) or not inner.get("asset_id"):
                 raise ValueError("Asset event requires non-empty payload.asset_id.")
-            # Broadcast as-is (already normalized)
             await cls.broadcast_json({"event": event, "payload": inner})
             return
 
@@ -350,40 +428,21 @@ class WsHub:
                 raise ValueError("Asset item requires non-empty org_id.")
             if not isinstance(payload.get("asset_id"), str) or not payload.get("asset_id"):
                 raise ValueError("Asset item requires non-empty asset_id.")
-            # Remove helper key 'op' and wrap
             item = dict(payload)
             item.pop("op", None)
             await cls.broadcast_json({"event": event, "payload": item})
             return
 
-        raise ValueError("Unsupported asset event payload shape. Provide an envelope with 'event' and 'payload', or a plain item with 'op'.")
+        raise ValueError("Unsupported asset event payload shape.")
 
     @classmethod
     async def aemit_asset_created(cls, item: dict[str, Any]) -> None:
-        """
-        Convenience wrapper: emit 'asset.created' for a single item.
-
-        Example 'item':
-          {
-            "org_id": "...", "asset_id": "...",
-            "name": "CRM", "assetType": "APPLICATION", "isPrimary": true, "description": "...?",
-            "ts": "...?", "idempotency_key": "...?"
-          }
-        """
+        """Convenience wrapper: emit 'asset.created' for a single item."""
         await cls.aemit_asset_event({"event": "asset.created", "payload": item})
 
     @classmethod
     async def aemit_asset_updated(cls, item: dict[str, Any]) -> None:
-        """
-        Convenience wrapper: emit 'asset.updated' for a single item.
-
-        Example 'item':
-          {
-            "org_id": "...", "asset_id": "...",
-            "name": "CRM", "assetType": "APPLICATION", "isPrimary": true, "description": "...?",
-            "ts": "...?", "idempotency_key": "...?"
-          }
-        """
+        """Convenience wrapper: emit 'asset.updated' for a single item."""
         await cls.aemit_asset_event({"event": "asset.updated", "payload": item})
 
     # -- Internals --------------------------------------------------------------

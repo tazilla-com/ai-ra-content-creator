@@ -2,24 +2,26 @@
 # -----------------------------------------------------------------------------
 # LangGraph: THREATS tab — LLM-first assistant (clarify-first, one-call-per-turn)
 #
-# This version aligns behavior and UX with Asset/Impact graphs:
-#   1) Allowed actions & node names stay canonical:
+# Aligns behavior/UX with Asset/Impact graphs and adds small but important
+# hardenings:
+#   1) Canonical tool names stay:
 #        • threat.asset_get (GET)
 #        • threat.set_probability (single write)
 #        • threat.bulk_set (batch write)
 #        • threat.upsert (presence add/remove on asset)
 #        • threat.explain (RAG→LLM)
 #        (+ threat.list kept for catalog)
-#   2) Read "get" node renders compact lines:  CODE: P=level — note
-#      with i18n title and agent_events in UI payload.
-#   3) All writes submit exactly once per turn via deps.submit_changeset(...).
-#      After submit, return:
-#        • a short localized LLM confirmation sentence,
-#        • {"kind":"changeset", ...},
-#        • {"kind":"submit_result", submitted|queued, ...}
-#   4) Thin runners so the router doesn’t build confirmations itself:
-#        • run_set_probability(...), run_bulk_set(...), run_upsert(...),
-#          run_explain_threats(...).
+#   2) Read GET renders lines: "CODE: P=level — note" with i18n title.
+#   3) Writes submit exactly once per turn via deps.submit_changeset(...).
+#      After submit we return:
+#         • short localized LLM confirmation sentence,
+#         • {"kind":"changeset", ...},
+#         • {"kind":"submit_result", submitted|queued, ...}
+#   4) JSON fallbacks: set/bulk_set/upsert accept raw JSON bodies.
+#   5) Lightweight validation for write actions (probability 0..4, etc.).
+#   6) Backend call consistency: tolerant assets_list(...) signature.
+#   7) UI message assembly: append side-messages instead of overriding
+#      the whole "messages" array.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -150,9 +152,10 @@ class ThreatState(BaseModel):
 
 
 # -----------------------------------------------------------------------------
-# Utilities: localization (short), telemetry, UI payload
+# Utilities: localization, telemetry, UI payload
 # -----------------------------------------------------------------------------
 def _lang(locale: Optional[str], fallback: str = "en") -> str:
+    """Normalize locale to 'cs' | 'sk' | 'en' (default 'en')."""
     if not locale:
         return fallback
     l = locale.lower()
@@ -198,7 +201,7 @@ def _finish(state: ThreatState, t0: float, *, tool: str, ok: bool, meta: dict | 
 
 # Backend accessor (align with routers)
 def _backend(deps: GraphDeps):
-    """Prefer deps.backend (router-consistent), fallback to deps.backend_port."""
+    """Prefer deps.backend; fallback to deps.backend_port."""
     return getattr(deps, "backend", None) or getattr(deps, "backend_port", None)
 
 
@@ -237,7 +240,7 @@ def _get_threats_retriever(deps: GraphDeps, org_id: Optional[str] = None):
 def _llm_text(
     *,
     deps: GraphDeps,
-    messages: list[dict[str, str]],
+    messages: List[dict],
     temperature: float | None = 0.2,
     model: Optional[str] = None,
 ) -> str:
@@ -415,6 +418,69 @@ async def _nlu(deps: GraphDeps, state: ThreatState) -> ThreatState:
 
 
 # -----------------------------------------------------------------------------
+# Write validation + plain-dict coercion (prevents serialization issues)
+# -----------------------------------------------------------------------------
+def _to_plain_dict(obj: Any) -> dict:
+    """Ensure a JSON-serializable plain dict (avoid Pydantic in state.actions)."""
+    try:
+        if isinstance(obj, BaseModel):
+            return obj.model_dump(mode="json")
+    except Exception:
+        pass
+    if isinstance(obj, dict):
+        return obj
+    return json.loads(json.dumps(obj, default=lambda o: getattr(o, "__dict__", str(o))))
+
+def _validate_actions(actions: List[dict]) -> tuple[List[dict], Optional[str]]:
+    """
+    Light guardrails:
+      - set_risks: asset_id present; items non-empty; threats have code + probability in 0..4
+      - asset_upsert_threat_presence: asset_id, threat_code non-empty; present is bool
+    """
+    out: List[dict] = []
+    for a in actions:
+        op = (a.get("op") or "").strip()
+
+        if op == "set_risks":
+            aid = a.get("asset_id")
+            items = a.get("items") or []
+            if not aid or not items:
+                return [], "set_risks requires asset_id and non-empty items"
+            norm_items = []
+            for it in items:
+                code = str((it.get("threat_code") or it.get("code") or "")).strip()
+                prob = it.get("probability")
+                if not code:
+                    return [], "risk item missing threat_code"
+                try:
+                    prob = int(prob)
+                except Exception:
+                    return [], f"probability for {code} must be integer 0..4"
+                if prob < 0 or prob > 4:
+                    return [], f"probability for {code} must be in 0..4"
+                norm_items.append({"threat_code": code, "probability": prob, "note": it.get("note")})
+            out.append({"op": "set_risks", "mode": "merge", "asset_id": aid, "items": norm_items})
+
+        elif op == "asset_upsert_threat_presence":
+            aid = a.get("asset_id")
+            code = str(a.get("threat_code") or "").strip()
+            if not aid or not code:
+                return [], "presence upsert requires asset_id and threat_code"
+            present = a.get("present")
+            if not isinstance(present, bool):
+                return [], "presence upsert requires boolean 'present'"
+            row = {"op": "asset_upsert_threat_presence", "asset_id": aid, "threat_code": code, "present": present}
+            if a.get("note") is not None:
+                row["note"] = a.get("note")
+            out.append(row)
+
+        else:
+            return [], f"unsupported operation '{op}'"
+
+    return [_to_plain_dict(x) for x in out], None
+
+
+# -----------------------------------------------------------------------------
 # Clarify-first helpers (ask ONE concise follow-up)
 # -----------------------------------------------------------------------------
 def _suggest_select(deps: GraphDeps) -> Callable[[ThreatState], ThreatState]:
@@ -423,7 +489,13 @@ def _suggest_select(deps: GraphDeps) -> Callable[[ThreatState], ThreatState]:
         t0 = _event(state, kind="tool.call.start", tool="suggest_select")
         try:
             backend = _backend(deps)
-            items = (backend.assets_list(org_id=state.org_id) if backend else []) or []
+            # Support both signatures: assets_list(org_id, ...) and assets_list(org_id=...)
+            items = []
+            if backend:
+                try:
+                    items = backend.assets_list(state.org_id, None, None, None) or []
+                except TypeError:
+                    items = backend.assets_list(org_id=state.org_id) or []
             rows: List[List[str]] = []
             for a in items[:10]:  # preview (not a full catalog)
                 d = a.model_dump() if hasattr(a, "model_dump") else dict(a)
@@ -639,8 +711,20 @@ def _set_probability(deps: GraphDeps) -> Callable[[ThreatState], ThreatState]:
     """Set one or more threat probabilities for a single asset (merge mode)."""
     def _inner(state: ThreatState) -> ThreatState:
         l = _lang(state.locale)
-        payload = state.set_payload
 
+        # JSON fallback: allow {"asset_id":"...", "items":[{threat_code, probability, note?}, ...]}
+        if not state.set_payload:
+            try:
+                obj = json.loads(state.message or "{}")
+                if isinstance(obj, dict) and obj.get("asset_id") and isinstance(obj.get("items"), list):
+                    state.set_payload = RiskSetPayload(
+                        asset_id=obj["asset_id"],
+                        items=[RiskItem(**it) for it in obj["items"]],
+                    )
+            except Exception:
+                pass
+
+        payload = state.set_payload
         if not payload or not payload.items:
             if not (state.selection and state.selection.get("asset_id")):
                 return _suggest_select(deps)(state)
@@ -650,20 +734,22 @@ def _set_probability(deps: GraphDeps) -> Callable[[ThreatState], ThreatState]:
             state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
             return state
 
+        # Build and validate
         action = {
             "op": "set_risks",
             "mode": "merge",
             "asset_id": payload.asset_id,
             "items": [it.model_dump() for it in payload.items],
         }
-        # Optional guard
-        try:
-            from workshops_ai.tools.guard import guard_validate_payload as _guard_validate  # type: ignore
-            _guard_validate("ActionSetRisks", action)  # type: ignore[arg-type]
-        except Exception:
-            pass
+        validated, err = _validate_actions([action])
+        if err:
+            state.result = _ui_response(
+                {"cs": f"Validace selhala: {err}", "sk": f"Validácia zlyhala: {err}", "en": f"Validation failed: {err}"}[l],
+                extra={"agent_events": state.agent_events},
+            )
+            return state
 
-        state.actions = [action]
+        state.actions = validated
 
         # Short pre-submit echo
         lines = [f"{it.threat_code}=P{int(max(0, min(4, it.probability)))}" + (f" — {it.note}" if it.note else "") for it in payload.items]
@@ -679,6 +765,26 @@ def _bulk_set_probability(deps: GraphDeps) -> Callable[[ThreatState], ThreatStat
     """Bulk set threat probabilities across multiple assets (merge mode)."""
     def _inner(state: ThreatState) -> ThreatState:
         l = _lang(state.locale)
+
+        # JSON fallback: {"entries":[{"asset_id":"...","items":[{threat_code,probability}]} , ...]}
+        if not state.bulk_payload:
+            try:
+                obj = json.loads(state.message or "{}")
+                if isinstance(obj, dict) and isinstance(obj.get("entries"), list):
+                    entries = []
+                    for e in obj["entries"]:
+                        if isinstance(e, dict) and e.get("asset_id") and isinstance(e.get("items"), list):
+                            entries.append(
+                                RiskSetPayload(
+                                    asset_id=e["asset_id"],
+                                    items=[RiskItem(**it) for it in e["items"]],
+                                )
+                            )
+                    if entries:
+                        state.bulk_payload = RiskBulkPayload(entries=entries)
+            except Exception:
+                pass
+
         bulk = state.bulk_payload
         if not bulk or not bulk.entries:
             msg = {"cs": "Chybí entries pro hromadné nastavení.",
@@ -708,7 +814,15 @@ def _bulk_set_probability(deps: GraphDeps) -> Callable[[ThreatState], ThreatStat
             state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
             return state
 
-        state.actions = actions
+        validated, err = _validate_actions(actions)
+        if err:
+            state.result = _ui_response(
+                {"cs": f"Validace selhala: {err}", "sk": f"Validácia zlyhala: {err}", "en": f"Validation failed: {err}"}[l],
+                extra={"agent_events": state.agent_events},
+            )
+            return state
+
+        state.actions = validated
         heading = {"cs": "Připraveno k aplikaci (hromadné nastavení)",
                    "sk": "Pripravené na aplikáciu (hromadné nastavenie)",
                    "en": "Ready to apply (bulk set)"}[l]
@@ -722,6 +836,24 @@ def _upsert_presence(deps: GraphDeps) -> Callable[[ThreatState], ThreatState]:
     def _inner(state: ThreatState) -> ThreatState:
         l = _lang(state.locale)
 
+        # JSON fallback: {"asset_id":"...", "items":[{threatName,present[,note]}...]}
+        # or single:     {"asset_id":"...","threatName":"X","present":true,"note":"..."}
+        if not state.upsert_payload:
+            try:
+                obj = json.loads(state.message or "{}")
+                if isinstance(obj, dict) and obj.get("asset_id"):
+                    items: List[ThreatPresenceItem] = []
+                    if "threatName" in obj and "present" in obj:
+                        items.append(ThreatPresenceItem(threatName=obj["threatName"], present=bool(obj["present"]), note=obj.get("note")))
+                    if isinstance(obj.get("items"), list):
+                        for it in obj["items"]:
+                            if isinstance(it, dict) and "threatName" in it and "present" in it:
+                                items.append(ThreatPresenceItem(threatName=it["threatName"], present=bool(it["present"]), note=it.get("note")))
+                    if items:
+                        state.upsert_payload = ThreatPresencePayload(asset_id=obj["asset_id"], items=items)
+            except Exception:
+                pass
+
         payload = state.upsert_payload
         if not payload or not payload.asset_id or not payload.items:
             if not (state.selection and state.selection.get("asset_id")):
@@ -733,27 +865,28 @@ def _upsert_presence(deps: GraphDeps) -> Callable[[ThreatState], ThreatState]:
             return state
 
         # Build one asset-scoped presence action per item
-        actions: List[dict] = []
+        raw_actions: List[dict] = []
         for it in payload.items:
             code = (it.threatName or "").strip()
             if not code:
                 continue
-            action = {
+            raw_actions.append({
                 "op": "asset_upsert_threat_presence",
                 "asset_id": payload.asset_id,
                 "threat_code": code,
                 "present": bool(it.present),
                 "note": (it.note or None),
-            }
-            # Optional guard (safe best-effort)
-            try:
-                from workshops_ai.tools.guard import guard_validate_payload as _guard_validate  # type: ignore
-                _guard_validate("ActionAssetUpsertThreatPresence", action)  # type: ignore[arg-type]
-            except Exception:
-                pass
-            actions.append(action)
+            })
 
-        state.actions = actions
+        validated, err = _validate_actions(raw_actions)
+        if err:
+            state.result = _ui_response(
+                {"cs": f"Validace selhala: {err}", "sk": f"Validácia zlyhala: {err}", "en": f"Validation failed: {err}"}[l],
+                extra={"agent_events": state.agent_events},
+            )
+            return state
+
+        state.actions = validated
 
         # Short pre-submit echo
         lines = [f"{it.threatName}: {'present' if it.present else 'absent'}" + (f" — {it.note}" if it.note else "") for it in payload.items]
@@ -825,7 +958,7 @@ async def _llm_confirm_async(
 # Submit (single submit per turn) — unified with Asset/Impact (submit_changeset)
 # -----------------------------------------------------------------------------
 async def _submit_changeset_async(deps: GraphDeps, state: ThreatState) -> ThreatState:
-    """Submit accumulated actions as a typed ChangeSet via deps.submit_changeset (with OUTBOX fallback handled inside)."""
+    """Submit accumulated actions as a typed ChangeSet via deps.submit_changeset (OUTBOX fallback handled inside)."""
     l = _lang(state.locale)
     acts = state.actions or []
     if not acts:
@@ -869,18 +1002,13 @@ async def _submit_changeset_async(deps: GraphDeps, state: ThreatState) -> Threat
         except Exception:
             cs_dump = {"_error": "cannot_dump_changeset"}
 
-        # Unified messages: confirm + structured changeset + structured submit_result
-        messages: List[Any] = [
-            confirm,
-            {"kind": "changeset", "changeset": cs_dump, "ts": _now_iso()},
-            {"kind": "submit_result", "submitted": ok, "queued": (not ok), "fallback_path": str(fallback_path) if fallback_path else None},
-        ]
+        # Build UI response and append structured side-messages (do not override messages)
+        res = _ui_response(confirm, extra={"changeset_actions": len(acts), "agent_events": state.agent_events})
+        res["messages"].append({"kind": "changeset", "changeset": cs_dump, "ts": _now_iso()})
+        res["messages"].append({"kind": "submit_result", "submitted": ok, "queued": (not ok), "fallback_path": str(fallback_path) if fallback_path else None})
+        state.result = res
 
-        state.result = _ui_response(confirm, extra={
-            "changeset_actions": len(acts),
-            "agent_events": state.agent_events,
-            "messages": messages,  # override with the complete messages list for UI
-        })
+        # Clear write state to avoid re-entry loops
         state.actions = None
         state.change = None
         return state

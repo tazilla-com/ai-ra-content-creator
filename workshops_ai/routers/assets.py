@@ -9,9 +9,8 @@
 # Design
 # - Read-only REST: returns canonical API DTOs (workshops_ai.api.schema.asset.Asset).
 # - Tool-first (/graph/assets): validates strictly against ToolRegistry (SSOT) and
-#   dispatches to the asset graph runners for create/update/explain. One tool per call.
-# - No hardcoded conversational strings here — the LLM + graph handle slot-asking
-#   and confirmations. This router only validates, routes, and shapes responses.
+#   dispatches to the asset graph runners for create/update/explain/CIA updates.
+#   Jedna tool-operace na jeden call.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ from workshops_ai.backend.csv_backend import CsvBackend
 from workshops_ai.tools.telemetry import telemetry_log
 
 # Graph runners (LLM-first behavior for selected ops)
-from workshops_ai.graph.asset_graph import run_explain, run_create, run_update_meta
+from workshops_ai.graph.assets.asset_graph import run_explain, run_create, run_update_meta, run_set_meta
 from workshops_ai.graph.factory import GraphDeps
 
 # Canonical public DTOs for assets (client contracts)
@@ -43,8 +42,9 @@ from workshops_ai.agents.tools.registry import (
     AssetListArgs,
     AssetCreateArgs,
     AssetUpdateMetaArgs,
+    AssetSetMetaArgs,   # <-- NEW: CIA policy updates
     AssetExplainArgs,
-    AssetGetArgs,  # <-- needed for /graph/assets: asset.get
+    AssetGetArgs,
 )
 
 # UI contract (used when delegating to graph runners)
@@ -85,6 +85,10 @@ class ToolAssetLite(BaseModel):
     asset_id: str
     name: str
     type: Optional[str] = None
+    isPrimary: Optional[bool] = None
+    confidentiality: Optional[str] = None
+    integrity: Optional[str] = None
+    availability: Optional[str] = None
 
 
 class ToolAssetType(BaseModel):
@@ -110,13 +114,13 @@ class ToolAssetUpdateResponse(BaseModel):
 
 # Unified tool call request/response wrapper for /graph/assets
 class GraphToolCall(BaseModel):
-    # Extended to include the two missing ops: asset.list_types, asset.get
     op: Literal[
         "asset.list",
         "asset.list_types",
         "asset.get",
         "asset.create",
         "asset.update_meta",
+        "asset.set_meta",   # <-- NEW
         "asset.explain",
     ]
     args: dict = Field(default_factory=dict)
@@ -289,7 +293,31 @@ def _shape_tool_asset(item: Any) -> ToolAssetLite:
     asset_id = str(_first_nonempty(data.get("id"), data.get("asset_id")))
     name = str(_first_nonempty(data.get("name"), data.get("title"), ""))
     a_type = _first_nonempty(data.get("assetType"), data.get("type"), data.get("asset_type"))
-    return ToolAssetLite(asset_id=asset_id, name=name, type=(str(a_type) if a_type else None))
+
+    is_primary = _as_bool(_first_nonempty(data.get("isPrimary"), data.get("primary"), data.get("is_primary")))
+    conf = _num_conf_to_label(_first_nonempty(data.get("confidentiality"), data.get("c")))
+    integ = _num_ia_to_label(_first_nonempty(data.get("integrity"), data.get("i")))
+    avail = _num_ia_to_label(_first_nonempty(data.get("availability"), data.get("a")))
+
+    return ToolAssetLite(
+        asset_id=asset_id,
+        name=name,
+        type=(str(a_type) if a_type else None),
+        isPrimary=is_primary,
+        confidentiality=conf,
+        integrity=integ,
+        availability=avail,
+    )
+
+def _best_lang(header: str | None) -> str:
+    """
+    Pick the first language token from Accept-Language (e.g. 'cs,en;q=0.8' -> 'cs').
+    Defaults to 'en' if missing.
+    """
+    if not header:
+        return "en"
+    token = header.split(",")[0].strip()
+    return token or "en"
 
 # -----------------------------------------------------------------------------
 # Public read-only routes (/api/assets)
@@ -440,7 +468,7 @@ async def get_asset_risks(
 @graph_router.post(
     "",
     response_class=JSONResponse,
-    summary="[tool] Unified assets tools (SSOT): list/list_types/get/create/update_meta/explain",
+    summary="[tool] Unified assets tools (SSOT): list/list_types/get/create/update_meta/set_meta/explain",
 )
 async def graph_assets_entrypoint(
     request: Request,
@@ -457,6 +485,7 @@ async def graph_assets_entrypoint(
       - asset.list_types   → handled here (catalog list from backend)
       - asset.get          → handled here (fetch by id or name)
       - asset.update_meta  → delegated to graph runner (slot-driven + ChangeSet)
+      - asset.set_meta     → delegated to graph runner (CIA policy updates)
       - asset.create       → delegated to graph runner (slot-driven + ChangeSet)
       - asset.explain      → delegated to graph runner (RAG/LLM)
     """
@@ -488,7 +517,6 @@ async def graph_assets_entrypoint(
 
     # --- asset.list_types (catalog) ------------------------------------------
     if op == "asset.list_types":
-        # Returns list of catalog codes (EN) for asset types.
         try:
             types = await _run_async(backend.list_asset_types)
         except Exception as ex:
@@ -496,12 +524,13 @@ async def graph_assets_entrypoint(
                 status_code=500,
                 detail={"message": "Failed to list asset types", "error": str(ex)},
             ) from ex
-        items = [ToolAssetType(code=t, name=t) for t in (types or [])]
+
+        types = [str(t).strip() for t in (types or []) if str(t).strip()]
+        items = [ToolAssetType(code=t, name=t) for t in types]
         return ToolListAssetTypesResponse(items=items, total=len(items))
 
     # --- asset.get (by id or name) -------------------------------------------
     if op == "asset.get":
-        # Validate args against registry model; support id or name.
         v: AssetGetArgs = cast(AssetGetArgs, validated_model)
         asset_id: str | None = None
 
@@ -522,7 +551,6 @@ async def graph_assets_entrypoint(
             exact = next((a for a in candidates if str(getattr(a, "name", "")).strip().lower() == name.lower()), None)
             chosen = exact or (candidates[0] if candidates else None)
             if chosen:
-                # Accept id or asset_id attribute, whichever the backend exposes
                 asset_id = str(getattr(chosen, "id", "") or getattr(chosen, "asset_id", "")).strip()
 
         if not asset_id:
@@ -546,7 +574,6 @@ async def graph_assets_entrypoint(
 
     # --- asset.update_meta (delegates to graph runner) -----------------------
     if op == "asset.update_meta":
-        # Delegate to slot-driven graph runner (the graph will ask questions if needed)
         v: AssetUpdateMetaArgs = cast(AssetUpdateMetaArgs, validated_model)
         ui_resp = await run_update_meta(
             deps=deps,
@@ -561,9 +588,24 @@ async def graph_assets_entrypoint(
         )
         return JSONResponse(ui_resp.model_dump(mode="json"), status_code=200)
 
+    # --- asset.set_meta (CIA policy updates; delegates to graph runner) ------
+    if op == "asset.set_meta":
+        v: AssetSetMetaArgs = cast(AssetSetMetaArgs, validated_model)
+        ui_resp = await run_set_meta(
+            deps=deps,
+            ui_req=UIRequest(
+                org_id=org_id,
+                user_id=user_id,
+                active_tab="assets",
+                body={"op": op, "args": v.model_dump(mode="json")},
+                agent_events={"subscribed": False, "mode": "raw_json"},
+                emit_changes_enabled=True,
+            ),
+        )
+        return JSONResponse(ui_resp.model_dump(mode="json"), status_code=200)
+
     # --- asset.create (delegates to graph runner) ----------------------------
     if op == "asset.create":
-        # Delegate to slot-driven graph runner (the graph will iterate questions and then apply)
         v: AssetCreateArgs = cast(AssetCreateArgs, validated_model)  # type: ignore[assignment]
         ui_resp = await run_create(
             deps=deps,
@@ -580,17 +622,11 @@ async def graph_assets_entrypoint(
 
     # --- asset.explain (delegates to graph runner) ---------------------------
     if op == "asset.explain":
-        # Our asset graph exposes run_explain(deps, text, locale) returning a dict UI payload.
-        # AssetExplainArgs = AssetSelector (assetId | assetName). Build a natural question.
         v: AssetExplainArgs = cast(AssetExplainArgs, validated_model)
         asset_id = getattr(v, "assetId", None)
         asset_name = getattr(v, "assetName", None)
-        # Prefer name when available; otherwise use the id
         question = f"Explain asset '{asset_name}'." if asset_name else f"Explain asset with id '{asset_id}'."
-        # Locale: take Accept-Language best-effort; otherwise EN
-        headers = dict(request.headers)
-        accept_lang = headers.get("accept-language") or "en"
-        payload = await run_explain(deps=deps, text=question, locale=accept_lang)
+        payload = await run_explain(deps=deps, text=question, locale=_best_lang(request.headers.get("accept-language")))
         return JSONResponse(payload, status_code=200)
 
     # Should never happen (Literal + registry validation)

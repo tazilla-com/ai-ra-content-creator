@@ -12,6 +12,9 @@
 #
 # Change:
 #   - Use central `mask_secrets()` to redact config in the startup log (replaces settings.redacted_dict()).
+#   - Added session propagation helpers for HTTP: a stable cookie/header name and a
+#     `get_session_id_from_request()` fallback that chat_router can use when body lacks `session_id`.
+#   - ✅ NEW: Enable faulthandler at startup and register SIGUSR2 to dump stacks (for recursion/debug).
 #   - Kept the project's patch style: old code commented above new code.
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Optional  # <- Optional for helper return
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, WebSocket, status
 from fastapi.exceptions import RequestValidationError
@@ -73,6 +76,10 @@ from workshops_ai.app.services.redis_pool import get_redis, close_redis
 # Tracing (export LANGCHAIN_* from settings.langchain, no getenv reads)
 from workshops_ai.tools.tracing import enable_tracing_if_configured
 
+# enable on-demand/full-crash Python stack dumps 
+import faulthandler  
+import signal        
+
 
 # ------------------------------------------------------------------------------
 # Logging (structured-ish)
@@ -101,6 +108,34 @@ _request_id_ctx: ContextVar[str] = ContextVar("request_id", default="")
 def get_request_id() -> str:
     rid = _request_id_ctx.get("")
     return rid or "n/a"
+
+
+# ------------------------------------------------------------------------------
+# Session identifiers (HTTP)
+# ------------------------------------------------------------------------------
+# Keep cookie name aligned with ws_router so both HTTP and WS share the same session.
+SESSION_COOKIE_NAME = "wsai.sid"
+# Custom HTTP header that FE may send alongside or instead of cookie.
+SESSION_HEADER_NAME = "X-Session-Id"
+
+def get_session_id_from_request(req: Request) -> Optional[str]:
+    """
+    Extract session id for HTTP requests. This is used by chat_router as a fallback
+    when the client doesn't send `session_id` in the JSON body.
+
+    Precedence:
+      1) Cookie `wsai.sid` (stable name shared with WS)
+      2) Header `X-Session-Id` (handy for non-cookie environments)
+      3) Legacy/loose header `x-sessionid` (best-effort)
+    """
+    try:
+        sid = req.cookies.get(SESSION_COOKIE_NAME)
+    except Exception:
+        sid = None
+    if sid:
+        return sid
+    # Header fallback
+    return req.headers.get(SESSION_HEADER_NAME) or req.headers.get("x-sessionid")
 
 
 # ------------------------------------------------------------------------------
@@ -261,6 +296,15 @@ async def wizard_exception_handler(_: Request, exc: "WizardException") -> JSONRe
 # ------------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
+    try:
+        # Dumps go to stderr → visible in `docker logs`
+        faulthandler.enable()
+        # Manual dump anytime: `docker kill -s USR2 workshops-ai-api`
+        faulthandler.register(signal.SIGUSR2, all_threads=True)
+    except Exception:
+        # Be tolerant to environments lacking signals (e.g., Windows dev shells)
+        pass
+
     # Export LANGCHAIN_* envs purely from settings (no getenv reads)
     try:
         enable_tracing_if_configured()
@@ -269,9 +313,6 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
 
     # Log redacted settings (no secrets)
     try:
-        # OLD:
-        # logger.info("startup.begin %s", settings.redacted_dict())
-        # NEW (centralized masking):
         logger.info("startup.begin %s", mask_secrets(settings))
     except Exception:
         logger.info("startup.begin")
@@ -368,6 +409,8 @@ def create_app() -> FastAPI:
     app.add_middleware(TimingMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
     # Sessions (cookie + Redis). Secure cookie if env != "dev".
+    # NOTE: we don't force the cookie name here to avoid coupling to middleware internals.
+    #       The helper `get_session_id_from_request()` reads the standard cookie/header names.
     app.add_middleware(SessionMiddleware, secure_cookie=(settings.env != "dev"))
     # HTTP rate-limit (per session/IP per route, fixed 1-minute window)
     app.add_middleware(RateLimitMiddleware)

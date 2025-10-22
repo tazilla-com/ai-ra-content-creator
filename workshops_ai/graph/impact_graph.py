@@ -2,23 +2,22 @@
 # -----------------------------------------------------------------------------
 # LangGraph: IMPACTS tab — LLM-first assistant (clarify-first, one-call-per-turn)
 #
-# This version aligns behavior and UX with the Asset graph:
-#   1) GET intent is routed to node "impact.levels.for_asset" (canonical),
-#      while keeping "impact.asset_get" as an internal alias node.
+# This version aligns behavior and UX with the Asset graph and adds important
+# hardenings:
+#   1) Canonical GET node: "impact.levels.for_asset" (keep "impact.asset_get"
+#      as a compatible alias).
 #   2) Writes submit exactly once per turn via deps.submit_changeset(...).
-#      After submit, we return a unified, short LLM-generated confirmation
-#      and attach two structured UI side-messages:
+#      After submit, we send a short LLM-generated confirmation AND append two
+#      structured side-messages:
 #        • {"kind":"changeset", ...}
-#        • {"kind":"submit_result", ...}  (with queued/submitted semantics)
-#   3) Provides thin graph "runners" so routers can call graph the same way
-#      as in Assets without constructing confirmations themselves:
-#        • run_set_level(...)
-#        • run_bulk_set(...)
-#
-# Other principles preserved:
-#   - Clarify-first: ask ONE concise follow-up when required slots are missing.
-#   - Lists/summaries formatted via ui/formatting.py (title/bullets/chunk/table).
-#   - Explain uses RAG→LLM fallback and renders concise, chunked output.
+#        • {"kind":"submit_result", ...}  (submitted/queued semantics)
+#   3) JSON fallbacks for set/bulk_set/create so callers can post raw JSON.
+#   4) Lightweight write validation (levels 0–4, required fields) + coercion to
+#      plain dicts to keep LangGraph checkpointer serialization safe.
+#   5) Safer UI payload assembly: agent_events are shallow-copied into result to
+#      avoid circular references that could cause RecursionError.
+#   6) Backend call consistency: assets_list(...) signature tolerant (1-arg
+#      or 4-arg) like in Asset graph.
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ import logging
 import time
 from typing import Any, Callable, Literal, Optional, cast, List, Dict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing_extensions import TypedDict
 
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
@@ -41,6 +40,9 @@ from workshops_ai.models.changeset import (
     ChangeSet,
     build_changeset,
 )
+
+# Plain-dict coercion helpers (avoid recursion / non-serializable state)
+from workshops_ai.graph._serde import as_plain_dicts as _as_plain_dicts
 
 # UI formatting helpers (preferred). Provide safe fallbacks if unavailable.
 try:
@@ -93,21 +95,25 @@ Intent = Literal[
 
 
 class ImpactItem(BaseModel):
+    # Single impact assignment (level is 0..4)
     impact_code: str
     level: int = Field(ge=0, le=4)
     note: Optional[str] = None
 
 
 class ImpactSetPayload(BaseModel):
+    # Impact assignments for one asset
     asset_id: str
     items: List[ImpactItem]
 
 
 class ImpactBulkPayload(BaseModel):
+    # Many assets -> many assignments
     entries: List[ImpactSetPayload]
 
 
 class ImpactCreateItem(BaseModel):
+    # Catalog definition upsert
     code: str
     name: str
     category: Optional[str] = None
@@ -150,11 +156,23 @@ class ImpactState(BaseModel):
     # Telemetry
     agent_events: List[ToolEvent] = Field(default_factory=list)
 
+    # Ensure actions are always plain dicts (safe for checkpointer)
+    @field_validator("actions", mode="before")
+    @classmethod
+    def _coerce_actions_to_plain_dicts(cls, v):
+        if v is None:
+            return None
+        try:
+            return _as_plain_dicts(list(v))
+        except Exception:
+            return v
+
 
 # -----------------------------------------------------------------------------
 # Utilities: localization, telemetry, UI payload
 # -----------------------------------------------------------------------------
 def _lang(locale: Optional[str], fallback: str = "en") -> str:
+    """Normalize locale to 'cs' | 'sk' | 'en' (default to 'en')."""
     if not locale:
         return fallback
     l = locale.lower()
@@ -170,7 +188,7 @@ def _lang(locale: Optional[str], fallback: str = "en") -> str:
 def _ui_response(content: str | dict, *, extra: Optional[dict] = None) -> dict:
     """
     Standard UIResponse payload (messages + optional structured data).
-    - content: string (chat bubble) or dict (UI side panel/event)
+    IMPORTANT: never alias agent_events directly to avoid circular refs.
     """
     base = {
         "messages": [content] if isinstance(content, str) else [content],
@@ -179,7 +197,15 @@ def _ui_response(content: str | dict, *, extra: Optional[dict] = None) -> dict:
         "policy": {"emit_changes_enabled": True},
     }
     if extra:
-        base.update(extra)
+        # Shallow-copy agent_events if present
+        ev = extra.get("agent_events")
+        if isinstance(ev, list):
+            base["agent_events"] = [dict(e) for e in ev]
+        # Merge all other extras
+        for k, v in extra.items():
+            if k == "agent_events":
+                continue
+            base[k] = v
     return base
 
 
@@ -388,6 +414,80 @@ async def _nlu(deps: GraphDeps, state: ImpactState) -> ImpactState:
 
 
 # -----------------------------------------------------------------------------
+# Write validation + plain-dict coercion (prevents serialization issues)
+# -----------------------------------------------------------------------------
+def _to_plain_dict(obj: Any) -> dict:
+    """
+    Ensure a JSON-serializable plain dict (avoid Pydantic instances in state.actions).
+    """
+    try:
+        if isinstance(obj, BaseModel):
+            return obj.model_dump(mode="json")
+    except Exception:
+        pass
+    if isinstance(obj, dict):
+        return obj
+    # Last resort: JSON round-trip with __dict__ fallback
+    return json.loads(json.dumps(obj, default=lambda o: getattr(o, "__dict__", str(o))))
+
+
+def _validate_actions(actions: List[dict]) -> tuple[List[dict], Optional[str]]:
+    """
+    Lightweight guardrails for write ops:
+      - set_impacts: asset_id present; items non-empty; each item has impact_code and level in 0..4
+      - upsert_impacts: each item has code+name
+    """
+    out: List[dict] = []
+    for a in actions:
+        op = (a.get("op") or "").strip()
+
+        if op == "set_impacts":
+            aid = a.get("asset_id")
+            items = a.get("items") or []
+            if not aid or not items:
+                return [], "set_impacts requires asset_id and non-empty items"
+            norm_items = []
+            for it in items:
+                code = str((it.get("impact_code") or it.get("code") or "")).strip()
+                lvl = it.get("level")
+                if not code:
+                    return [], "impact item missing impact_code"
+                try:
+                    lvl = int(lvl)
+                except Exception:
+                    return [], f"level for {code} must be integer 0..4"
+                if lvl < 0 or lvl > 4:
+                    return [], f"level for {code} must be in 0..4"
+                norm_items.append({"impact_code": code, "level": lvl, "note": it.get("note")})
+            out.append({"op": "set_impacts", "mode": "merge", "asset_id": aid, "items": norm_items})
+
+        elif op == "upsert_impacts":
+            items = a.get("items") or []
+            if not items:
+                return [], "upsert_impacts requires non-empty items"
+            norm = []
+            for it in items:
+                code = str((it.get("code") or "")).strip()
+                name = str((it.get("name") or "")).strip()
+                if not code or not name:
+                    return [], "each upsert item requires code and name"
+                row = {
+                    "code": code,
+                    "name": name,
+                    "category": it.get("category"),
+                    "description": it.get("description"),
+                    "weight": it.get("weight"),
+                }
+                norm.append({k: v for k, v in row.items() if v is not None})
+            out.append({"op": "upsert_impacts", "items": norm})
+
+        else:
+            return [], f"unsupported operation '{op}'"
+
+    return [_to_plain_dict(x) for x in out], None
+
+
+# -----------------------------------------------------------------------------
 # Clarify (ask ONE concise question when a required slot is missing)
 # -----------------------------------------------------------------------------
 def _clarify_once(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
@@ -437,7 +537,13 @@ def _suggest_select(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
         t0 = _event(state, kind="tool.call.start", tool="suggest_select")
         try:
             backend = _backend(deps)
-            items = (backend.assets_list(org_id=state.org_id) if backend else []) or []
+            # Support both signatures: assets_list(org_id, ...) and assets_list(org_id=...)
+            items = []
+            if backend:
+                try:
+                    items = backend.assets_list(state.org_id, None, None, None) or []
+                except TypeError:
+                    items = backend.assets_list(org_id=state.org_id) or []
             rows: List[List[str]] = []
             for a in items[:10]:  # preview only; not a catalog list
                 d = a.model_dump() if hasattr(a, "model_dump") else dict(a)
@@ -618,8 +724,20 @@ def _set_impact_level(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
     """Set one or more impact levels for a single asset (merge mode)."""
     def _inner(state: ImpactState) -> ImpactState:
         l = _lang(state.locale)
-        payload = state.set_payload
 
+        # JSON fallback: allow {"asset_id":"...", "items":[{impact_code, level, note?}, ...]}
+        if not state.set_payload:
+            try:
+                obj = json.loads(state.message or "{}")
+                if isinstance(obj, dict) and obj.get("asset_id") and isinstance(obj.get("items"), list):
+                    state.set_payload = ImpactSetPayload(
+                        asset_id=obj["asset_id"],
+                        items=[ImpactItem(**it) for it in obj["items"]],
+                    )
+            except Exception:
+                pass
+
+        payload = state.set_payload
         if not payload or not payload.items:
             # If no selection, propose asset list; otherwise ask for items only
             if not (state.selection and state.selection.get("asset_id")):
@@ -630,15 +748,23 @@ def _set_impact_level(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
             state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
             return state
 
+        # Build action and validate
         action = {
             "op": "set_impacts",
             "mode": "merge",
             "asset_id": payload.asset_id,
             "items": [it.model_dump() for it in payload.items],
         }
-        state.actions = [action]
+        validated, err = _validate_actions([action])
+        if err:
+            state.result = _ui_response(
+                {"cs": f"Validace selhala: {err}", "sk": f"Validácia zlyhala: {err}", "en": f"Validation failed: {err}"}[l],
+                extra={"agent_events": state.agent_events},
+            )
+            return state
 
-        # Short pre-submit echo; final confirmation is after submit
+        state.actions = validated  # already plain dicts via _validate_actions → _to_plain_dict
+        # Pre-submit echo; final confirmation is after submit
         last = payload.items[-1]
         echo = {"cs": f"✅ Připraveno nastavit {last.impact_code}={int(last.level)} pro aktivum „{payload.asset_id}“.",
                 "sk": f"✅ Pripravené nastaviť {last.impact_code}={int(last.level)} pre aktívum „{payload.asset_id}“.",
@@ -652,6 +778,26 @@ def _bulk_set_impact_levels(deps: GraphDeps) -> Callable[[ImpactState], ImpactSt
     """Bulk set impact levels across multiple assets (merge mode)."""
     def _inner(state: ImpactState) -> ImpactState:
         l = _lang(state.locale)
+
+        # JSON fallback: allow {"entries":[{"asset_id":"...","items":[{impact_code,level}]} , ...]}
+        if not state.bulk_payload:
+            try:
+                obj = json.loads(state.message or "{}")
+                if isinstance(obj, dict) and isinstance(obj.get("entries"), list):
+                    entries = []
+                    for e in obj["entries"]:
+                        if isinstance(e, dict) and e.get("asset_id") and isinstance(e.get("items"), list):
+                            entries.append(
+                                ImpactSetPayload(
+                                    asset_id=e["asset_id"],
+                                    items=[ImpactItem(**it) for it in e["items"]],
+                                )
+                            )
+                    if entries:
+                        state.bulk_payload = ImpactBulkPayload(entries=entries)
+            except Exception:
+                pass
+
         bulk = state.bulk_payload
         if not bulk or not bulk.entries:
             msg = {"cs": "Chybí entries pro hromadné nastavení.",
@@ -678,7 +824,15 @@ def _bulk_set_impact_levels(deps: GraphDeps) -> Callable[[ImpactState], ImpactSt
             state.result = _ui_response(msg, extra={"agent_events": state.agent_events})
             return state
 
-        state.actions = actions
+        validated, err = _validate_actions(actions)
+        if err:
+            state.result = _ui_response(
+                {"cs": f"Validace selhala: {err}", "sk": f"Validácia zlyhala: {err}", "en": f"Validation failed: {err}"}[l],
+                extra={"agent_events": state.agent_events},
+            )
+            return state
+
+        state.actions = validated
         ready = {"cs": "✅ Připraveno k aplikaci (hromadné nastavení).",
                  "sk": "✅ Pripravené na aplikáciu (hromadné nastavenie).",
                  "en": "✅ Ready to apply (bulk set)."}[l]
@@ -709,7 +863,15 @@ def _create_impact(deps: GraphDeps) -> Callable[[ImpactState], ImpactState]:
             return state
 
         action = {"op": "upsert_impacts", "items": [it.model_dump() for it in items]}
-        state.actions = [action]
+        validated, err = _validate_actions([action])
+        if err:
+            state.result = _ui_response(
+                {"cs": f"Validace selhala: {err}", "sk": f"Validácia zlyhala: {err}", "en": f"Validation failed: {err}"}[l],
+                extra={"agent_events": state.agent_events},
+            )
+            return state
+
+        state.actions = validated
 
         echo = {"cs": f"✅ Připraveno přidat/aktualizovat {len(items)} dopadů.",
                 "sk": f"✅ Pripravené pridať/aktualizovať {len(items)} dopadov.",
@@ -819,18 +981,13 @@ async def _submit_changeset_async(deps: GraphDeps, state: ImpactState) -> Impact
         except Exception:
             cs_dump = {"_error": "cannot_dump_changeset"}
 
-        # Unified messages: confirm + structured changeset + structured submit_result
-        messages: List[Any] = [
-            confirm,
-            {"kind": "changeset", "changeset": cs_dump, "ts": _now_iso()},
-            {"kind": "submit_result", "submitted": ok, "queued": (not ok), "fallback_path": str(fallback_path) if fallback_path else None},
-        ]
+        # Build UI response and append structured side-messages (do not override messages)
+        res = _ui_response(confirm, extra={"changeset_actions": len(acts), "agent_events": state.agent_events})
+        res["messages"].append({"kind": "changeset", "changeset": cs_dump, "ts": _now_iso()})
+        res["messages"].append({"kind": "submit_result", "submitted": ok, "queued": (not ok), "fallback_path": str(fallback_path) if fallback_path else None})
+        state.result = res
 
-        state.result = _ui_response(confirm, extra={
-            "changeset_actions": len(acts),
-            "agent_events": state.agent_events,
-            "messages": messages,  # override with the complete messages list for UI
-        })
+        # Clear write state to avoid re-entry loops
         state.actions = None
         state.change = None
         return state

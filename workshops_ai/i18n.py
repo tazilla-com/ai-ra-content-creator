@@ -151,7 +151,7 @@ I18N: Dict[str, Dict[str, Dict[str, str]]] = {
             "clarify_asset": "Which asset?",
         },
         "assets": {
-            "explain_1": "I’m your AssetAgent. Tell me in plain language what you want to do with assets.",
+            "explain_1": "I’m your Asset Agent. Tell me in plain language what you want to do with assets.",
             "explain_2": "• “Create a CRM asset as primary, type Information system …”",
             "explain_3": "• “Update asset asset-db-001: rename to Customer DB and set primary=false.”",
             "explain_4": "• “List primary Application software containing ‘crm’.”",

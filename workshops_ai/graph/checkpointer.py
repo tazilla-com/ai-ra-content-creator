@@ -1,30 +1,60 @@
 # File: workshops_ai/graph/checkpointer.py
-# -----------------------------------------------------------------------------
-# Purpose
-# LangGraph checkpointer factory with robust async normalization.
-# Order of preference:
-#   1) Redis (WORKSHOPS_AI_REDIS_URL)
-#   2) SQLite (file)
-#   3) Memory (last resort)
-#
-# Guarantees:
-# - Always returns an object that supports aget_tuple / aput / apatch.
-# - If the underlying saver only has sync methods (get / get_tuple / put / patch / update),
-#   we adapt them with a threadpool so LangGraph’s async runtime can use them.
-# - If async methods exist but raise NotImplementedError (stubs), we fall back to sync.
-# - Compatible with LangGraph builds that call aput_writes / apatch_writes.
-# -----------------------------------------------------------------------------
+"""
+Redis-only LangGraph Checkpointer (robust, fail-fast)
+====================================================
+
+Purpose
+-------
+Build a Redis-backed LangGraph checkpointer and **fail fast** if Redis is not
+available or misconfigured. No SQLite or in-memory fallbacks (by request).
+
+Behavior
+--------
+- Reads configuration from provided `settings` and/or environment variables:
+    WORKSHOPS_AI_CHECKPOINTER        → must be "redis"
+    WORKSHOPS_AI_REDIS_URL           → e.g., "redis://redis:6379/0"
+    WORKSHOPS_AI_CHECKPOINT_NS       → key namespace for LangGraph (default: "lg:ckpt")
+                                      (NOTE: this namespace is *not* passed to the saver;
+                                       it is intended for RunnableConfig.configurable.checkpoint_ns)
+    WORKSHOPS_AI_CHECKPOINT_TTL_SEC  → optional default TTL in seconds (int)
+
+- Supports common RedisSaver factories across langgraph-checkpoint-redis versions:
+    RedisSaver.from_url(url, ttl=?)
+    RedisSaver.from_conn_string(url, ttl=?)
+  We try TTL as:
+    1) {"default_ttl": <int>}
+    2) no TTL (persistent keys)
+  We intentionally do not pass "ttl_config" variants that some versions reject.
+
+- Guarantees an **async** surface even if the underlying saver is sync-only:
+    aget_tuple / aput / apatch
+    aput_writes / apatch_writes (compat shims if missing)
+
+Important detail (prevents recursion)
+-------------------------------------
+Some code (e.g., a factory) probes for context-manager methods using hasattr().
+If our adapter *exposes* inner __enter__/__exit__ via __getattr__, that probe may
+try to enter the adapter itself (and/or loop through delegated lookups). To avoid
+this:
+  - The adapter’s __getattr__ explicitly *does not* expose "__enter__" or "__exit__".
+  - We prefer to unwrap context managers ourselves (class-level check) before
+    wrapping into the async adapter.
+
+Notes
+-----
+- No explicit network PING at construction (keeps startup synchronous). If you need
+  connectivity checks, do it in your app startup.
+- Construction failures raise immediately (fail-fast by design).
+"""
 
 from __future__ import annotations
 
-import atexit
 import asyncio
 import inspect
 import logging
 import os
-from contextlib import AbstractContextManager
-from pathlib import Path
-from typing import Any, Optional, Callable
+import atexit
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -32,110 +62,83 @@ __all__ = ["make_checkpointer", "get_checkpointer"]
 
 
 # -----------------------------------------------------------------------------
-# Config helpers
+# Utilities
 # -----------------------------------------------------------------------------
-
 def _parse_int(val: Optional[str]) -> Optional[int]:
+    """Parse string to int or return None; warn on invalid or negative values."""
     if val is None or val == "":
         return None
     try:
-        return int(val)
+        parsed = int(val)
+        if parsed < 0:
+            logger.warning("Negative TTL ignored: %s", val)
+            return None
+        return parsed
     except ValueError:
         logger.warning("Invalid int for WORKSHOPS_AI_CHECKPOINT_TTL_SEC: %s", val)
         return None
 
 
-def _collect_cfg(settings: Any | None) -> dict[str, Any]:
-    env = os.getenv
-    cfg: dict[str, Any] = {}
+def _maybe_enter_context(obj: Any) -> Any:
+    """
+    Enter a *real* context manager without accidentally unwrapping our async adapter.
 
-    if settings is not None:
-        cfg["checkpointer"] = getattr(settings, "checkpointer", None) or getattr(
-            settings, "WORKSHOPS_AI_CHECKPOINTER", None
-        )
-        cfg["redis_url"] = (
-            getattr(settings, "redis_url", None)
-            or getattr(getattr(settings, "redis", None), "url", None)
-            or getattr(settings, "WORKSHOPS_AI_REDIS_URL", None)
-            or getattr(settings, "WORKSHOPS_AI_REDIS__URL", None)
-        )
-        cfg["checkpoint_ns"] = getattr(settings, "checkpoint_ns", None) or getattr(
-            settings, "WORKSHOPS_AI_CHECKPOINT_NS", None
-        )
-        cfg["checkpoint_ttl_sec"] = (
-            getattr(settings, "checkpoint_ttl_sec", None)
-            or getattr(settings, "WORKSHOPS_AI_CHECKPOINT_TTL_SEC", None)
-        )
-        cfg["sqlite_ckpt_path"] = getattr(settings, "sqlite_ckpt_path", None) or getattr(
-            settings, "WORKSHOPS_AI_SQLITE_CKPT_PATH", None
-        )
+    Why:
+      - Our adapter uses __getattr__ for delegation. Instance-level checks like
+        hasattr(obj, "__enter__") could delegate into the wrapped saver and cause
+        the caller to try entering the adapter instead of the inner object.
 
-    cfg["checkpointer"] = (cfg.get("checkpointer") or env("WORKSHOPS_AI_CHECKPOINTER", "")).strip() or None
-    cfg["redis_url"] = (
-        (cfg.get("redis_url") or env("WORKSHOPS_AI_REDIS_URL", "") or env("WORKSHOPS_AI_REDIS__URL", ""))
-        .strip()
-        or None
-    )
-    cfg["checkpoint_ns"] = (cfg.get("checkpoint_ns") or env("WORKSHOPS_AI_CHECKPOINT_NS", "lg:ckpt")).strip()
-    cfg["checkpoint_ttl_sec"] = (
-        cfg.get("checkpoint_ttl_sec") if isinstance(cfg.get("checkpoint_ttl_sec"), int)
-        else _parse_int(env("WORKSHOPS_AI_CHECKPOINT_TTL_SEC", "").strip())
-    )
-    cfg["sqlite_ckpt_path"] = (
-        cfg.get("sqlite_ckpt_path") or env("WORKSHOPS_AI_SQLITE_CKPT_PATH", "/app/workshops_ai/data/state/checkpoints.db")
-    )
-    return cfg
+    Strategy:
+      1) If `obj` is our adapter, return as-is (never unwrap).
+      2) Detect context-manager capability on the **class**, not the instance.
+      3) If it is a CM, call __enter__() and register best-effort atexit cleanup.
+    """
+    # 1) Never unwrap our async adapter
+    if obj.__class__.__name__ == "_AsyncAdapter":
+        return obj
 
-
-# -----------------------------------------------------------------------------
-# Context manager unwrap
-# -----------------------------------------------------------------------------
-
-def _unwrap_context_manager(obj: Any) -> Any:
-    if hasattr(obj, "__enter__") and hasattr(obj, "__exit__"):
-        cm = obj  # type: ignore[assignment]
-        saver = cm.__enter__()  # type: ignore[misc]
-        def _finalize():
-            try:
-                cm.__exit__(None, None, None)  # type: ignore[misc]
-            except Exception:
-                pass
-        atexit.register(_finalize)
-        return saver
-
-    if isinstance(obj, AbstractContextManager):
-        saver = obj.__enter__()
-        def _finalize():
-            try:
-                obj.__exit__(None, None, None)
-            except Exception:
-                pass
-        atexit.register(_finalize)
-        return saver
+    # 2) Check on the class to avoid triggering __getattr__ on the instance
+    cls = type(obj)
+    has_enter = callable(getattr(cls, "__enter__", None))
+    has_exit = callable(getattr(cls, "__exit__", None))
+    if has_enter and has_exit:
+        # 3) Enter and arrange best-effort cleanup
+        entered = obj.__enter__()  # bound to the object; no delegation
+        try:
+            atexit.register(lambda: obj.__exit__(None, None, None))
+        except Exception:
+            pass
+        return entered
 
     return obj
 
 
 # -----------------------------------------------------------------------------
-# Universal async adapter (with NotImplementedError fallback)
+# Universal async adapter
+# Ensures we always expose async methods even if the saver is sync-only or uses
+# different method names across LangGraph versions.
 # -----------------------------------------------------------------------------
-
 class _AsyncAdapter:
     """
-    Wraps any saver and guarantees async surface (aget_tuple/aput/apatch).
-    Prefers native async if present; otherwise runs sync variants in a thread.
-    If a native async method exists but raises NotImplementedError (stub),
-    we gracefully fall back to the sync method.
+    Wrap any saver and guarantee an async surface:
 
-    Also provides compatibility shims for aput_writes / apatch_writes used by
-    newer LangGraph versions; when not present, we fall back to aput/apatch.
+      - aget_tuple / aput / apatch
+      - aput_writes / apatch_writes (compat shims)
+
+    Selection strategy:
+      1) Prefer a native async method if present.
+      2) If missing or raising NotImplementedError → call a sync variant in a thread.
+
+    Recursion prevention:
+      We **do not** expose "__enter__" / "__exit__" via __getattr__. This prevents
+      external hasattr(obj, "__enter__") checks from mistaking the adapter for a
+      context manager and trying to enter it.
     """
 
     def __init__(self, inner: Any):
         self._inner = inner
 
-    # --------- helpers
-    def _get_method(self, *names: str) -> Optional[Callable]:
+    def _get(self, *names: str) -> Optional[Callable]:
         for n in names:
             m = getattr(self._inner, n, None)
             if callable(m):
@@ -146,285 +149,324 @@ class _AsyncAdapter:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: fn(*a, **k))
 
-    async def _run_async_or_fallback_sync(
+    async def _prefer_async_else_sync(
         self,
-        pref_async: tuple[str, ...],
-        fallback_sync: tuple[str, ...],
-        *a, **k
+        async_names: tuple[str, ...],
+        sync_names: tuple[str, ...],
+        *a,
+        **k,
     ):
-        # 1) Try async method (if present)
-        am = self._get_method(*pref_async)
-        if am:
+        # 1) Try async candidates
+        for name in async_names:
+            fn = getattr(self._inner, name, None)
+            if not callable(fn):
+                continue
             try:
-                res = am(*a, **k)
+                try:
+                    res = fn(*a, **k)
+                except TypeError:
+                    # Older signatures may not accept kwargs
+                    res = fn(*a)
                 if inspect.isawaitable(res):
-                    return await res
-                return res
+                    try:
+                        return await res
+                    except NotImplementedError:
+                        # Async surface exists but not implemented → try next/sync
+                        continue
+                    except TypeError:
+                        # Argument mismatch surfaced late → retry without kwargs
+                        res2 = fn(*a)
+                        return await res2 if inspect.isawaitable(res2) else res2
+                else:
+                    # Some "async" APIs may actually be sync; return value directly
+                    return res
             except NotImplementedError:
-                # Async surface exists but is a stub — fall back to sync.
-                pass
+                continue
 
-        # 2) Fallback to sync in a thread
-        sm = self._get_method(*fallback_sync)
-        if sm:
-            return await self._run_in_thread(sm, *a, **k)
+        # 2) Try sync candidates (off the event loop)
+        for name in sync_names:
+            fn = getattr(self._inner, name, None)
+            if not callable(fn):
+                continue
+            try:
+                try:
+                    return await self._run_in_thread(fn, *a, **k)
+                except TypeError:
+                    return await self._run_in_thread(fn, *a)
+            except NotImplementedError:
+                continue
 
         # 3) Nothing usable
         raise NotImplementedError(
-            f"Neither async {pref_async} nor sync {fallback_sync} are implemented on {type(self._inner)}"
+            f"No suitable method on {type(self._inner).__name__}: "
+            f"tried async={async_names} then sync={sync_names}"
         )
 
-    # --------- async API expected by LangGraph
+    # --- LangGraph async API
     async def aget_tuple(self, *a, **k):
-        return await self._run_async_or_fallback_sync(
-            ("aget_tuple",),
-            ("get_tuple", "get"),
-            *a, **k
-        )
+        try:
+            return await self._prefer_async_else_sync(("aget_tuple", "aget"), ("get_tuple", "get"), *a, **k)
+        except (TypeError, NotImplementedError):
+            # Some versions expose only aget/get (no tuple). Normalize to (value, writes).
+            res = await self._prefer_async_else_sync(("aget",), ("get",), *a, **k)
+            return res if isinstance(res, tuple) else (res, None)
 
     async def aput(self, *a, **k):
-        return await self._run_async_or_fallback_sync(
-            ("aput",),
-            ("put",),
-            *a, **k
-        )
+        return await self._prefer_async_else_sync(("aput",), ("put",), *a, **k)
 
     async def apatch(self, *a, **k):
-        return await self._run_async_or_fallback_sync(
-            ("apatch",),
-            ("patch", "update"),
-            *a, **k
-        )
+        return await self._prefer_async_else_sync(("apatch",), ("patch", "update"), *a, **k)
 
-    # --------- compatibility shims for newer LangGraph
     async def aput_writes(self, *a, **k):
-        # Prefer real aput_writes / put_writes if available; otherwise fallback to aput/put
         try:
-            return await self._run_async_or_fallback_sync(
-                ("aput_writes",),
-                ("put_writes", "put"),
-                *a, **k
-            )
+            return await self._prefer_async_else_sync(("aput_writes",), ("put_writes", "put"), *a, **k)
         except NotImplementedError:
+            # Older savers may not support writes-specific methods
             return await self.aput(*a, **k)
 
     async def apatch_writes(self, *a, **k):
-        # Prefer real apatch_writes / patch_writes if available; otherwise fallback to apatch/patch
         try:
-            return await self._run_async_or_fallback_sync(
-                ("apatch_writes",),
-                ("patch_writes", "patch", "update"),
-                *a, **k
-            )
+            return await self._prefer_async_else_sync(("apatch_writes",), ("patch_writes", "patch", "update"), *a, **k)
         except NotImplementedError:
             return await self.apatch(*a, **k)
 
-    # --------- optional surfaces
-    def get_next_version(self, *a, **k):
-        if hasattr(self._inner, "get_next_version"):
-            return getattr(self._inner, "get_next_version")(*a, **k)
-        raise AttributeError("get_next_version not available on inner saver")
-
+    # --- Transparent passthrough for anything else, but do NOT expose CM hooks
     def __getattr__(self, name: str):
-        # Delegate everything else to the inner saver
+        if name in ("__enter__", "__exit__"):
+            # Hide CM methods so hasattr(obj, "__enter__") returns False on adapter
+            raise AttributeError(name)
         return getattr(self._inner, name)
+
+    # Friendlier introspection (optional): hide noisy sync names in dir()
+    def __dir__(self):
+        names = set(dir(self._inner))
+        for n in ("get", "get_tuple", "put", "patch", "update", "put_writes", "patch_writes",
+                  "__enter__", "__exit__"):
+            names.discard(n)
+        names.update({
+            "aget_tuple", "aput", "apatch", "aput_writes", "apatch_writes",
+            "_get", "_run_in_thread", "_prefer_async_else_sync", "_inner",
+        })
+        return sorted(names)
 
 
 def _ensure_async(saver: Any) -> Any:
-    # Always wrap — the adapter prefers native async but will handle fallbacks.
+    """Wrap a saver with the async adapter to provide a consistent async API."""
     return _AsyncAdapter(saver)
 
 
 # -----------------------------------------------------------------------------
-# Redis / SQLite builders
+# Configuration collection (settings → env)
 # -----------------------------------------------------------------------------
+def _collect_cfg(settings: Any | None) -> dict[str, Any]:
+    """
+    Collect and normalize configuration from `settings` and environment variables.
 
-def _make_redis_saver(cfg: dict[str, Any]):
+    Supports both single-underscore and double-underscore env variants:
+      WORKSHOPS_AI_REDIS_URL  and  WORKSHOPS_AI_REDIS__URL
+    """
+    env = os.getenv
+    cfg: dict[str, Any] = {}
+
+    # Prefer settings object, if provided
+    if settings is not None:
+        cfg["checkpointer"] = getattr(settings, "checkpointer", None) or getattr(
+            settings, "WORKSHOPS_AI_CHECKPOINTER", None
+        )
+        cfg["redis_url"] = (
+            getattr(settings, "redis_url", None)
+            or getattr(getattr(settings, "redis", None), "url", None)  # nested settings.redis.url
+            or getattr(settings, "WORKSHOPS_AI_REDIS_URL", None)
+            or getattr(settings, "WORKSHOPS_AI_REDIS__URL", None)
+        )
+        cfg["checkpoint_ns"] = getattr(settings, "checkpoint_ns", None) or getattr(
+            settings, "WORKSHOPS_AI_CHECKPOINT_NS", None
+        )
+        ttl_raw = getattr(settings, "checkpoint_ttl_sec", None) or getattr(
+            settings, "WORKSHOPS_AI_CHECKPOINT_TTL_SEC", None
+        )
+        cfg["checkpoint_ttl_sec"] = ttl_raw
+
+    # Env fallbacks
+    cfg["checkpointer"] = (cfg.get("checkpointer") or env("WORKSHOPS_AI_CHECKPOINTER", "redis")).strip()
+    cfg["redis_url"] = (
+        (cfg.get("redis_url") or env("WORKSHOPS_AI_REDIS_URL", "") or env("WORKSHOPS_AI_REDIS__URL", ""))
+        .strip()
+        or None
+    )
+    cfg["checkpoint_ns"] = (cfg.get("checkpoint_ns") or env("WORKSHOPS_AI_CHECKPOINT_NS", "lg:ckpt")).strip()
+
+    # TTL normalization
+    ttl = cfg.get("checkpoint_ttl_sec")
+    if isinstance(ttl, str):
+        ttl = _parse_int(ttl)
+    if ttl is None:
+        ttl = _parse_int(env("WORKSHOPS_AI_CHECKPOINT_TTL_SEC", "").strip())
+    cfg["checkpoint_ttl_sec"] = ttl  # int | None
+
+    return cfg
+
+
+# -----------------------------------------------------------------------------
+# Redis builders (handle multiple LangGraph signatures; no non-Redis fallbacks)
+# -----------------------------------------------------------------------------
+def _attempt_builder(builder: Callable[..., Any], url: str, ttl_seconds: int) -> Any:
+    """
+    Build a Redis-backed LangGraph saver using the given builder
+    (e.g., RedisSaver.from_url / from_conn_string) with a TTL configuration
+    compatible across langgraph-checkpoint-redis releases.
+    """
+    attempts: list[dict[str, Any]] = []
+
+    # Prefer dict-based TTL config (works on current releases)
+    if ttl_seconds and ttl_seconds > 0:
+        attempts.append({"ttl": {"default_ttl": ttl_seconds}})
+
+    # No-TTL fallback (persistent keys)
+    attempts.append({})
+
+    last_err: Optional[Exception] = None
+    for kw in attempts:
+        try:
+            # Builder may return a raw saver or a context manager
+            saver_or_cm = builder(url, **kw)
+
+            # If a context manager was returned, enter it immediately
+            saver = _maybe_enter_context(saver_or_cm)
+
+            # Optional setup() to create indices etc. (idempotent)
+            setup = getattr(saver, "setup", None)
+            if callable(setup):
+                res = setup()
+                if inspect.isawaitable(res):
+                    logger.warning("RedisSaver.setup() returned awaitable; ignoring in sync context.")
+
+            # Wrap to guarantee async surface
+            wrapped = _ensure_async(saver)
+
+            # Sanity check: catch incompatible int-typed TTL attributes early
+            ttl_attr = getattr(saver, "ttl", None)
+            if isinstance(ttl_attr, int):
+                raise RuntimeError(
+                    "Incompatible TTL type (int) detected on RedisSaver; expected a dict-like TTL config."
+                )
+
+            logger.info(
+                "LangGraph checkpointer ready: %s ttl=%s",
+                getattr(builder, "__name__", "builder"),
+                kw or None,
+            )
+            return wrapped
+        except Exception as e:
+            last_err = e
+            logger.debug(
+                "RedisSaver attempt failed via %s with kwargs=%r, err=%r",
+                getattr(builder, "__name__", "builder"),
+                kw,
+                e,
+            )
+
+    raise RuntimeError(
+        f"RedisSaver build failed for {getattr(builder, '__name__', 'builder')}: {last_err}"
+    )
+
+
+def _build_redis_saver(cfg: dict[str, Any]) -> Any:
+    """
+    Construct a Redis-backed LangGraph checkpointer.
+
+    Order of attempts:
+      1) Full RedisSaver via from_url → from_conn_string
+      2) ShallowRedisSaver (still Redis, no JSON/FT modules) via from_url → from_conn_string
+      3) If all fail → raise (fail-fast, no SQLite/memory)
+    """
     url = cfg.get("redis_url")
     if not url:
-        raise RuntimeError("Redis URL not provided")
+        raise RuntimeError("Redis URL not provided (WORKSHOPS_AI_REDIS_URL is empty).")
 
+    ttl_seconds = int(cfg.get("checkpoint_ttl_sec") or 0)
+
+    # Import primary and shallow Redis savers
     try:
         from langgraph.checkpoint.redis import RedisSaver  # type: ignore
     except Exception as e:
-        raise RuntimeError(f"RedisSaver import failed: {e}") from e
+        raise RuntimeError(
+            "langgraph-checkpoint-redis is required but not importable. "
+            "Install it and ensure compatible LangGraph versions."
+        ) from e
 
-    ns = cfg.get("checkpoint_ns") or "lg:ckpt"
-    ttl = cfg.get("checkpoint_ttl_sec")
-    ttl_seconds = int(ttl) if ttl else 0
-    # IMPORTANT: Always pass a dict for TTL to avoid "int is not iterable" in some builds.
-    ttl_map = {"default_ttl": ttl_seconds} if ttl_seconds > 0 else None
+    try:
+        from langgraph.checkpoint.redis.shallow import ShallowRedisSaver  # type: ignore
+    except Exception:
+        ShallowRedisSaver = None  # type: ignore
 
-    def _supported_kwargs(factory: Any) -> set[str]:
-        try:
-            return set(inspect.signature(factory).parameters.keys())
-        except Exception:
-            return set()
-
-    def _build_kwargs(supported: set[str]) -> dict[str, Any]:
-        kw: dict[str, Any] = {}
-        # namespace compatibility
-        if "namespace" in supported:
-            kw["namespace"] = ns
-        elif "ns" in supported:
-            kw["ns"] = ns
-        # ttl mapping (prefer ttl_config, fallback to legacy "ttl" but still a dict)
-        if ttl_map:
-            if "ttl_config" in supported:
-                kw["ttl_config"] = ttl_map
-            elif "ttl" in supported:
-                kw["ttl"] = ttl_map
-        return kw
-
-    # Prefer helper constructors first
+    # 1) Full RedisSaver — prefer from_url, then from_conn_string
     if hasattr(RedisSaver, "from_url"):
         try:
-            kwargs = _build_kwargs(_supported_kwargs(RedisSaver.from_url))
-            saver = RedisSaver.from_url(url, **kwargs)  # type: ignore[call-arg]
-            saver = _unwrap_context_manager(saver)
-            saver = _ensure_async(saver)
-            logger.info(
-                "LangGraph checkpointer: Redis via from_url (ns=%s, ttl_config=%s)",
-                kwargs.get("namespace") or kwargs.get("ns"),
-                kwargs.get("ttl_config") or kwargs.get("ttl"),
-            )
-            return saver
+            return _attempt_builder(RedisSaver.from_url, url, ttl_seconds)  # type: ignore[arg-type]
         except Exception as e:
             logger.warning("RedisSaver.from_url failed: %s", e)
-
     if hasattr(RedisSaver, "from_conn_string"):
         try:
-            kwargs = _build_kwargs(_supported_kwargs(RedisSaver.from_conn_string))
-            saver = RedisSaver.from_conn_string(url, **kwargs)  # type: ignore[call-arg]
-            saver = _unwrap_context_manager(saver)
-            saver = _ensure_async(saver)
-            logger.info(
-                "LangGraph checkpointer: Redis via from_conn_string (ns=%s, ttl_config=%s)",
-                kwargs.get("namespace") or kwargs.get("ns"),
-                kwargs.get("ttl_config") or kwargs.get("ttl"),
-            )
-            return saver
+            return _attempt_builder(RedisSaver.from_conn_string, url, ttl_seconds)  # type: ignore[arg-type]
         except Exception as e:
             logger.warning("RedisSaver.from_conn_string failed: %s", e)
 
-    # Fallback: construct with client (broad compatibility)
-    try:
-        from redis.asyncio import Redis as AsyncRedis  # type: ignore
-    except Exception as e:
-        raise RuntimeError(f"redis-py (async) not installed: {e}") from e
+    # 2) ShallowRedisSaver (still Redis) — if available
+    if ShallowRedisSaver is not None:
+        if hasattr(ShallowRedisSaver, "from_url"):
+            try:
+                return _attempt_builder(ShallowRedisSaver.from_url, url, ttl_seconds)  # type: ignore[arg-type]
+            except Exception as e:
+                logger.warning("ShallowRedisSaver.from_url failed: %s", e)
+        if hasattr(ShallowRedisSaver, "from_conn_string"):
+            try:
+                return _attempt_builder(ShallowRedisSaver.from_conn_string, url, ttl_seconds)  # type: ignore[arg-type]
+            except Exception as e:
+                logger.warning("ShallowRedisSaver.from_conn_string failed: %s", e)
 
-    try:
-        client = AsyncRedis.from_url(url, decode_responses=False)
-
-        ctor_supported = _supported_kwargs(RedisSaver)
-        saver_kwargs: dict[str, Any] = {"client": client}
-
-        if "namespace" in ctor_supported:
-            saver_kwargs["namespace"] = ns
-        elif "ns" in ctor_supported:
-            saver_kwargs["ns"] = ns
-
-        if ttl_map:
-            if "ttl_config" in ctor_supported:
-                saver_kwargs["ttl_config"] = ttl_map
-            elif "ttl" in ctor_supported:
-                saver_kwargs["ttl"] = ttl_map
-
-        try:
-            saver = RedisSaver(**saver_kwargs)  # type: ignore[call-arg]
-        except TypeError:
-            # Very old signature — no kwargs except client
-            saver = RedisSaver(client=client)  # type: ignore[call-arg]
-
-        saver = _unwrap_context_manager(saver)
-        saver = _ensure_async(saver)
-        logger.info("LangGraph checkpointer: Redis via client (ns=%s, ttl_config=%s)", ns, ttl_map)
-        return saver
-    except Exception as e:
-        raise RuntimeError(f"RedisSaver(client=...) failed: {e}") from e
-
-
-def _make_sqlite_saver(cfg: dict[str, Any]):
-    try:
-        from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore
-    except Exception as e:
-        raise RuntimeError(f"SqliteSaver import failed: {e}") from e
-
-    path = Path(cfg.get("sqlite_ckpt_path") or "/app/workshops_ai/data/state/checkpoints.db")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        logger.warning("mkdir for sqlite parent failed (%s): %s", path.parent, e)
-
-    attempts: list[tuple[str, Callable[[], Any]]] = []
-    if hasattr(SqliteSaver, "from_conn_string"):
-        attempts.append(("from_conn_string", lambda: SqliteSaver.from_conn_string(f"sqlite:///{path}")))
-    if hasattr(SqliteSaver, "from_url"):
-        attempts.append(("from_url", lambda: SqliteSaver.from_url(f"sqlite:///{path}")))  # type: ignore[attr-defined]
-    attempts.append(("ctor", lambda: SqliteSaver(str(path))))  # type: ignore[call-arg]
-
-    last_err: Optional[Exception] = None
-    for name, build in attempts:
-        try:
-            saver = build()
-            saver = _unwrap_context_manager(saver)
-            saver = _ensure_async(saver)
-            logger.info("LangGraph checkpointer: SQLite (%s via %s)", str(path), name)
-            return saver
-        except Exception as e:
-            last_err = e
-
-    raise RuntimeError(f"SqliteSaver construction failed: {last_err}")
+    # 3) Give up — Redis-only policy, so we do not degrade to memory/SQLite
+    raise RuntimeError(
+        "Unable to construct a Redis-backed LangGraph checkpointer. "
+        "Ensure Redis is reachable and the installed langgraph / langgraph-checkpoint-redis "
+        "versions support your environment (consider redis/redis-stack if modules are required)."
+    )
 
 
 # -----------------------------------------------------------------------------
 # Public API
 # -----------------------------------------------------------------------------
-
-def make_checkpointer(prefer: Optional[str] = None, settings: Any | None = None) -> Any:
+def make_checkpointer(settings: Any | None = None) -> Any:
     """
-    Build and return an async-capable LangGraph checkpointer saver.
-    Resolution:
-      1) Explicit 'prefer' if provided.
-      2) Settings/env preference.
-      3) Otherwise Redis if URL present; else SQLite; else Memory.
+    Build and return a Redis-backed LangGraph checkpointer.
+
+    Rules:
+      - WORKSHOPS_AI_CHECKPOINTER must be "redis" (or settings.checkpointer == "redis").
+      - WORKSHOPS_AI_REDIS_URL must be set (e.g., "redis://redis:6379/0").
+      - No fallback to SQLite or Memory. If we cannot construct RedisSaver, raise.
+
+    Additionally:
+      - If the saver (unexpectedly) is a context manager, we **enter and unwrap**
+        it here so LangGraph receives the actual saver object (with required methods),
+        and then we wrap it with our async adapter.
     """
     cfg = _collect_cfg(settings)
 
-    target = (prefer or cfg.get("checkpointer") or "").strip().lower()
-    if not target:
-        target = "redis" if cfg.get("redis_url") else "sqlite"
+    target = (cfg.get("checkpointer") or "redis").strip().lower()
+    if target != "redis":
+        raise RuntimeError(
+            f"checkpointer must be 'redis' (no fallbacks). Got: {target!r}. "
+            "Set WORKSHOPS_AI_CHECKPOINTER=redis."
+        )
 
-    if target == "redis":
-        try:
-            return _make_redis_saver(cfg)
-        except Exception as e:
-            logger.warning("Falling back from Redis checkpointer: %s", e)
-            try:
-                return _make_sqlite_saver(cfg)
-            except Exception as e2:
-                logger.warning("Falling back from SQLite checkpointer: %s", e2)
-    elif target == "sqlite":
-        try:
-            return _make_sqlite_saver(cfg)
-        except Exception as e:
-            logger.warning("Falling back from SQLite checkpointer: %s", e)
-            if cfg.get("redis_url"):
-                try:
-                    return _make_redis_saver(cfg)
-                except Exception as e2:
-                    logger.warning("Falling back from Redis checkpointer: %s", e2)
+    saver = _build_redis_saver(cfg)
 
-    # Final fallback: memory
-    try:
-        from langgraph.checkpoint.memory import MemorySaver  # type: ignore
-        saver = MemorySaver()
-        saver = _ensure_async(saver)
-        logger.info("LangGraph checkpointer: Memory (no persistence)")
-        return saver
-    except Exception as e:
-        raise RuntimeError(f"MemorySaver import failed: {e}") from e
+    # Defensive: if the saver itself is (unexpectedly) a context manager, unwrap it.
+    saver = _maybe_enter_context(saver)
+
+    return saver
 
 
 def get_checkpointer(settings: Any | None = None) -> Any:
+    """Alias used by factories/manager to build the Redis-backed checkpointer."""
     return make_checkpointer(settings=settings)

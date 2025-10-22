@@ -24,7 +24,7 @@ services:
       - WORKSHOPS_AI_RAG__EMBED_PROVIDER=fastembed
       - WORKSHOPS_AI_RAG__EMBED_MODEL=BAAI/bge-small-en-v1.5
     volumes:
-      - chroma_data:/var/lib/chroma
+      - chroma_data:/workshops_ai/data/chroma
 
 volumes:
   chroma_data:
@@ -54,7 +54,7 @@ EF mismatch errors: older Chroma versions may lock an embedding function per col
 Useful env (summary)
 WORKSHOPS_AI_RAG__STORE=chroma
 
-WORKSHOPS_AI_RAG__DATA_DIR=/var/lib/chroma
+WORKSHOPS_AI_RAG__DATA_DIR=/workshops_ai/data/chroma
 
 WORKSHOPS_AI_RAG__NAMESPACE=rag
 

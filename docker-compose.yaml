@@ -16,17 +16,21 @@ services:
       APP_PORT: ${APP_PORT:-8000}
       PORT: ${APP_PORT:-8000}
 
-      # RAG under /app/workshops_ai (no writes to /app/data required, but we guard it anyway)
+      # DIAG mód – zapne crashpacky
+      WSAI_DIAG: "1"
+
+      # RAG (Chroma store)
       WORKSHOPS_AI_RAG__DATA_DIR: /app/workshops_ai/data/chroma
       WORKSHOPS_AI_RAG__CHROMA_DIR: ${WORKSHOPS_AI_RAG__CHROMA_DIR:-}
 
-      # LangGraph checkpointer
+      # LangGraph checkpointer (Redis)
       WORKSHOPS_AI_CHECKPOINTER: ${WORKSHOPS_AI_CHECKPOINTER:-redis}
       WORKSHOPS_AI_REDIS_URL: ${WORKSHOPS_AI_REDIS_URL:-redis://redis:6379/0}
+      # některé buildy používají dvojité podtržítko – necháváme obojí pro jistotu
       WORKSHOPS_AI_REDIS__URL: ${WORKSHOPS_AI_REDIS__URL:-redis://redis:6379/0}
-      WORKSHOPS_AI_SQLITE_CKPT_PATH: /app/workshops_ai/data/state/checkpoints.db
       WORKSHOPS_AI_CHECKPOINT_NS: ${WORKSHOPS_AI_CHECKPOINT_NS:-lg:ckpt}
-      WORKSHOPS_AI_CHECKPOINT_TTL_SEC: ${WORKSHOPS_AI_CHECKPOINT_TTL_SEC:-1209600}
+      # TTL v sekundách
+      WORKSHOPS_AI_CHECKPOINT_TTL_SEC: ${WORKSHOPS_AI_CHECKPOINT_TTL_SEC:-60}
 
       # Auth
       WORKSHOPS_AI_SECURITY__ENABLE_API_KEY: ${WORKSHOPS_AI_SECURITY__ENABLE_API_KEY:-true}
@@ -55,8 +59,8 @@ services:
 
       # Telemetry
       WORKSHOPS_AI_TELEMETRY__ENABLED: ${WORKSHOPS_AI_TELEMETRY__ENABLED:-true}
-      WORKSHOPS_AI_TELEMETRY__LEVEL: ${WORKSHOPS_AI_TELEMETRY__LEVEL:-INFO}
-      WORKSHOPS_AI_TELEMETRY__LOG_TO_FILE: ${WORKSHOPS_AI_TELEMETRY__LOG_TO_FILE:-false}
+      WORKSHOPS_AI_TELEMETRY__LEVEL: ${WORKSHOPS_AI_TELEMETRY__LEVEL:-DEBUG}
+      WORKSHOPS_AI_TELEMETRY__LOG_TO_FILE: ${WORKSHOPS_AI_TELEMETRY__LOG_TO_FILE:-true}
       WORKSHOPS_AI_TELEMETRY__LOG_FILE_PATH: ${WORKSHOPS_AI_TELEMETRY__LOG_FILE_PATH:-/app/logs/workshops_ai.log}
       WORKSHOPS_AI_TELEMETRY__MAX_PAYLOAD_LEN: ${WORKSHOPS_AI_TELEMETRY__MAX_PAYLOAD_LEN:-16000}
 
@@ -71,13 +75,25 @@ services:
       WORKSHOPS_AI_CHAT__TIMEOUT_SEC: ${WORKSHOPS_AI_CHAT__TIMEOUT_SEC:-180}
       WORKSHOPS_AI_CHAT__MAX_MESSAGE_LEN: ${WORKSHOPS_AI_CHAT__MAX_MESSAGE_LEN:-4000}
 
+      # Logging quality-of-life
+      PYTHONUNBUFFERED: "1"
+
     volumes:
       - ./workshops_ai/data:/app/workshops_ai/data
       - ./logs:/app/logs
 
+    healthcheck:
+      # /healthcheck.py je zkopírován v Dockerfile
+      test: ["CMD", "python", "/healthcheck.py"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
+
     restart: unless-stopped
 
   redis:
@@ -86,9 +102,16 @@ services:
     ports:
       - "6379:6379"
     environment:
+      # žádné AOF/snapshoty pro lokální dev; moduly (JSON/FT) jsou součástí redis-stack
       REDIS_ARGS: --save "" --appendonly no
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "PING"]
+      interval: 5s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
     restart: unless-stopped
 
 volumes:
