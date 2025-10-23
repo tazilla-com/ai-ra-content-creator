@@ -50,6 +50,7 @@ class SecuritySettings(BaseModel):
     Authentication & authorization settings.
 
     ENV mapping (examples):
+      WORKSHOPS_AI_SECURITY__DISABLE_ALL_AUTH=true
       WORKSHOPS_AI_SECURITY__ENABLE_API_KEY=true
       WORKSHOPS_AI_SECURITY__API_KEYS=["K1","K2"]
       WORKSHOPS_AI_SECURITY__ENABLE_JWT=true
@@ -59,6 +60,11 @@ class SecuritySettings(BaseModel):
       WORKSHOPS_AI_SECURITY__JWT_AUDIENCE=workshops-ai
       WORKSHOPS_AI_SECURITY__JWKS_URL=https://auth.example.com/.well-known/jwks.json
     """
+
+    disable_all_auth: bool = Field(
+        default=False,
+        description="Disable all authentication",
+    )
 
     # --- API Key auth ---
     enable_api_key: bool = Field(

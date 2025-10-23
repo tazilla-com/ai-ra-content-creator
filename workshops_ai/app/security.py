@@ -162,6 +162,9 @@ def _choose_identity(headers: Dict[str, str], query: Dict[str, str]) -> Dict[str
     """
     sec = get_settings().security
 
+    if sec.disable_all_auth:
+        return {"sub": "system", "method": "disabled"}
+
     if sec.enable_api_key:
         ident = _validate_api_key(_extract_api_key(headers, query))
         if ident:
@@ -173,13 +176,11 @@ def _choose_identity(headers: Dict[str, str], query: Dict[str, str]) -> Dict[str
             return ident
 
     if not sec.enable_api_key and not sec.enable_jwt:
-        # Fail-closed: at least one auth mechanism must be enabled.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="No authentication method is enabled.",
         )
 
-    # Methods are enabled but nothing validated.
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
 

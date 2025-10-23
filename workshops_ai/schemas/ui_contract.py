@@ -154,7 +154,18 @@ class UIRequest(BaseModel):
         description="If true, user expects staging semantics (used by some non-asset flows).",
     )
 
-    user_id: Optional[StrictStr] = Field(default=None, description="Authenticated user identifier.")
+    user_id: Optional[StrictStr] = Field(
+        default=None,
+        description="User identifier (deprecated - use identity from auth instead)",
+        deprecated=True
+    )
+
+    # Auth identity (populated by security middleware)
+    identity: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Authentication identity from security layer",
+        exclude=True  # Not exposed in API docs
+    )
 
     # Wizard / enrichment (optional, tolerated to keep the contract flexible)
     session_id: Optional[StrictStr] = Field(default=None, description="Client session identifier.")

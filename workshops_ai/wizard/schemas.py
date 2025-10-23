@@ -15,23 +15,6 @@ from workshops_ai.api.schema.threat import AssetRisk
 from workshops_ai.api.schema.control import AssetControls
 
 # ===================================================================================
-# Sector Values (Fixed List)
-# ===================================================================================
-
-SECTOR_VALUES = [
-    "Digital infrastructure",
-    "Transport",
-    "Energy",
-    "Finance",
-    "Financial markets infrastructure",
-    "Post",
-    "Industry",
-    "Public administration",
-    "Water and atmosphere",
-    "Health",
-]
-
-# ===================================================================================
 # Domain Models
 # ===================================================================================
 
@@ -47,20 +30,9 @@ class Service(BaseModel):
         None,
         description="Description of the service, its function, or business relevance."
     )
-    sector: Optional[Literal[
-        "Digital infrastructure",
-        "Transport",
-        "Energy",
-        "Finance",
-        "Financial markets infrastructure",
-        "Post",
-        "Industry",
-        "Public administration",
-        "Water and atmosphere",
-        "Health"
-    ]] = Field(
+    sector: Optional[str] = Field(
         None,
-        description="Optional sector classification. Fixed code list; must not be translated."
+        description="Optional sector classification. Must match catalog; must not be translated."
     )
 
 # ===================================================================================

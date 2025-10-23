@@ -441,7 +441,13 @@ def create_app() -> FastAPI:
     app.add_exception_handler(Exception, unhandled_exception_handler)
 
     # Health & meta (hidden from API docs - wizard-only API)
-    @app.get("/health", tags=["_meta"], response_class=_DEFAULT_RESPONSE_CLASS, include_in_schema=False)
+    @app.get(
+        "/health",
+        tags=["Health"],
+        response_class=_DEFAULT_RESPONSE_CLASS,
+        summary="Health check endpoint",
+        description="Returns application health status, version, and environment information"
+    )
     async def health() -> dict[str, Any]:
         return {
             "status": "ok",
@@ -657,6 +663,29 @@ def create_app() -> FastAPI:
         app.include_router(router)
 
     _mount_or_fallback("wizard_router", _mount_wizard, _fallback_wizard)
+
+    # /session (Session management)
+    def _mount_session():
+        from workshops_ai.routers.session_router import router as session_router
+        app.include_router(session_router, tags=["Session"], dependencies=_AUTH_DEP)
+
+    def _fallback_session():
+        router = APIRouter()
+        @router.get(
+            "/session/",
+            tags=["Session"],
+            response_class=_DEFAULT_RESPONSE_CLASS,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            include_in_schema=False,
+        )
+        async def session_not_ready() -> dict[str, Any]:
+            return {
+                "error": {"type": "not_ready", "message": "Session router not mounted."},
+                "request_id": get_request_id(),
+            }
+        app.include_router(router)
+
+    _mount_or_fallback("session_router", _mount_session, _fallback_session)
 
     # /scrape (Web scraping endpoints)
     def _mount_scrape():

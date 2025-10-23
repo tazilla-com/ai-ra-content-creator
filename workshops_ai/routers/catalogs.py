@@ -628,3 +628,74 @@ async def get_control_category_catalog(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to load control category catalog: {str(e)}"
         )
+
+
+@router.get(
+    "/sectors",
+    response_model=CategoryCatalogResponse,
+    summary="Get Sectors catalog",
+    description="Retrieve the official Sectors catalog with localized names"
+)
+async def get_sector_catalog(
+    language: str = Query(
+        default="en",
+        regex="^(en|sk|cs)$",
+        description="Language code for localized names (en/sk/cs)"
+    ),
+    x_session_id: Optional[str] = Header(
+        None,
+        alias="X-Session-Id",
+        description="Session ID for client-specific catalogs (optional for CSV provider)"
+    )
+) -> CategoryCatalogResponse:
+    """
+    Get Sectors catalog with localized names.
+
+    Args:
+        language: Language code (en/sk/cs)
+        x_session_id: Session ID for client-specific catalogs
+
+    Returns:
+        CategoryCatalogResponse with list of sectors
+
+    Raises:
+        HTTPException: If catalog loading fails
+    """
+    try:
+        provider = get_catalog_provider()
+        sectors_data = await provider.load_sector_catalog(
+            language=language,
+            session_id=x_session_id
+        )
+
+        sectors = [CategoryItem(**item) for item in sectors_data]
+
+        logger.info(
+            "sector_catalog_retrieved",
+            extra={
+                "language": language,
+                "session_id": x_session_id,
+                "count": len(sectors),
+            }
+        )
+
+        return CategoryCatalogResponse(
+            language=language,
+            total=len(sectors),
+            categories=sectors
+        )
+
+    except Exception as e:
+        logger.error(
+            "sector_catalog_load_failed",
+            extra={
+                "language": language,
+                "session_id": x_session_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load sector catalog: {str(e)}"
+        )

@@ -100,7 +100,7 @@ async def get_session_id(
        - Return session ID
 
     Returns:
-        Session ID (format: 22 random base64url characters)
+        Session ID (format: 1-40 alphanumeric characters)
 
     Raises:
         HTTPException:
@@ -115,7 +115,7 @@ async def get_session_id(
         if not validate_session_id(x_session_id):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid session ID format. Expected: 22 alphanumeric characters (a-z, A-Z, 0-9, _, -)"
+                detail="Invalid session ID format. Expected: 1-40 alphanumeric characters (a-z, A-Z, 0-9, _, -)"
             )
 
         response.headers["X-Session-Id"] = x_session_id
@@ -301,6 +301,7 @@ async def generate_services(
             organization_profile=organization_profile,
             user_instructions=request.user_instructions,
             previous_services=previous_services,
+            session_id=session_id,
         )
 
         logger.info(
@@ -1279,6 +1280,7 @@ async def generate_evaluation(
                 organization_profile=organization_profile,
                 user_instructions=None,  # Not exposed in evaluation mode
                 previous_services=None,
+                session_id=session_id,
             )
 
             results.services = services
@@ -1677,61 +1679,3 @@ async def generate_evaluation(
     return output
 
 
-# =============================================================================
-# State Management
-# =============================================================================
-
-@router.get(
-    "/state",
-    response_model=WizardStateResponse,
-    summary="Get wizard state",
-    description="Retrieve current wizard state for user"
-)
-async def get_state(
-    session_id: str = Depends(get_session_id),
-) -> WizardStateResponse:
-    """
-    Get current wizard state from Redis.
-    """
-    logger.info(
-        "Wizard: get state",
-        extra={"session_id": session_id}
-    )
-
-    state = await get_wizard_state(session_id)
-
-    # Extract completed steps
-    steps_completed = [
-        step for step in [
-            "services", "assets", "impacts",
-            "risks", "controls", "evaluation"
-        ]
-        if step in state
-    ]
-
-    return WizardStateResponse(
-        session_id=session_id,
-        steps_completed=steps_completed,
-        data=state
-    )
-
-
-@router.delete(
-    "/state",
-    summary="Clear wizard state",
-    description="Clear all wizard state for user (reset wizard)"
-)
-async def clear_state(
-    session_id: str = Depends(get_session_id),
-) -> Dict[str, str]:
-    """
-    Clear wizard state from Redis.
-    """
-    logger.info(
-        "Wizard: clear state",
-        extra={"session_id": session_id}
-    )
-
-    await clear_wizard_state(session_id)
-
-    return {"message": "Wizard state cleared successfully"}

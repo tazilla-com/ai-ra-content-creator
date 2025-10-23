@@ -19,9 +19,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Session ID format: 22 characters of base64url (from secrets.token_urlsafe(16))
-# Example: nOB3VEiMhk8AyxQvz9m_8A
-SESSION_ID_PATTERN = re.compile(r'^[a-zA-Z0-9_-]{22}$')
+SESSION_ID_PATTERN = re.compile(r'^[a-zA-Z0-9_-]{1,40}$')
 
 
 def validate_session_id(session_id: str) -> bool:

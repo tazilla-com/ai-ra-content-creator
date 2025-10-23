@@ -93,6 +93,15 @@ class CatalogProvider(ABC):
         """Load control category catalog with localization."""
         pass
 
+    @abstractmethod
+    async def load_sector_catalog(
+        self,
+        language: str,
+        session_id: Optional[str] = None
+    ) -> List[Dict[str, str]]:
+        """Load sector catalog with localization."""
+        pass
+
 
 # =============================================================================
 # CSV Provider (Dev/Mockup)
@@ -173,6 +182,16 @@ class CSVCatalogProvider(CatalogProvider):
     ) -> List[Dict[str, str]]:
         """Load control category catalog from CSV file."""
         from workshops_ai.wizard.catalog_loader import load_control_category_catalog as _load
+
+        return _load(language=language, session_id=None)
+
+    async def load_sector_catalog(
+        self,
+        language: str,
+        session_id: Optional[str] = None
+    ) -> List[Dict[str, str]]:
+        """Load sector catalog from CSV file."""
+        from workshops_ai.wizard.catalog_loader import load_sector_catalog as _load
 
         return _load(language=language, session_id=None)
 
@@ -492,6 +511,26 @@ class TazillaAPICatalogProvider(CatalogProvider):
                 raise ValueError(f"Category at index {idx} missing fields: {missing}")
 
         return categories
+
+    async def load_sector_catalog(
+        self,
+        language: str,
+        session_id: Optional[str] = None
+    ) -> List[Dict[str, str]]:
+        """Fetch sector catalog from Tazilla API."""
+        data = await self._fetch_catalog("sectors", language, session_id)
+
+        sectors = data.get("sectors", [])
+
+        for idx, item in enumerate(sectors):
+            if not isinstance(item, dict):
+                raise ValueError(f"Invalid sector at index {idx}: expected dict")
+            required = ["name", "description"]
+            missing = [f for f in required if f not in item]
+            if missing:
+                raise ValueError(f"Sector at index {idx} missing fields: {missing}")
+
+        return sectors
 
     async def close(self):
         """Close HTTP client connection."""

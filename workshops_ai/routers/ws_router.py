@@ -119,6 +119,8 @@ class Conn:
     # - lang_iso: the normalized ISO primary tag used for agents, e.g., "cs"
     accept_language: Optional[str] = None
     lang_iso: Optional[str] = None
+    # Auth identity (from security middleware)
+    identity: Optional[dict] = None
 
 
 # -----------------------------------------------------------------------------
@@ -216,6 +218,7 @@ def _build_ui_request(state: Conn, message: str, *, staging: bool = False) -> UI
         session_id=state.sid,          # lets manager compute thread id or use provided session
         conn_id=state.conn_id,         # explicit conn_id → manager can uuid5(org, conn_id|user_id)
         language=state.lang_iso or _to_iso_primary(state.accept_language),
+        identity=state.identity,       # auth identity from security middleware
         # Optionally include locale (canonical tag) if UIRequest supports it:
         # locale=state.accept_language,
     )
@@ -298,6 +301,9 @@ async def ws_endpoint(
     sid = ws.cookies.get(COOKIE_NAME)
     rid = get_request_id() or "n/a"
 
+    # Extract auth identity (populated by verify_ws_auth)
+    identity = getattr(ws.state, "identity", None)
+
     # Decide language once (per connection) and "lock" it into the Conn
     lang_tag, lang_iso = _choose_lang(
         accept_language,
@@ -315,6 +321,7 @@ async def ws_endpoint(
         staging=DEFAULT_STAGING,
         accept_language=lang_tag,  # canonical tag (e.g., "cs-CZ")
         lang_iso=lang_iso,         # normalized ISO (e.g., "cs")
+        identity=identity,         # auth identity from security middleware
     )
 
     # Send hello with both values so the UI can clearly see what was chosen

@@ -20,7 +20,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
 from workshops_ai.settings import get_settings
-from workshops_ai.wizard.schemas import Service, SECTOR_VALUES
+from workshops_ai.wizard.schemas import Service
 from workshops_ai.wizard.prompts import (
     SERVICES_SYSTEM_PROMPT,
     SERVICES_HUMAN_PROMPT_TEMPLATE,
@@ -32,6 +32,7 @@ from workshops_ai.wizard.exceptions import (
     ValidationRetriesExhausted,
     ModelNotAllowedError,
 )
+from workshops_ai.wizard.catalog_provider import get_catalog_provider
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +150,8 @@ class ServiceGenerator:
         self,
         language: str,
         number: int,
-        sections: Dict[str, str]
+        sections: Dict[str, str],
+        valid_sectors: List[str]
     ) -> str:
         """
         Build full prompt text for debugging.
@@ -159,7 +161,7 @@ class ServiceGenerator:
         human_prompt = SERVICES_HUMAN_PROMPT_TEMPLATE.format(
             number=number,
             language=language,
-            valid_sectors=", ".join(SECTOR_VALUES),
+            valid_sectors=", ".join(valid_sectors),
             **sections
         )
 
@@ -261,13 +263,15 @@ class ServiceGenerator:
 
     def _parse_and_validate_services(
         self,
-        response_text: str
+        response_text: str,
+        valid_sectors: List[str]
     ) -> List[Service]:
         """
         Parse JSON response and validate services.
 
         Args:
             response_text: Raw LLM response
+            valid_sectors: List of valid sector names
 
         Returns:
             List of validated Service objects
@@ -309,7 +313,7 @@ class ServiceGenerator:
                 try:
                     # Validate sector value
                     sector = service_dict.get("sector")
-                    if sector and sector not in SECTOR_VALUES:
+                    if sector and sector not in valid_sectors:
                         logger.warning(
                             f"Invalid sector '{sector}' at index {idx}, setting to None"
                         )
@@ -342,6 +346,7 @@ class ServiceGenerator:
         organization_profile: Optional[Dict[str, Any]] = None,
         user_instructions: Optional[str] = None,
         previous_services: Optional[List[Service]] = None,
+        session_id: Optional[str] = None,
     ) -> Tuple[List[Service], UsageMetrics, Dict[str, Any]]:
         """
         Generate services from website content.
@@ -353,6 +358,7 @@ class ServiceGenerator:
             organization_profile: Optional organization metadata
             user_instructions: Optional user refinement instructions
             previous_services: Optional previous services for refinement
+            session_id: Session ID for client-specific catalogs
 
         Returns:
             Tuple of (services list, usage metrics, debug info dict)
@@ -364,6 +370,14 @@ class ServiceGenerator:
         """
         # Clamp number of services to valid range
         number_of_services = max(1, min(3, number_of_services))
+
+        # Load valid sectors from catalog
+        provider = get_catalog_provider()
+        sectors_data = await provider.load_sector_catalog(
+            language=language,
+            session_id=session_id
+        )
+        valid_sectors = [s["name"] for s in sectors_data]
 
         # Build prompt sections
         sections = self._build_prompt_sections(
@@ -377,7 +391,8 @@ class ServiceGenerator:
         prompt_text = self._build_full_prompt_text(
             language=language,
             number=number_of_services,
-            sections=sections
+            sections=sections,
+            valid_sectors=valid_sectors
         )
 
         # Create LangChain prompt
@@ -392,12 +407,15 @@ class ServiceGenerator:
                 prompt=prompt,
                 number=number_of_services,
                 language=language,
-                valid_sectors=", ".join(SECTOR_VALUES),
+                valid_sectors=", ".join(valid_sectors),
                 **sections
             )
 
             # Parse and validate
-            services = self._parse_and_validate_services(response_text)
+            services = self._parse_and_validate_services(
+                response_text=response_text,
+                valid_sectors=valid_sectors
+            )
 
             # Build debug info
             debug_info = {

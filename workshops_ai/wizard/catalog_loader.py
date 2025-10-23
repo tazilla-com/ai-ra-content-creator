@@ -513,6 +513,59 @@ def get_asset_type_names(language: str = "en", session_id: Optional[str] = None)
     return [at["name"] for at in asset_types]
 
 
+def load_sector_catalog(language: str = "en", session_id: Optional[str] = None) -> List[Dict[str, str]]:
+    """
+    Load sector catalog from CSV file with localization.
+
+    Args:
+        language: Output language (en/sk/cs)
+        session_id: Session ID for client-specific catalogs (CSV provider ignores this)
+
+    Returns:
+        List of dicts with name and description
+    """
+    rows = _read_csv(CATALOG_BASE / "Sector.csv")
+    sectors: List[Dict[str, str]] = []
+
+    for r in rows:
+        base_name = (r.get("EN Name") or r.get("Name") or "").strip()
+        if not base_name:
+            continue
+
+        if language == "sk":
+            name = (r.get("SK Name") or base_name).strip()
+            notes = (r.get("SK Notes") or r.get("Notes") or "").strip()
+        elif language == "cs":
+            name = base_name
+            notes = (r.get("EN Notes") or r.get("Notes") or "").strip()
+        else:
+            name = base_name
+            notes = (r.get("EN Notes") or r.get("Notes") or "").strip()
+
+        sectors.append({
+            "name": name,
+            "description": notes
+        })
+
+    logger.info(f"Loaded {len(sectors)} sectors for language '{language}'")
+    return sectors
+
+
+def get_sector_names(language: str = "en", session_id: Optional[str] = None) -> List[str]:
+    """
+    Get ordered list of sector names from catalog.
+
+    Args:
+        language: Output language (en/sk/cs)
+        session_id: Session ID for client-specific catalogs (CSV provider ignores this)
+
+    Returns:
+        List of sector names in catalog order
+    """
+    sectors = load_sector_catalog(language, session_id=session_id)
+    return [s["name"] for s in sectors]
+
+
 def load_asset_type_threat_priors() -> Dict[str, List[str]]:
     """
     Load AssetType -> Threat priors from CSV (optional for smart threat selection).

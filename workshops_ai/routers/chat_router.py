@@ -324,6 +324,11 @@ async def chat_endpoint(
     # 1) Validate inbound payload (UIRequest or legacy), with language normalization
     ui_req = _to_ui_request(payload)
 
+    # 1.5) Extract auth identity from request.state (populated by security middleware)
+    identity = getattr(request.state, "identity", None)
+    if identity:
+        ui_req.identity = identity
+
     # 2) Message-length guard (only if message is provided)
     msg = getattr(ui_req, "message", None)
     if msg and len(msg) > MAX_MESSAGE_LEN:

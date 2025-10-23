@@ -7,7 +7,6 @@ cybersecurity analysis outputs for the onboarding wizard.
 
 Contains both current production prompts and legacy versions for reference.
 """
-from workshops_ai.wizard.schemas import SECTOR_VALUES
 
 # ===================================================================================
 # Scrape/Website

@@ -162,7 +162,12 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
     )
 
     # 4) Compose thread scope + conversation memory (rolling window)
-    uid = (req.user_id or "anon").strip() or "anon"
+    # Extract user_id from auth identity (fallback to req.user_id for backwards compat)
+    identity = getattr(req, "identity", None)
+    if identity and isinstance(identity, dict):
+        uid = (identity.get("sub") or "anon").strip() or "anon"
+    else:
+        uid = (getattr(req, "user_id", None) or "anon").strip() or "anon"
     thread_id = f"{req.org_id}:{tab}:{uid}"
     mem = RollingWindowMemory(
         memory_get=getattr(deps, "memory_get", None),
@@ -174,11 +179,11 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
             namespace=_CHAT_NS,
         ),
     )
-    turns = await mem.read(org_id=req.org_id, user_id=req.user_id, thread_id=thread_id, namespace=_CHAT_NS)
+    turns = await mem.read(org_id=req.org_id, user_id=uid, thread_id=thread_id, namespace=_CHAT_NS)
     history_msgs = RollingWindowMemory.to_llm_messages(turns, drop_tool_output=True)
 
     # 4a) Load/merge thread session state (current_asset + MRU + once_flags + language)
-    session_state = await _load_session_state(deps, org_id=req.org_id, user_id=req.user_id, thread_id=thread_id)
+    session_state = await _load_session_state(deps, org_id=req.org_id, user_id=uid, thread_id=thread_id)
 
     # UI selection explicitly overrides current asset
     selection_asset_id = getattr(getattr(req, "selection", None), "asset_id", None)
@@ -234,7 +239,7 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
         "org_id": req.org_id,
         "active_tab": tab,
         "message": req.message,
-        "user_id": req.user_id,
+        "user_id": uid,
         "staging": bool(req.staging),
         "language": language,                 # "cs|sk|en"
         "locale": (req.locale or language),   # pinned locale
@@ -277,7 +282,7 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
         return _fail("Agent execution failed.", req, details=str(e))
 
     # 9a) Telemetry passthrough for tool events (if present)
-    _telemetry_from_raw_tool_events(raw_result, tab=tab, org_id=req.org_id, user_id=req.user_id)
+    _telemetry_from_raw_tool_events(raw_result, tab=tab, org_id=req.org_id, user_id=uid)
 
     # 9b) Update session state from tool events (e.g., asset created/selected)
     session_state = _maybe_update_current_asset_from_result(session_state, raw_result)
@@ -291,7 +296,7 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
             raw_result,
             tab=tab,
             org_id=req.org_id,
-            user_id=req.user_id,
+            user_id=uid,
             asset_id=(getattr(req, "selection", None) and getattr(req.selection, "asset_id", None)),
         )
 
@@ -688,7 +693,7 @@ async def _persist_history(mem: RollingWindowMemory, req: UIRequest, resp: UIRes
         if new_msgs:
             await mem.append(
                 org_id=req.org_id,
-                user_id=req.user_id,
+                user_id=uid,
                 thread_id=thread_id,
                 namespace=_CHAT_NS,
                 new_messages=[cast(tuple[str, str], m) for m in new_msgs],
