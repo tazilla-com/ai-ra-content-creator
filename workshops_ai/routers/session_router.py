@@ -19,7 +19,7 @@ logger = logging.getLogger("workshops_ai.session_router")
 
 router = APIRouter(
     prefix="/session",
-    tags=["Session"],
+    tags=["session"],
 )
 
 
@@ -59,7 +59,7 @@ class SessionDeleteResponse(BaseModel):
 
 
 @router.get(
-    "/",
+    "",
     response_model=SessionStateResponse,
     summary="Get session state",
     description="Retrieve the current wizard state for a session",
@@ -78,7 +78,7 @@ async def get_session_state(
 
 
 @router.delete(
-    "/",
+    "",
     response_model=SessionDeleteResponse,
     summary="Delete session",
     description="Delete the session and all associated data from storage",

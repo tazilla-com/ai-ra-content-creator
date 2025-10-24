@@ -516,7 +516,7 @@ def create_app() -> FastAPI:
 
     def _fallback_ws():
         router = APIRouter()
-        @router.websocket("/ws", include_in_schema=False)
+        @router.websocket("/ws")
         async def ws_not_ready(websocket: WebSocket) -> None:
             await websocket.accept()
             await websocket.send_json({
@@ -667,13 +667,13 @@ def create_app() -> FastAPI:
     # /session (Session management)
     def _mount_session():
         from workshops_ai.routers.session_router import router as session_router
-        app.include_router(session_router, tags=["Session"], dependencies=_AUTH_DEP)
+        app.include_router(session_router, tags=["session"], dependencies=_AUTH_DEP)
 
     def _fallback_session():
         router = APIRouter()
         @router.get(
-            "/session/",
-            tags=["Session"],
+            "/session",
+            tags=["session"],
             response_class=_DEFAULT_RESPONSE_CLASS,
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             include_in_schema=False,
