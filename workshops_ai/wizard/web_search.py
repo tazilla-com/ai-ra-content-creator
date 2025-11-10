@@ -48,8 +48,15 @@ BUSINESS MODEL:
 - Key partners or suppliers
 - Critical dependencies
 
-Provide factual details found on their website. Be comprehensive but concise.
-Format: Short bullet points. No URLs. No extras."""
+ABSOLUTE RULES:
+• NO citations, URLs, links, or source references in any format
+• NO conversational phrases ("Let me know...", "Feel free to...", "Here's...", etc.)
+• NO questions, offers, suggestions, or call-to-action phrases
+• NO introductory or closing remarks
+• NO markdown links like [text](url)
+• Format: Direct bullet points only
+• Deliver: Pure facts, no commentary
+• Terminate: Immediately after last fact"""
 
 
 async def get_website_via_search(
@@ -218,10 +225,10 @@ async def get_website_via_search(
             details={"error_type": type(e).__name__}
         ) from e
 
-    # Extract and validate response (Responses API returns .output as a list of content blocks)
-    output = getattr(response, 'output', None)
+    # Extract text content without citations using output_text
+    message = response.output_text
 
-    if not output:
+    if not message:
         logger.warning(
             "web_search_no_output",
             extra={"url": url, "model": model}
@@ -231,15 +238,6 @@ async def get_website_via_search(
             model=model,
             details={"url": url}
         )
-
-    # Convert output list to string (extract text from content blocks)
-    if isinstance(output, list):
-        message = " ".join(
-            block.get("text", "") if isinstance(block, dict) else str(block)
-            for block in output
-        )
-    else:
-        message = str(output)
 
     if not message or len(message.strip()) < settings.wizard.web_search_min_content_chars:
         logger.warning(

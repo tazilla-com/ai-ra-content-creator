@@ -72,25 +72,13 @@ class ControlGenerator:
         Raises:
             ModelNotAllowedError: If model not in allowed list
         """
+        from workshops_ai.llm.wizard_client import create_wizard_llm_client
+
         settings = get_settings()
         self.settings = settings
 
-        # Resolve model
-        self.model_name = model or settings.llm.model
-
-        # Validate model against allowed list
-        allowed_models = settings.wizard.allowed_models
-        if self.model_name not in allowed_models:
-            raise ModelNotAllowedError(self.model_name, allowed_models)
-
-        # Initialize LangChain ChatOpenAI
-        self.llm = ChatOpenAI(
-            model=self.model_name,
-            temperature=settings.llm.temperature,
-            openai_api_key=settings.llm.api_key,
-            timeout=settings.wizard.llm_timeout_sec,
-            max_retries=0,  # We handle retries ourselves with tenacity
-        )
+        self.llm = create_wizard_llm_client(model)
+        self.model_name = self.llm.model_name
 
         logger.info(
             "ControlGenerator initialized",
@@ -103,18 +91,33 @@ class ControlGenerator:
 
     def _build_prompt_sections(
         self,
+        website_content: str,
         user_instructions: Optional[str],
     ) -> Dict[str, str]:
         """
         Build prompt sections from inputs.
 
         Args:
+            website_content: Website text content
             user_instructions: Optional user refinement instructions
 
         Returns:
             Dict of section names to content
         """
         sections = {}
+
+        # Website content section (truncate if needed, omit if empty/disabled)
+        if website_content:
+            max_length = self.settings.wizard.max_content_length
+            truncated_content = website_content[:max_length]
+            if len(website_content) > max_length:
+                truncated_content += "\n... [content truncated]"
+
+            sections["website_content_section"] = (
+                f"Website Content:\n{truncated_content}\n"
+            )
+        else:
+            sections["website_content_section"] = ""
 
         # User instructions section
         if user_instructions:
@@ -454,7 +457,9 @@ class ControlGenerator:
         assets: List[Asset],
         asset_risks: List[AssetRisk],
         language: str = "en",
-        max_controls_per_asset: int = 5,
+        min_controls_per_asset: Optional[int] = None,
+        max_controls_per_asset: Optional[int] = None,
+        website_content: str = "",
         user_instructions: Optional[str] = None,
     ) -> Tuple[List[AssetControls], UsageMetrics, Dict[str, Any]]:
         """
@@ -468,7 +473,9 @@ class ControlGenerator:
             assets: List of assets to protect
             asset_risks: List of asset risks (threat probabilities)
             language: Output language (en/sk/cs)
-            max_controls_per_asset: Maximum controls per asset (default 5)
+            min_controls_per_asset: Minimum controls per asset (optional, if not provided, no minimum enforced)
+            max_controls_per_asset: Maximum controls per asset (optional, if not provided, no maximum enforced)
+            website_content: Website text content (optional)
             user_instructions: Optional user refinement instructions
 
         Returns:
@@ -479,6 +486,16 @@ class ControlGenerator:
             AITimeoutError: If LLM request times out
             AIResponseError: If response cannot be parsed
         """
+
+        # Build controls count constraint text for prompt
+        if min_controls_per_asset is not None and max_controls_per_asset is not None:
+            controls_constraint = f"Select between {min_controls_per_asset} and {max_controls_per_asset} controls."
+        elif min_controls_per_asset is not None:
+            controls_constraint = f"Select at least {min_controls_per_asset} controls."
+        elif max_controls_per_asset is not None:
+            controls_constraint = f"Select up to {max_controls_per_asset} controls."
+        else:
+            controls_constraint = "Select the optimal number of controls for this asset."
         # Load control catalog for language
         control_catalog = load_control_catalog(language)
         threat_coverage = load_control_threat_coverage()
@@ -493,6 +510,7 @@ class ControlGenerator:
 
         # Build shared prompt sections
         sections = self._build_prompt_sections(
+            website_content=website_content,
             user_instructions=user_instructions,
         )
 
@@ -582,7 +600,7 @@ class ControlGenerator:
                     asset_json=asset_json,
                     asset_risks_json=asset_risks_json,
                     relevant_controls_json=relevant_controls_json,
-                    max_controls=max_controls_per_asset,
+                    controls_constraint=controls_constraint,
                     **sections
                 )
                 last_prompt_text = str(messages)
@@ -593,7 +611,7 @@ class ControlGenerator:
                     asset_json=asset_json,
                     asset_risks_json=asset_risks_json,
                     relevant_controls_json=relevant_controls_json,
-                    max_controls=max_controls_per_asset,
+                    controls_constraint=controls_constraint,
                     **sections
                 )
 
@@ -612,8 +630,9 @@ class ControlGenerator:
                     asset_risk_threats=asset_threat_names,
                 )
 
-                # Limit to max_controls_per_asset
-                controls = controls[:max_controls_per_asset]
+                # Apply max limit if specified
+                if max_controls_per_asset is not None:
+                    controls = controls[:max_controls_per_asset]
 
                 # Create AssetControls
                 results.append(AssetControls(
@@ -665,7 +684,9 @@ class ControlGenerator:
             "assets_processed": len(assets),
             "assets_skipped": skipped_assets,
             "catalog_controls_total": len(control_catalog),
+            "min_controls_per_asset": min_controls_per_asset,
             "max_controls_per_asset": max_controls_per_asset,
+            "controls_constraint": controls_constraint,
             "last_prompt_preview": last_prompt_text[:500],
             "last_response_preview": last_response_text[:500],
         }

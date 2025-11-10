@@ -159,7 +159,16 @@ def _choose_identity(headers: Dict[str, str], query: Dict[str, str]) -> Dict[str
     Try API-key first (if enabled), then JWT (if enabled).
     If neither method is enabled → 401.
     If methods are enabled but none succeed → 401 Unauthorized.
+
+    DEVELOPMENT MODE: If DISABLE_AUTH env var is set, bypass all auth.
     """
+    import os
+
+    # DEVELOPMENT MODE: Bypass auth for testing
+    if os.getenv("DISABLE_AUTH", "").lower() in ("true", "1", "yes"):
+        logger.warning("⚠️  AUTH DISABLED - Development mode (DISABLE_AUTH=true)")
+        return {"sub": "dev_user", "method": "disabled", "dev_mode": True}
+
     sec = get_settings().security
 
     if sec.disable_all_auth:

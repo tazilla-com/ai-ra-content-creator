@@ -41,6 +41,9 @@ from workshops_ai.graph.factory import (
     build_graph_config,   # unified config builder (thread_id/lang/checkpoint_ns)
 )
 
+# Asset agent (conversational, session-based)
+from workshops_ai.graph.assets.agent_handler import run_asset_agent
+
 # Conversation memory (rolling window; KV-backed where available)
 from workshops_ai.graph.conversation_memory import (
     RollingWindowMemory,
@@ -142,6 +145,21 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
     tab = (req.active_tab or "").strip().lower()
     if tab not in _SUPPORTED_TABS:
         return _tab_not_supported(req)
+
+    # 1a) Detect agent mode for assets tab
+    # Use conversational agent if:
+    # - tab is "assets"
+    # - session_id is present (indicates conversational flow)
+    # - NOT a direct tool call (message doesn't start with specific tool keywords)
+    use_asset_agent = False
+    if tab == "assets" and getattr(req, "session_id", None):
+        # Check if message looks conversational (not a direct tool call)
+        msg_lower = (req.message or "").strip().lower()
+        tool_keywords = ["asset.list", "asset.get", "asset.create", "asset.update", "llm.explain"]
+        is_tool_call = any(msg_lower.startswith(kw) for kw in tool_keywords)
+
+        if not is_tool_call:
+            use_asset_agent = True
 
     # 2) Build DI deps (backend, ws hub, retriever, memory, llm_client, settings, submit_changeset)
     deps = _deps(tab)
@@ -271,10 +289,20 @@ async def route_chat(req: UIRequest | dict[str, Any]) -> UIResponse:
     timeout = _timeout_for_tab(tab)
     cfg = build_graph_config(req, deps)  # single source of truth for configurable.thread_id/lang/checkpoint_ns)
 
-    # 9) Execute graph (graphs get deps.llm_client via DI)
+    # 9) Execute graph OR asset agent
     try:
-        runner = await _get_or_build_runner(tab, deps)
-        raw_result = await ainvoke_with_timeout(runner, inputs, timeout=timeout, config=cfg)
+        if use_asset_agent:
+            # Use conversational asset agent (session-based, educational)
+            telemetry_log("manager.using_asset_agent", {"session_id": req.session_id})
+
+            # Extract conn_id from request if available (for WebSocket streaming)
+            conn_id = getattr(req, "conn_id", None)
+
+            return await run_asset_agent(req, deps, conn_id=conn_id)
+        else:
+            # Use traditional graph-based flow
+            runner = await _get_or_build_runner(tab, deps)
+            raw_result = await ainvoke_with_timeout(runner, inputs, timeout=timeout, config=cfg)
     except asyncio.TimeoutError:
         return _fail(f"{tab.capitalize()}Agent execution timed out.", req)
     except Exception as e:

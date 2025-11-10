@@ -7,8 +7,8 @@ where possible. Wizard-specific request models are defined here.
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional, List, Literal
+from pydantic import BaseModel, Field, ConfigDict, model_validator
+from typing import Optional, List, Literal, Any
 from workshops_ai.api.schema.asset import Asset
 from workshops_ai.api.schema.impact import AssetImpact
 from workshops_ai.api.schema.threat import AssetRisk
@@ -85,11 +85,23 @@ class OrganizationProfile(BaseModel):
 
 
 class WebsiteContent(BaseModel):
-    """Website content data when not using session."""
+    """Website content data when not using session.
+
+    Can be empty object {} to disable web scraping entirely.
+    """
     model_config = ConfigDict(extra="forbid")
 
-    url: str = Field(..., description="Website URL")
-    content: str = Field(..., description="Scraped website content")
+    url: Optional[str] = Field(default=None, description="Website URL (optional)")
+    content: Optional[str] = Field(default=None, description="Scraped website content (optional)")
+
+    @model_validator(mode='before')
+    @classmethod
+    def handle_empty_object(cls, data: Any) -> Any:
+        """Allow empty object {} to pass validation with None defaults."""
+        if isinstance(data, dict) and not data:
+            # Empty dict - return with None defaults
+            return {"url": None, "content": None}
+        return data
 
 
 class ServicesInput(WizardStepInput):
@@ -116,11 +128,17 @@ class ServicesInput(WizardStepInput):
         default="en",
         description="Output language (en/sk/cs)"
     )
-    number_of_services: int = Field(
-        default=3,
+    min_services: Optional[int] = Field(
+        None,
         ge=1,
-        le=3,
-        description="Number of services to generate (1-3)"
+        le=10,
+        description="Minimum number of services to generate (optional, 1-10)"
+    )
+    max_services: Optional[int] = Field(
+        None,
+        ge=1,
+        le=10,
+        description="Maximum number of services to generate (optional, 1-10)"
     )
 
     # Optional context for better generation
@@ -188,11 +206,17 @@ class AssetsInput(WizardStepInput):
         default="en",
         description="Output language (en/sk/cs)"
     )
-    number_of_assets: int = Field(
-        default=10,
+    min_assets: Optional[int] = Field(
+        None,
         ge=1,
-        le=50,
-        description="Target number of assets to generate (1-50)"
+        le=100,
+        description="Minimum number of assets to generate (optional, 1-100)"
+    )
+    max_assets: Optional[int] = Field(
+        None,
+        ge=1,
+        le=100,
+        description="Maximum number of assets to generate (optional, 1-100)"
     )
 
     # Optional context for better generation
@@ -233,6 +257,22 @@ class AssetsOutput(BaseModel):
 class ImpactsInput(WizardStepInput):
     """Input for /wizard/impacts endpoint."""
 
+    # Website content sources
+    website_url: Optional[str] = Field(
+        None,
+        description="Website URL to scrape (will be cached in session)"
+    )
+    website_content: Optional[WebsiteContent] = Field(
+        None,
+        description="Provide website content directly when not using session"
+    )
+
+    # Search method
+    search_method: Literal["scrape", "web_search"] = Field(
+        default="scrape",
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    )
+
     # Assets context (from previous step or direct)
     assets: Optional[List[Asset]] = Field(
         None,
@@ -249,6 +289,18 @@ class ImpactsInput(WizardStepInput):
     language: str = Field(
         default="en",
         description="Output language (en/sk/cs)"
+    )
+    min_impacts_per_asset: Optional[int] = Field(
+        None,
+        ge=1,
+        le=20,
+        description="Minimum impacts to evaluate per asset (optional, 1-20)"
+    )
+    max_impacts_per_asset: Optional[int] = Field(
+        None,
+        ge=1,
+        le=20,
+        description="Maximum impacts to evaluate per asset (optional, 1-20)"
     )
 
     # Optional context for better generation
@@ -285,6 +337,22 @@ class ImpactsOutput(BaseModel):
 class RisksInput(WizardStepInput):
     """Input for /wizard/risks endpoint."""
 
+    # Website content sources
+    website_url: Optional[str] = Field(
+        None,
+        description="Website URL to scrape (will be cached in session)"
+    )
+    website_content: Optional[WebsiteContent] = Field(
+        None,
+        description="Provide website content directly when not using session"
+    )
+
+    # Search method
+    search_method: Literal["scrape", "web_search"] = Field(
+        default="scrape",
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    )
+
     # Assets context (from previous step or direct)
     assets: Optional[List[Asset]] = Field(
         None,
@@ -307,6 +375,18 @@ class RisksInput(WizardStepInput):
     language: str = Field(
         default="en",
         description="Output language (en/sk/cs)"
+    )
+    min_threats_per_asset: Optional[int] = Field(
+        None,
+        ge=1,
+        le=30,
+        description="Minimum threats to evaluate per asset (optional, 1-30)"
+    )
+    max_threats_per_asset: Optional[int] = Field(
+        None,
+        ge=1,
+        le=30,
+        description="Maximum threats to evaluate per asset (optional, 1-30)"
     )
 
     # Optional context for better generation
@@ -343,6 +423,22 @@ class RisksOutput(BaseModel):
 class ControlsInput(WizardStepInput):
     """Input for /wizard/controls endpoint."""
 
+    # Website content sources
+    website_url: Optional[str] = Field(
+        None,
+        description="Website URL to scrape (will be cached in session)"
+    )
+    website_content: Optional[WebsiteContent] = Field(
+        None,
+        description="Provide website content directly when not using session"
+    )
+
+    # Search method
+    search_method: Literal["scrape", "web_search"] = Field(
+        default="scrape",
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    )
+
     # Assets context (from previous step or direct)
     assets: Optional[List[Asset]] = Field(
         None,
@@ -360,11 +456,17 @@ class ControlsInput(WizardStepInput):
         default="en",
         description="Output language (en/sk/cs)"
     )
-    max_controls_per_asset: int = Field(
-        default=5,
+    min_controls_per_asset: Optional[int] = Field(
+        None,
         ge=1,
-        le=10,
-        description="Maximum controls per asset (1-10)"
+        le=20,
+        description="Minimum controls per asset (optional, 1-20)"
+    )
+    max_controls_per_asset: Optional[int] = Field(
+        None,
+        ge=1,
+        le=20,
+        description="Maximum controls per asset (optional, 1-20)"
     )
 
     # Optional context for better generation
@@ -448,24 +550,66 @@ class EvaluationInput(WizardStepInput):
         description="Output language for all steps (en/sk/cs)"
     )
 
-    # Step-specific parameters
-    number_of_services: int = Field(
-        default=3,
-        ge=1,
-        le=3,
-        description="Number of services to generate (1-3)"
-    )
-    number_of_assets: int = Field(
-        default=10,
-        ge=1,
-        le=50,
-        description="Number of assets to generate (1-50)"
-    )
-    max_controls_per_asset: int = Field(
-        default=5,
+    # Step-specific parameters (optional ranges)
+    min_services: Optional[int] = Field(
+        None,
         ge=1,
         le=10,
-        description="Maximum controls per asset (1-10)"
+        description="Minimum number of services to generate (optional, 1-10)"
+    )
+    max_services: Optional[int] = Field(
+        None,
+        ge=1,
+        le=10,
+        description="Maximum number of services to generate (optional, 1-10)"
+    )
+    min_assets: Optional[int] = Field(
+        None,
+        ge=1,
+        le=100,
+        description="Minimum number of assets to generate (optional, 1-100)"
+    )
+    max_assets: Optional[int] = Field(
+        None,
+        ge=1,
+        le=100,
+        description="Maximum number of assets to generate (optional, 1-100)"
+    )
+    min_controls_per_asset: Optional[int] = Field(
+        None,
+        ge=1,
+        le=20,
+        description="Minimum controls per asset (optional, 1-20)"
+    )
+    max_controls_per_asset: Optional[int] = Field(
+        None,
+        ge=1,
+        le=20,
+        description="Maximum controls per asset (optional, 1-20)"
+    )
+    min_impacts_per_asset: Optional[int] = Field(
+        None,
+        ge=1,
+        le=20,
+        description="Minimum impacts to evaluate per asset (optional, 1-20)"
+    )
+    max_impacts_per_asset: Optional[int] = Field(
+        None,
+        ge=1,
+        le=20,
+        description="Maximum impacts to evaluate per asset (optional, 1-20)"
+    )
+    min_threats_per_asset: Optional[int] = Field(
+        None,
+        ge=1,
+        le=30,
+        description="Minimum threats to evaluate per asset (optional, 1-30)"
+    )
+    max_threats_per_asset: Optional[int] = Field(
+        None,
+        ge=1,
+        le=30,
+        description="Maximum threats to evaluate per asset (optional, 1-30)"
     )
 
     # Control flags

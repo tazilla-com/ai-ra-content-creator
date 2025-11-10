@@ -226,7 +226,8 @@ async def generate_services(
             "session_id": session_id,
             "model": request.ai_model,
             "language": request.language,
-            "number_of_services": request.number_of_services,
+            "min_services": request.min_services,
+            "max_services": request.max_services,
         }
     )
 
@@ -236,33 +237,56 @@ async def generate_services(
     service_generator = ServiceGenerator(model=request.ai_model)
 
     # Step 1: Resolve website content
-    try:
-        website_content, content_metadata = await content_resolver.resolve_content(
-            session_id=session_id,
-            website_text=request.website_content.content if request.website_content else None,
-            website_url=request.website_url,
-            search_method=request.search_method,
-            ai_model=request.ai_model,
-        )
+    # Check if web scraping is disabled (empty website_content object)
+    scraping_disabled = (
+        request.website_content is not None and
+        not request.website_content.url and
+        not request.website_content.content
+    )
 
+    if scraping_disabled:
+        # Web scraping explicitly disabled - use empty content
+        website_content = ""
+        content_metadata = {
+            "source": "disabled",
+            "content_length": 0,
+        }
         logger.info(
-            "content_resolved",
+            "web_scraping_disabled",
             extra={
                 "session_id": session_id,
-                "source": content_metadata.get("source"),
-                "content_length": content_metadata.get("content_length"),
+                "reason": "empty_website_content_object",
             }
         )
+    else:
+        # Normal flow - resolve content from cache or scraping
+        try:
+            website_content, content_metadata = await content_resolver.resolve_content(
+                session_id=session_id,
+                website_text=request.website_content.content if request.website_content else None,
+                website_url=request.website_url,
+                search_method=request.search_method,
+                ai_model=request.ai_model,
+            )
 
-    except ContentNotFoundError as e:
-        logger.error(
-            "content_resolution_failed",
-            extra={
-                "session_id": session_id,
-                "error": str(e),
-            }
-        )
-        raise
+            logger.info(
+                "content_resolved",
+                extra={
+                    "session_id": session_id,
+                    "source": content_metadata.get("source"),
+                    "content_length": content_metadata.get("content_length"),
+                }
+            )
+
+        except ContentNotFoundError as e:
+            logger.error(
+                "content_resolution_failed",
+                extra={
+                    "session_id": session_id,
+                    "error": str(e),
+                }
+            )
+            raise
 
     # Step 2: Build organization profile from request
     organization_profile = None
@@ -297,7 +321,8 @@ async def generate_services(
         services, usage_metrics, debug_info = await service_generator.generate_services(
             website_content=website_content,
             language=request.language,
-            number_of_services=request.number_of_services,
+            min_services=request.min_services,
+            max_services=request.max_services,
             organization_profile=organization_profile,
             user_instructions=request.user_instructions,
             previous_services=previous_services,
@@ -418,7 +443,8 @@ async def generate_assets(
             "session_id": session_id,
             "model": request.ai_model,
             "language": request.language,
-            "number_of_assets": request.number_of_assets,
+            "min_assets": request.min_assets,
+            "max_assets": request.max_assets,
         }
     )
 
@@ -445,33 +471,52 @@ async def generate_assets(
             )
 
     # Step 2: Resolve website content (optional additional context)
+    # Check if web scraping is disabled (empty website_content object)
+    scraping_disabled = (
+        request.website_content is not None and
+        not request.website_content.url and
+        not request.website_content.content
+    )
+
     website_content = ""
     content_metadata = {"source": "none"}
 
-    try:
-        website_content, content_metadata = await content_resolver.resolve_content(
-            session_id=session_id,
-            website_text=request.website_content.content if request.website_content else None,
-            website_url=request.website_url,
-            search_method=request.search_method,
-            ai_model=request.ai_model,
-        )
-
+    if scraping_disabled:
+        # Web scraping explicitly disabled - use empty content
+        content_metadata = {"source": "disabled", "content_length": 0}
         logger.info(
-            "content_resolved",
+            "web_scraping_disabled",
             extra={
                 "session_id": session_id,
-                "source": content_metadata.get("source"),
-                "content_length": content_metadata.get("content_length"),
+                "reason": "empty_website_content_object",
             }
         )
+    else:
+        # Normal flow - try to resolve content
+        try:
+            website_content, content_metadata = await content_resolver.resolve_content(
+                session_id=session_id,
+                website_text=request.website_content.content if request.website_content else None,
+                website_url=request.website_url,
+                search_method=request.search_method,
+                ai_model=request.ai_model,
+            )
 
-    except ContentNotFoundError:
-        # Website content is optional for assets (services are primary input)
-        logger.info(
-            "no_website_content_available",
-            extra={"session_id": session_id}
-        )
+            logger.info(
+                "content_resolved",
+                extra={
+                    "session_id": session_id,
+                    "source": content_metadata.get("source"),
+                    "content_length": content_metadata.get("content_length"),
+                }
+            )
+
+        except ContentNotFoundError:
+            # Website content is optional for assets (services are primary input)
+            logger.info(
+                "no_website_content_available",
+                extra={"session_id": session_id}
+            )
 
     # Step 3: Build organization profile from request
     organization_profile = None
@@ -506,7 +551,8 @@ async def generate_assets(
         assets, usage_metrics, debug_info = await asset_generator.generate_assets(
             website_content=website_content,
             language=request.language,
-            number_of_assets=request.number_of_assets,
+            min_assets=request.min_assets,
+            max_assets=request.max_assets,
             services=services,
             organization_profile=organization_profile,
             user_instructions=request.user_instructions,
@@ -677,6 +723,37 @@ async def generate_impacts(
                 }
             )
 
+    # Step 2.5: Resolve website content (scraping or AI search)
+    redis = await get_redis()
+    content_resolver = ContentResolver(redis)
+
+    # Check if web scraping is disabled (empty website_content object)
+    scraping_disabled = (
+        request.website_content is not None and
+        not request.website_content.url and
+        not request.website_content.content
+    )
+
+    if scraping_disabled:
+        website_content = ""
+        content_metadata = {"source": "disabled", "content_length": 0}
+        logger.info(
+            "web_scraping_disabled",
+            extra={
+                "session_id": session_id,
+                "reason": "empty_website_content_object",
+                "endpoint": "impacts"
+            }
+        )
+    else:
+        website_content, content_metadata = await content_resolver.resolve_content(
+            session_id=session_id,
+            website_text=request.website_content.content if request.website_content else None,
+            website_url=request.website_url,
+            search_method=request.search_method,
+            ai_model=request.ai_model,
+        )
+
     # Step 3: Build organization profile from request
     organization_profile = None
     if request.organization_profile:
@@ -692,6 +769,9 @@ async def generate_impacts(
         asset_impacts, usage_metrics, debug_info = await impact_generator.generate_asset_impacts(
             assets=assets,
             language=request.language,
+            min_impacts_per_asset=request.min_impacts_per_asset,
+            max_impacts_per_asset=request.max_impacts_per_asset,
+            website_content=website_content,
             organization_profile=organization_profile,
             services=services,
             user_instructions=request.user_instructions,
@@ -877,6 +957,37 @@ async def generate_risks(
                 }
             )
 
+    # Step 3.5: Resolve website content (scraping or AI search)
+    redis = await get_redis()
+    content_resolver = ContentResolver(redis)
+
+    # Check if web scraping is disabled (empty website_content object)
+    scraping_disabled = (
+        request.website_content is not None and
+        not request.website_content.url and
+        not request.website_content.content
+    )
+
+    if scraping_disabled:
+        website_content = ""
+        content_metadata = {"source": "disabled", "content_length": 0}
+        logger.info(
+            "web_scraping_disabled",
+            extra={
+                "session_id": session_id,
+                "reason": "empty_website_content_object",
+                "endpoint": "risks"
+            }
+        )
+    else:
+        website_content, content_metadata = await content_resolver.resolve_content(
+            session_id=session_id,
+            website_text=request.website_content.content if request.website_content else None,
+            website_url=request.website_url,
+            search_method=request.search_method,
+            ai_model=request.ai_model,
+        )
+
     # Step 4: Build organization profile from request
     organization_profile = None
     if request.organization_profile:
@@ -892,6 +1003,9 @@ async def generate_risks(
         asset_risks, usage_metrics, debug_info = await risk_generator.generate_asset_risks(
             assets=assets,
             language=request.language,
+            min_threats_per_asset=request.min_threats_per_asset,
+            max_threats_per_asset=request.max_threats_per_asset,
+            website_content=website_content,
             organization_profile=organization_profile,
             services=services,
             asset_impacts=asset_impacts,
@@ -1019,6 +1133,7 @@ async def generate_controls(
             "session_id": session_id,
             "model": request.ai_model,
             "language": request.language,
+            "min_controls_per_asset": request.min_controls_per_asset,
             "max_controls_per_asset": request.max_controls_per_asset,
         }
     )
@@ -1084,13 +1199,46 @@ async def generate_controls(
             "employees": request.organization_profile.employees,
         }
 
+    # Step 3.5: Resolve website content (scraping or AI search)
+    redis = await get_redis()
+    content_resolver = ContentResolver(redis)
+
+    # Check if web scraping is disabled (empty website_content object)
+    scraping_disabled = (
+        request.website_content is not None and
+        not request.website_content.url and
+        not request.website_content.content
+    )
+
+    if scraping_disabled:
+        website_content = ""
+        content_metadata = {"source": "disabled", "content_length": 0}
+        logger.info(
+            "web_scraping_disabled",
+            extra={
+                "session_id": session_id,
+                "reason": "empty_website_content_object",
+                "endpoint": "controls"
+            }
+        )
+    else:
+        website_content, content_metadata = await content_resolver.resolve_content(
+            session_id=session_id,
+            website_text=request.website_content.content if request.website_content else None,
+            website_url=request.website_url,
+            search_method=request.search_method,
+            ai_model=request.ai_model,
+        )
+
     # Step 4: Generate control recommendations with LLM
     try:
         asset_controls, usage_metrics, debug_info = await control_generator.generate_asset_controls(
             assets=assets,
             asset_risks=asset_risks,
             language=request.language,
+            min_controls_per_asset=request.min_controls_per_asset,
             max_controls_per_asset=request.max_controls_per_asset,
+            website_content=website_content,
             user_instructions=request.user_instructions,
         )
 
@@ -1154,7 +1302,9 @@ async def generate_controls(
             "assets_processed": debug_info.get("assets_processed"),
             "assets_skipped": debug_info.get("assets_skipped"),
             "catalog_controls_total": debug_info.get("catalog_controls_total"),
+            "min_controls_per_asset": debug_info.get("min_controls_per_asset"),
             "max_controls_per_asset": debug_info.get("max_controls_per_asset"),
+            "controls_constraint": debug_info.get("controls_constraint"),
             "last_prompt_preview": debug_info.get("last_prompt_preview", "")[:500],
             "last_response_preview": debug_info.get("last_response_preview", "")[:500],
         }
@@ -1256,16 +1406,36 @@ async def generate_evaluation(
                 )
 
         if results.services is None:
-            # Resolve website content
-            website_content, content_metadata = await content_resolver.resolve_content(
-                session_id=session_id,
-                website_text=request.website_content.content if request.website_content else None,
-                website_url=request.website_url,
-                search_method=request.search_method,
-                ai_model=request.ai_model,
+            # Check if web scraping is disabled (empty website_content object)
+            scraping_disabled = (
+                request.website_content is not None and
+                not request.website_content.url and
+                not request.website_content.content
             )
 
-            if not website_content:
+            # Resolve website content
+            if scraping_disabled:
+                # Web scraping explicitly disabled
+                website_content = ""
+                content_metadata = {"source": "disabled", "content_length": 0}
+                logger.info(
+                    "web_scraping_disabled",
+                    extra={
+                        "session_id": session_id,
+                        "reason": "empty_website_content_object",
+                        "step": "services",
+                    }
+                )
+            else:
+                website_content, content_metadata = await content_resolver.resolve_content(
+                    session_id=session_id,
+                    website_text=request.website_content.content if request.website_content else None,
+                    website_url=request.website_url,
+                    search_method=request.search_method,
+                    ai_model=request.ai_model,
+                )
+
+            if not website_content and not scraping_disabled:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="No website content or URL provided"
@@ -1276,7 +1446,8 @@ async def generate_evaluation(
             services, usage_metrics, debug_info = await service_generator.generate_services(
                 website_content=website_content,
                 language=request.language,
-                number_of_services=request.number_of_services,
+                min_services=request.min_services,
+                max_services=request.max_services,
                 organization_profile=organization_profile,
                 user_instructions=None,  # Not exposed in evaluation mode
                 previous_services=None,
@@ -1350,21 +1521,40 @@ async def generate_evaluation(
                     )
 
             if results.assets is None and results.services:
-                # Get website content from session (or re-scrape if cache fails)
-                website_content, _ = await content_resolver.resolve_content(
-                    session_id=session_id,
-                    website_text=request.website_content.content if request.website_content else None,
-                    website_url=request.website_url,
-                    search_method=request.search_method,
-                    ai_model=request.ai_model,
+                # Check if web scraping is disabled (empty website_content object)
+                scraping_disabled = (
+                    request.website_content is not None and
+                    not request.website_content.url and
+                    not request.website_content.content
                 )
+
+                # Get website content from session (or re-scrape if cache fails)
+                if scraping_disabled:
+                    website_content = ""
+                    logger.info(
+                        "web_scraping_disabled",
+                        extra={
+                            "session_id": session_id,
+                            "reason": "empty_website_content_object",
+                            "step": "assets",
+                        }
+                    )
+                else:
+                    website_content, _ = await content_resolver.resolve_content(
+                        session_id=session_id,
+                        website_text=request.website_content.content if request.website_content else None,
+                        website_url=request.website_url,
+                        search_method=request.search_method,
+                        ai_model=request.ai_model,
+                    )
 
                 # Generate assets
                 asset_generator = AssetGenerator(model=request.ai_model)
                 assets, usage_metrics, debug_info = await asset_generator.generate_assets(
                     website_content=website_content or "",
                     language=request.language,
-                    number_of_assets=request.number_of_assets,
+                    min_assets=request.min_assets,
+                    max_assets=request.max_assets,
                     services=results.services,
                     organization_profile=organization_profile,
                     user_instructions=None,
@@ -1443,6 +1633,8 @@ async def generate_evaluation(
                 asset_impacts, usage_metrics, debug_info = await impact_generator.generate_asset_impacts(
                     assets=results.assets,
                     language=request.language,
+                    min_impacts_per_asset=request.min_impacts_per_asset,
+                    max_impacts_per_asset=request.max_impacts_per_asset,
                     organization_profile=organization_profile,
                     services=results.services,
                     user_instructions=None,
@@ -1520,6 +1712,8 @@ async def generate_evaluation(
                 asset_risks, usage_metrics, debug_info = await risk_generator.generate_asset_risks(
                     assets=results.assets,
                     language=request.language,
+                    min_threats_per_asset=request.min_threats_per_asset,
+                    max_threats_per_asset=request.max_threats_per_asset,
                     organization_profile=organization_profile,
                     services=results.services,
                     asset_impacts=results.asset_impacts,
@@ -1599,6 +1793,7 @@ async def generate_evaluation(
                     assets=results.assets,
                     asset_risks=results.asset_risks,
                     language=request.language,
+                    min_controls_per_asset=request.min_controls_per_asset,
                     max_controls_per_asset=request.max_controls_per_asset,
                     user_instructions=None,
                 )

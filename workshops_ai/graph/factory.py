@@ -39,8 +39,8 @@ from workshops_ai.graph.checkpointer import make_checkpointer as _central_make_c
 # RAG retriever factory
 from workshops_ai.rag.retriever import make_retriever as _rag_make_retriever
 
-# Enforce LangChain OpenAI chat model
-from langchain_openai import ChatOpenAI  # type: ignore
+# LangChain OpenAI chat model with throttling
+from workshops_ai.llm.throttled_client import ThrottledChatOpenAI as ChatOpenAI
 
 # Unified submit wrapper (online → OUTBOX fallback)
 from workshops_ai.app.services.outbox_writer import (  # type: ignore
@@ -558,7 +558,7 @@ def _make_submit_callable(settings: AppSettings) -> SubmitChangeSet:
     except Exception:
         submitter = None
 
-    outbox_dir = getattr(getattr(settings, "tazila", object()), "outbox_path", None)
+    outbox_dir = getattr(getattr(settings, "catalog", object()), "outbox_path", None)
 
     def _to_plain_dict(obj: Any) -> dict:
         # 1) Pydantic

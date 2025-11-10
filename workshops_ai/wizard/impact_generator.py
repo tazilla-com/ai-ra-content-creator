@@ -63,25 +63,13 @@ class ImpactGenerator:
         Raises:
             ModelNotAllowedError: If model not in allowed list
         """
+        from workshops_ai.llm.wizard_client import create_wizard_llm_client
+
         settings = get_settings()
         self.settings = settings
 
-        # Resolve model
-        self.model_name = model or settings.llm.model
-
-        # Validate model against allowed list
-        allowed_models = settings.wizard.allowed_models
-        if self.model_name not in allowed_models:
-            raise ModelNotAllowedError(self.model_name, allowed_models)
-
-        # Initialize LangChain ChatOpenAI
-        self.llm = ChatOpenAI(
-            model=self.model_name,
-            temperature=settings.llm.temperature,
-            openai_api_key=settings.llm.api_key,
-            timeout=settings.wizard.llm_timeout_sec,
-            max_retries=0,  # We handle retries ourselves with tenacity
-        )
+        self.llm = create_wizard_llm_client(model)
+        self.model_name = self.llm.model_name
 
         logger.info(
             "ImpactGenerator initialized",
@@ -94,6 +82,7 @@ class ImpactGenerator:
 
     def _build_prompt_sections(
         self,
+        website_content: str,
         organization_profile: Optional[Dict[str, Any]],
         services: Optional[List[Service]],
         user_instructions: Optional[str],
@@ -102,6 +91,7 @@ class ImpactGenerator:
         Build prompt sections from inputs.
 
         Args:
+            website_content: Website text content
             organization_profile: Optional org metadata
             services: Optional services for context
             user_instructions: Optional user refinement instructions
@@ -132,6 +122,19 @@ class ImpactGenerator:
             )
         else:
             sections["services_section"] = ""
+
+        # Website content section (truncate if needed, omit if empty/disabled)
+        if website_content:
+            max_length = self.settings.wizard.max_content_length
+            truncated_content = website_content[:max_length]
+            if len(website_content) > max_length:
+                truncated_content += "\n... [content truncated]"
+
+            sections["website_content_section"] = (
+                f"Website Content:\n{truncated_content}\n"
+            )
+        else:
+            sections["website_content_section"] = ""
 
         # User instructions section
         if user_instructions:
@@ -330,6 +333,9 @@ class ImpactGenerator:
         self,
         assets: List[Asset],
         language: str = "en",
+        min_impacts_per_asset: Optional[int] = None,
+        max_impacts_per_asset: Optional[int] = None,
+        website_content: str = "",
         organization_profile: Optional[Dict[str, Any]] = None,
         services: Optional[List[Service]] = None,
         user_instructions: Optional[str] = None,
@@ -337,11 +343,14 @@ class ImpactGenerator:
         """
         Generate impact evaluations for each asset.
 
-        Processes one asset at a time, evaluating all impacts from catalog.
+        Processes one asset at a time, evaluating impacts from catalog.
 
         Args:
             assets: List of assets to evaluate
             language: Output language (en/sk/cs)
+            min_impacts_per_asset: Minimum impacts per asset (optional, if not provided, no minimum enforced)
+            max_impacts_per_asset: Maximum impacts per asset (optional, if not provided, no maximum enforced)
+            website_content: Website text content (optional)
             organization_profile: Optional organization metadata
             services: Optional services for context
             user_instructions: Optional user refinement instructions
@@ -354,12 +363,23 @@ class ImpactGenerator:
             AITimeoutError: If LLM request times out
             AIResponseError: If response cannot be parsed
         """
+
+        # Build impacts count constraint text for prompt
+        if min_impacts_per_asset is not None and max_impacts_per_asset is not None:
+            impacts_constraint = f"Evaluate between {min_impacts_per_asset} and {max_impacts_per_asset} most relevant impacts."
+        elif min_impacts_per_asset is not None:
+            impacts_constraint = f"Evaluate at least {min_impacts_per_asset} most relevant impacts."
+        elif max_impacts_per_asset is not None:
+            impacts_constraint = f"Evaluate up to {max_impacts_per_asset} most relevant impacts."
+        else:
+            impacts_constraint = "Evaluate all relevant impacts from the catalog."
         # Load impact catalog for language
         ordered_catalog_names = get_impact_names(language)
         allowed_names_set = set(ordered_catalog_names)
 
         # Build shared prompt sections
         sections = self._build_prompt_sections(
+            website_content=website_content,
             organization_profile=organization_profile,
             services=services,
             user_instructions=user_instructions,
@@ -387,6 +407,7 @@ class ImpactGenerator:
                 messages = prompt.format_messages(
                     assets_json=assets_json,
                     ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                    impacts_constraint=impacts_constraint,
                     language=language,
                     **sections
                 )
@@ -397,6 +418,7 @@ class ImpactGenerator:
                     prompt=prompt,
                     assets_json=assets_json,
                     ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                    impacts_constraint=impacts_constraint,
                     language=language,
                     **sections
                 )
@@ -412,6 +434,10 @@ class ImpactGenerator:
                     allowed_impact_names=list(allowed_names_set),
                     ordered_catalog_names=ordered_catalog_names,
                 )
+
+                # Apply max limit if specified
+                if max_impacts_per_asset is not None:
+                    evaluations = evaluations[:max_impacts_per_asset]
 
                 # Create AssetImpact
                 results.append(AssetImpact(
@@ -462,6 +488,9 @@ class ImpactGenerator:
         debug_info = {
             "assets_processed": len(assets),
             "catalog_impacts_count": len(ordered_catalog_names),
+            "min_impacts_per_asset": min_impacts_per_asset,
+            "max_impacts_per_asset": max_impacts_per_asset,
+            "impacts_constraint": impacts_constraint,
             "last_prompt_preview": last_prompt_text[:500],
             "last_response_preview": last_response_text[:500],
         }

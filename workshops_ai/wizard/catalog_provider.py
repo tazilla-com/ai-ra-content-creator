@@ -33,70 +33,62 @@ class CatalogProvider(ABC):
     @abstractmethod
     async def load_impact_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Impact]:
-        """Load impact catalog with localization."""
+        """Load impact catalog (localized by Tazilla backend)."""
         pass
 
     @abstractmethod
     async def load_threat_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Threat]:
-        """Load threat catalog with localization."""
+        """Load threat catalog (localized by Tazilla backend)."""
         pass
 
     @abstractmethod
     async def load_control_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[PlannedControl]:
-        """Load control catalog with localization."""
+        """Load control catalog (localized by Tazilla backend)."""
         pass
 
     @abstractmethod
     async def load_asset_type_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Load asset type catalog with localization."""
+        """Load asset type catalog (localized by Tazilla backend)."""
         pass
 
     @abstractmethod
     async def load_impact_category_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
-        """Load impact category catalog with localization."""
+        """Load impact category catalog (localized by Tazilla backend)."""
         pass
 
     @abstractmethod
     async def load_threat_category_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
-        """Load threat category catalog with localization."""
+        """Load threat category catalog (localized by Tazilla backend)."""
         pass
 
     @abstractmethod
     async def load_control_category_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
-        """Load control category catalog with localization."""
+        """Load control category catalog (localized by Tazilla backend)."""
         pass
 
     @abstractmethod
     async def load_sector_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
         """Load sector catalog with localization."""
@@ -112,88 +104,81 @@ class CSVCatalogProvider(CatalogProvider):
     Provider that loads catalogs from local CSV files.
 
     Ignores session_id - all clients see the same mockup data.
+    Uses English ("en") as the fixed language for CSV files.
     """
 
     async def load_impact_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Impact]:
-        """Load impact catalog from CSV file."""
+        """Load impact catalog from CSV file (English only)."""
         from workshops_ai.wizard.catalog_loader import load_impact_catalog as _load
 
-        # CSV provider ignores session_id
-        return _load(language=language, session_id=None)
+        # CSV provider ignores session_id and uses fixed English language
+        return _load(language="en", session_id=None)
 
     async def load_threat_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Threat]:
-        """Load threat catalog from CSV file."""
+        """Load threat catalog from CSV file (English only)."""
         from workshops_ai.wizard.catalog_loader import load_threat_catalog as _load
 
-        return _load(language=language, session_id=None)
+        return _load(language="en", session_id=None)
 
     async def load_control_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[PlannedControl]:
-        """Load control catalog from CSV file."""
+        """Load control catalog from CSV file (English only)."""
         from workshops_ai.wizard.catalog_loader import load_control_catalog as _load
 
-        return _load(language=language, session_id=None)
+        return _load(language="en", session_id=None)
 
     async def load_asset_type_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Load asset type catalog from CSV file."""
+        """Load asset type catalog from CSV file (English only)."""
         from workshops_ai.wizard.catalog_loader import load_asset_type_catalog as _load
 
-        return _load(language=language, session_id=None)
+        return _load(language="en", session_id=None)
 
     async def load_impact_category_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
-        """Load impact category catalog from CSV file."""
+        """Load impact category catalog from CSV file (English only)."""
         from workshops_ai.wizard.catalog_loader import load_impact_category_catalog as _load
 
-        return _load(language=language, session_id=None)
+        return _load(language="en", session_id=None)
 
     async def load_threat_category_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
-        """Load threat category catalog from CSV file."""
+        """Load threat category catalog from CSV file (English only)."""
         from workshops_ai.wizard.catalog_loader import load_threat_category_catalog as _load
 
-        return _load(language=language, session_id=None)
+        return _load(language="en", session_id=None)
 
     async def load_control_category_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
-        """Load control category catalog from CSV file."""
+        """Load control category catalog from CSV file (English only)."""
         from workshops_ai.wizard.catalog_loader import load_control_category_catalog as _load
 
-        return _load(language=language, session_id=None)
+        return _load(language="en", session_id=None)
 
     async def load_sector_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
-        """Load sector catalog from CSV file."""
+        """Load sector catalog from CSV file (English only)."""
         from workshops_ai.wizard.catalog_loader import load_sector_catalog as _load
 
-        return _load(language=language, session_id=None)
+        return _load(language="en", session_id=None)
 
 
 # =============================================================================
@@ -245,7 +230,6 @@ class TazillaAPICatalogProvider(CatalogProvider):
     async def _fetch_catalog(
         self,
         catalog_type: str,
-        language: str,
         session_id: Optional[str]
     ) -> Dict[str, Any]:
         """
@@ -253,11 +237,10 @@ class TazillaAPICatalogProvider(CatalogProvider):
 
         Args:
             catalog_type: Catalog type (impacts, threats, controls, asset-types)
-            language: Language code (en/sk/cs)
             session_id: Session ID for client-specific catalogs
 
         Returns:
-            API response JSON
+            API response JSON (already localized by Tazilla backend)
 
         Raises:
             HTTPException: If API request fails
@@ -270,20 +253,18 @@ class TazillaAPICatalogProvider(CatalogProvider):
 
         url = f"{self.endpoint}/catalogs/{catalog_type}"
         headers = {"X-Session-Id": session_id}
-        params = {"language": language}
 
         logger.debug(
             "tazilla_catalog_fetch_started",
             extra={
                 "catalog_type": catalog_type,
-                "language": language,
                 "session_id": session_id,
                 "url": url,
             }
         )
 
         try:
-            response = await self.client.get(url, headers=headers, params=params)
+            response = await self.client.get(url, headers=headers)
             response.raise_for_status()
 
             data = response.json()
@@ -292,7 +273,6 @@ class TazillaAPICatalogProvider(CatalogProvider):
                 "tazilla_catalog_fetched",
                 extra={
                     "catalog_type": catalog_type,
-                    "language": language,
                     "session_id": session_id,
                     "total": data.get("total", 0),
                 }
@@ -331,13 +311,12 @@ class TazillaAPICatalogProvider(CatalogProvider):
 
     async def load_impact_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Impact]:
-        """Fetch impact catalog from Tazilla API."""
+        """Fetch impact catalog from Tazilla API (already localized)."""
         from pydantic import ValidationError
 
-        data = await self._fetch_catalog("impacts", language, session_id)
+        data = await self._fetch_catalog("impacts", session_id)
 
         # Parse response into Impact objects with validation
         try:
@@ -357,13 +336,12 @@ class TazillaAPICatalogProvider(CatalogProvider):
 
     async def load_threat_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Threat]:
-        """Fetch threat catalog from Tazilla API."""
+        """Fetch threat catalog from Tazilla API (already localized)."""
         from pydantic import ValidationError
 
-        data = await self._fetch_catalog("threats", language, session_id)
+        data = await self._fetch_catalog("threats", session_id)
 
         # Parse response into Threat objects with validation
         try:
@@ -383,13 +361,12 @@ class TazillaAPICatalogProvider(CatalogProvider):
 
     async def load_control_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[PlannedControl]:
-        """Fetch control catalog from Tazilla API."""
+        """Fetch control catalog from Tazilla API (already localized)."""
         from pydantic import ValidationError
 
-        data = await self._fetch_catalog("controls", language, session_id)
+        data = await self._fetch_catalog("controls", session_id)
 
         # Parse response into PlannedControl objects with validation
         try:
@@ -409,11 +386,10 @@ class TazillaAPICatalogProvider(CatalogProvider):
 
     async def load_asset_type_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Fetch asset type catalog from Tazilla API."""
-        data = await self._fetch_catalog("asset-types", language, session_id)
+        """Fetch asset type catalog from Tazilla API (already localized)."""
+        data = await self._fetch_catalog("asset-types", session_id)
 
         # Return raw dicts (matching CSV provider format)
         # Note: No Pydantic validation since we return dicts, not typed models
@@ -451,11 +427,10 @@ class TazillaAPICatalogProvider(CatalogProvider):
 
     async def load_impact_category_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
-        """Fetch impact category catalog from Tazilla API."""
-        data = await self._fetch_catalog("impact-categories", language, session_id)
+        """Fetch impact category catalog from Tazilla API (already localized)."""
+        data = await self._fetch_catalog("impact-categories", session_id)
 
         categories = data.get("categories", [])
 
@@ -472,11 +447,10 @@ class TazillaAPICatalogProvider(CatalogProvider):
 
     async def load_threat_category_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
-        """Fetch threat category catalog from Tazilla API."""
-        data = await self._fetch_catalog("threat-categories", language, session_id)
+        """Fetch threat category catalog from Tazilla API (already localized)."""
+        data = await self._fetch_catalog("threat-categories", session_id)
 
         categories = data.get("categories", [])
 
@@ -493,11 +467,10 @@ class TazillaAPICatalogProvider(CatalogProvider):
 
     async def load_control_category_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
-        """Fetch control category catalog from Tazilla API."""
-        data = await self._fetch_catalog("control-categories", language, session_id)
+        """Fetch control category catalog from Tazilla API (already localized)."""
+        data = await self._fetch_catalog("control-categories", session_id)
 
         categories = data.get("categories", [])
 
@@ -514,11 +487,10 @@ class TazillaAPICatalogProvider(CatalogProvider):
 
     async def load_sector_catalog(
         self,
-        language: str,
         session_id: Optional[str] = None
     ) -> List[Dict[str, str]]:
-        """Fetch sector catalog from Tazilla API."""
-        data = await self._fetch_catalog("sectors", language, session_id)
+        """Fetch sector catalog from Tazilla API (already localized)."""
+        data = await self._fetch_catalog("sectors", session_id)
 
         sectors = data.get("sectors", [])
 
@@ -548,7 +520,7 @@ def get_catalog_provider() -> CatalogProvider:
     """
     Get catalog provider instance based on settings.
 
-    Returns singleton instance configured from WORKSHOPS_AI_TAZILA__MODE setting:
+    Returns singleton instance configured from CATALOG__MODE setting:
     - "file": CSVCatalogProvider (dev/mockup)
     - "http": TazillaAPICatalogProvider (production)
 
@@ -563,7 +535,7 @@ def get_catalog_provider() -> CatalogProvider:
     from workshops_ai.settings import get_settings
 
     settings = get_settings()
-    mode = settings.tazila.mode
+    mode = settings.catalog.mode
 
     if mode == "file":
         logger.info("Using CSV catalog provider (mockup mode)")
@@ -573,18 +545,18 @@ def get_catalog_provider() -> CatalogProvider:
         logger.info(
             "Using Tazilla API catalog provider",
             extra={
-                "endpoint": settings.tazila.endpoint,
-                "timeout": settings.tazila.timeout_sec,
+                "endpoint": settings.catalog.endpoint,
+                "timeout": settings.catalog.timeout_sec,
             }
         )
         _provider_instance = TazillaAPICatalogProvider(
-            endpoint=settings.tazila.endpoint,
-            auth_token=settings.tazila.auth_token,
-            timeout=settings.tazila.timeout_sec,
+            endpoint=settings.catalog.endpoint,
+            auth_token=settings.catalog.auth_token,
+            timeout=settings.catalog.timeout_sec,
         )
 
     else:
-        raise ValueError(f"Invalid WORKSHOPS_AI_TAZILA__MODE: {mode} (expected 'file' or 'http')")
+        raise ValueError(f"Invalid CATALOG__MODE: {mode} (expected 'file' or 'http')")
 
     return _provider_instance
 

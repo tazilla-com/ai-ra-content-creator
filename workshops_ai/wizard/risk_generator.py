@@ -68,25 +68,13 @@ class RiskGenerator:
         Raises:
             ModelNotAllowedError: If model not in allowed list
         """
+        from workshops_ai.llm.wizard_client import create_wizard_llm_client
+
         settings = get_settings()
         self.settings = settings
 
-        # Resolve model
-        self.model_name = model or settings.llm.model
-
-        # Validate model against allowed list
-        allowed_models = settings.wizard.allowed_models
-        if self.model_name not in allowed_models:
-            raise ModelNotAllowedError(self.model_name, allowed_models)
-
-        # Initialize LangChain ChatOpenAI
-        self.llm = ChatOpenAI(
-            model=self.model_name,
-            temperature=settings.llm.temperature,
-            openai_api_key=settings.llm.api_key,
-            timeout=settings.wizard.llm_timeout_sec,
-            max_retries=0,  # We handle retries ourselves with tenacity
-        )
+        self.llm = create_wizard_llm_client(model)
+        self.model_name = self.llm.model_name
 
         logger.info(
             "RiskGenerator initialized",
@@ -99,6 +87,7 @@ class RiskGenerator:
 
     def _build_prompt_sections(
         self,
+        website_content: str,
         organization_profile: Optional[Dict[str, Any]],
         services: Optional[List[Service]],
         asset_impacts: Optional[List[AssetImpact]],
@@ -108,6 +97,7 @@ class RiskGenerator:
         Build prompt sections from inputs.
 
         Args:
+            website_content: Website text content
             organization_profile: Optional org metadata
             services: Optional services for context
             asset_impacts: Optional asset impacts for context
@@ -152,6 +142,19 @@ class RiskGenerator:
             )
         else:
             sections["asset_impacts_section"] = ""
+
+        # Website content section (truncate if needed, omit if empty/disabled)
+        if website_content:
+            max_length = self.settings.wizard.max_content_length
+            truncated_content = website_content[:max_length]
+            if len(website_content) > max_length:
+                truncated_content += "\n... [content truncated]"
+
+            sections["website_content_section"] = (
+                f"Website Content:\n{truncated_content}\n"
+            )
+        else:
+            sections["website_content_section"] = ""
 
         # User instructions section
         if user_instructions:
@@ -400,12 +403,14 @@ class RiskGenerator:
         self,
         assets: List[Asset],
         language: str = "en",
+        min_threats_per_asset: Optional[int] = None,
+        max_threats_per_asset: Optional[int] = None,
+        website_content: str = "",
         organization_profile: Optional[Dict[str, Any]] = None,
         services: Optional[List[Service]] = None,
         asset_impacts: Optional[List[AssetImpact]] = None,
         user_instructions: Optional[str] = None,
         use_priors: bool = True,
-        max_threats_per_asset: int = 20,
     ) -> Tuple[List[AssetRisk], UsageMetrics, Dict[str, Any]]:
         """
         Generate risk evaluations for each asset.
@@ -416,12 +421,14 @@ class RiskGenerator:
         Args:
             assets: List of assets to evaluate
             language: Output language (en/sk/cs)
+            min_threats_per_asset: Minimum threats per asset (optional, if not provided, no minimum enforced)
+            max_threats_per_asset: Maximum threats per asset (optional, if not provided, no maximum enforced)
+            website_content: Website text content (optional)
             organization_profile: Optional organization metadata
             services: Optional services for context
             asset_impacts: Optional asset impacts for context
             user_instructions: Optional user refinement instructions
             use_priors: Whether to use AssetType→Threat priors for selection (default True)
-            max_threats_per_asset: Maximum threats to evaluate per asset (default 20)
 
         Returns:
             Tuple of (asset risks list, aggregated usage metrics, debug info dict)
@@ -431,6 +438,16 @@ class RiskGenerator:
             AITimeoutError: If LLM request times out
             AIResponseError: If response cannot be parsed
         """
+
+        # Build threats count constraint text for prompt
+        if min_threats_per_asset is not None and max_threats_per_asset is not None:
+            threats_constraint = f"Evaluate between {min_threats_per_asset} and {max_threats_per_asset} most relevant threats."
+        elif min_threats_per_asset is not None:
+            threats_constraint = f"Evaluate at least {min_threats_per_asset} most relevant threats."
+        elif max_threats_per_asset is not None:
+            threats_constraint = f"Evaluate up to {max_threats_per_asset} most relevant threats."
+        else:
+            threats_constraint = "Evaluate all relevant threats from the catalog."
         # Load threat catalog for language
         all_threat_names = get_threat_names(language)
         allowed_names_set = set(all_threat_names)
@@ -446,6 +463,7 @@ class RiskGenerator:
 
         # Build shared prompt sections
         sections = self._build_prompt_sections(
+            website_content=website_content,
             organization_profile=organization_profile,
             services=services,
             asset_impacts=asset_impacts,
@@ -482,6 +500,7 @@ class RiskGenerator:
                 messages = prompt.format_messages(
                     assets_json=assets_json,
                     ordered_catalog_names_json=json.dumps(relevant_threats, ensure_ascii=False),
+                    threats_constraint=threats_constraint,
                     language=language,
                     **sections
                 )
@@ -492,6 +511,7 @@ class RiskGenerator:
                     prompt=prompt,
                     assets_json=assets_json,
                     ordered_catalog_names_json=json.dumps(relevant_threats, ensure_ascii=False),
+                    threats_constraint=threats_constraint,
                     language=language,
                     **sections
                 )
@@ -507,6 +527,10 @@ class RiskGenerator:
                     allowed_threat_names=relevant_threats,
                     ordered_catalog_names=relevant_threats,
                 )
+
+                # Apply max limit if specified
+                if max_threats_per_asset is not None:
+                    evaluations = evaluations[:max_threats_per_asset]
 
                 # Create AssetRisk
                 results.append(AssetRisk(
@@ -557,7 +581,9 @@ class RiskGenerator:
         debug_info = {
             "assets_processed": len(assets),
             "catalog_threats_total": len(all_threat_names),
-            "threats_per_asset": max_threats_per_asset,
+            "min_threats_per_asset": min_threats_per_asset,
+            "max_threats_per_asset": max_threats_per_asset,
+            "threats_constraint": threats_constraint,
             "priors_available": len(priors) > 0,
             "priors_count": len(priors),
             "last_prompt_preview": last_prompt_text[:500],

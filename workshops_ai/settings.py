@@ -116,25 +116,34 @@ class PathsSettings(BaseModel):
     catalogs_dir: str = "data/catalogs"
 
 
-class TazilaSettings(BaseModel):
+class CatalogSettings(BaseModel):
     """
-    Outbound ChangeSet export settings:
-      - 'file': write JSON payloads to an outbox directory (non-blocking path)
-      - 'http': POST JSON to remote API (httpx/AsyncClient; retry/backoff elsewhere)
-      - 'disabled': no-op (returns a structured reason)
+    Catalog provider settings:
+      - 'file': use local CSV files (dev/mockup mode)
+      - 'http': fetch from Tazilla API (production mode)
 
-    ENV mapping:
-      WORKSHOPS_AI_TAZILA__MODE=file|http|disabled
-      WORKSHOPS_AI_TAZILA__OUTBOX_PATH=/app/data/outbox
-      WORKSHOPS_AI_TAZILA__ENDPOINT=https://backend.example.com/changesets
-      WORKSHOPS_AI_TAZILA__AUTH_TOKEN=Bearer ...
-      WORKSHOPS_AI_TAZILA__TIMEOUT_SEC=30
+    ENV mapping (both forms work):
+      WORKSHOPS_AI_CATALOG__MODE=file|http  or  CATALOG__MODE=file|http
+      WORKSHOPS_AI_CATALOG__ENDPOINT=https://api.tazilla.com  or  CATALOG__ENDPOINT=...
+      WORKSHOPS_AI_CATALOG__AUTH_TOKEN=Bearer ...  or  CATALOG__AUTH_TOKEN=...
+      WORKSHOPS_AI_CATALOG__TIMEOUT_SEC=30  or  CATALOG__TIMEOUT_SEC=30
     """
-    mode: Literal["file", "http", "disabled"] = "file"
-    outbox_path: str = Field(default="data/outbox")
-    endpoint: Optional[str] = None     # used when mode = http
-    auth_token: Optional[str] = None   # used when mode = http
-    timeout_sec: int = 60
+    mode: Literal["file", "http"] = Field(
+        default="file",
+        validation_alias="CATALOG__MODE"
+    )
+    endpoint: Optional[str] = Field(
+        default=None,
+        validation_alias="CATALOG__ENDPOINT"
+    )
+    auth_token: Optional[str] = Field(
+        default=None,
+        validation_alias="CATALOG__AUTH_TOKEN"
+    )
+    timeout_sec: int = Field(
+        default=30,
+        validation_alias="CATALOG__TIMEOUT_SEC"
+    )
 
 
 class RedisSettings(BaseModel):
@@ -157,6 +166,22 @@ class RateLimitSettings(BaseModel):
     """
     enabled: bool = False
     per_minute: int = 60
+
+
+class OpenAIThrottleSettings(BaseModel):
+    """
+    OpenAI API throttling (RPM + TPM limits).
+
+    ENV mapping:
+      WORKSHOPS_AI_OPENAI_THROTTLE__ENABLED=true
+      WORKSHOPS_AI_OPENAI_THROTTLE__RPM=450
+      WORKSHOPS_AI_OPENAI_THROTTLE__TPM=2000000
+      WORKSHOPS_AI_OPENAI_THROTTLE__MAX_CONCURRENT=50
+    """
+    enabled: bool = True
+    rpm: int = 450
+    tpm: int = 2_000_000
+    max_concurrent: int = 50
 
 
 class MemorySettings(BaseModel):
@@ -541,9 +566,10 @@ class AppSettings(BaseSettings):
     # Feature groups (namespaced)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     paths: PathsSettings = Field(default_factory=PathsSettings)
-    tazila: TazilaSettings = Field(default_factory=TazilaSettings)
+    catalog: CatalogSettings = Field(default_factory=CatalogSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     ratelimit: RateLimitSettings = Field(default_factory=RateLimitSettings)
+    openai_throttle: OpenAIThrottleSettings = Field(default_factory=OpenAIThrottleSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     telemetry: TelemetrySettings = Field(default_factory=TelemetrySettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
@@ -650,7 +676,7 @@ class AppSettings(BaseSettings):
         Return a dict safe for logging (secrets redacted).
         - API keys -> "***"
         - JWT secret -> "***"
-        - Tazila auth token -> "***"
+        - Catalog auth token -> "***"
         - LangChain API key -> "***"
         """
         data = self.model_dump()
@@ -662,10 +688,10 @@ class AppSettings(BaseSettings):
         if sec.get("jwt_secret"):
             sec["jwt_secret"] = "***"
 
-        # Tazila
-        tz = data.get("tazila", {})
-        if tz.get("auth_token"):
-            tz["auth_token"] = "***"
+        # Catalog
+        cat = data.get("catalog", {})
+        if cat.get("auth_token"):
+            cat["auth_token"] = "***"
 
         # LangChain
         lc = data.get("langchain", {})

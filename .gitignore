@@ -72,3 +72,6 @@ workshops_ai/data/outbox/**
 
 # (Volitelné) Qdrant lokální data, pokud je mapuješ do repo složky:
 # qdrant_data/
+
+# Snyk Security Extension - AI Rules (auto-generated)
+.cursor/rules/snyk_rules.mdc

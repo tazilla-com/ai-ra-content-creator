@@ -59,7 +59,7 @@ IMPORTANT: If user provides specific instructions or refinements, those take pri
 SERVICES_HUMAN_PROMPT_TEMPLATE = """
 Analyze this organization.
 
-Generate {number} core business services.
+{count_constraint}
 Output in {language} language.
 Sectors must be selected from (in English): {valid_sectors}
 
@@ -149,7 +149,7 @@ IMPORTANT Rules:
 """
 
 ASSETS_HUMAN_PROMPT_TEMPLATE = """
-Generate {number} assets for this organization.
+{count_constraint}
 Output language: {language}
 Allowed asset types (use EXACTLY as written): {asset_types}
 
@@ -252,13 +252,17 @@ Single asset to evaluate (JSON array with exactly one object):
 
 {services_section}
 
+{website_content_section}
+
 Impact catalog (ordered list of names to preserve):
 {ordered_catalog_names_json}
+
+{impacts_constraint}
 
 Language for any localized names already provided: {language}
 {user_instructions_section}
 
-Return ONLY a JSON array of objects with fields `impactName` and `impactLevel` for ALL catalog items, preserving the given order. Example item: {{"impactName": "Financial impact", "impactLevel": 2}}
+Return ONLY a JSON array of objects with fields `impactName` and `impactLevel`, preserving the catalog order. Example item: {{"impactName": "Financial impact", "impactLevel": 2}}
 """
 
 # Legacy prompt (original implementation - kept for reference)
@@ -336,13 +340,17 @@ Single asset to evaluate (JSON array with exactly one object):
 
 {asset_impacts_section}
 
+{website_content_section}
+
 Threat catalog (ordered list of names to preserve):
 {ordered_catalog_names_json}
+
+{threats_constraint}
 
 Language for any localized names already provided: {language}
 {user_instructions_section}
 
-Return ONLY a JSON array of objects with fields `threatName` and `probability` for ALL catalog items, preserving the given order. Example item: {{"threatName": "Fire", "probability": 2}}
+Return ONLY a JSON array of objects with fields `threatName` and `probability`, preserving the catalog order. Example item: {{"threatName": "Fire", "probability": 2}}
 """
 
 # Legacy prompt (original implementation - kept for reference)
@@ -386,7 +394,6 @@ For the SINGLE asset and its evaluated risks, select the MOST EFFECTIVE controls
 from the pre-filtered catalog to mitigate the identified threats.
 
 DEFAULT Guidelines (apply unless user instructions override):
-- Select maximum {max_controls} controls (prioritize highest risk coverage and cost-effectiveness)
 - Use ONLY controls from the provided relevant_controls list
 - For each control, specify exact threatName and riskCoverage (0-100%)
 - Use catalog_coverage as guidance, but may adjust based on asset context
@@ -413,7 +420,9 @@ Asset risks (threats with probabilities 0-4):
 Pre-filtered relevant controls from catalog (with default coverage from catalog):
 {relevant_controls_json}
 
-Maximum controls to select: {max_controls}
+{controls_constraint}
+
+{website_content_section}
 
 {user_instructions_section}
 

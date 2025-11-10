@@ -303,7 +303,7 @@ class UIResponse(BaseModel):
     )
 
     # 4) Optional synchronous echo of agent events (progress transparency)
-    agent_events: Optional[list[AgentEvent]] = Field(
+    agent_events: Optional[list[Union[AgentEvent, dict[str, Any]]]] = Field(
         default=None,
         description="Agent tool events echoed with the response for live progress rendering."
     )

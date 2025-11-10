@@ -1,7 +1,7 @@
 # File: workshops_ai/schemas/impact_models.py
 # -----------------------------------------------------------------------------
 # Pydantic v2 models for the Impacts domain (SEND-NOW workflow).
-# These models are used across the agent, WS hub, and Tazila client payloads.
+# These models are used across the agent and WS hub.
 # - ImpactUpdate: validated input (one change for one asset).
 # - ImpactChangeItem: one item inside a ChangeSet sent to BE.
 # - ImpactChangeSet: whole changeset for immediate submission (send-now).

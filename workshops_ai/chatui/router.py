@@ -52,8 +52,7 @@ async def demo_page() -> str:
     <strong>WorkshopsAI Demo</strong>
     <span class="pill">/chat + /ws</span>
     <span style="margin-left:auto"></span>
-    <label>org_id <input id="org" value="demo-org" size="10" /></label>
-    <label>user_id <input id="user" value="demo-user" size="10" /></label>
+    <label>session_id <input id="sessionId" value="" placeholder="Auto-generated" size="24" /></label>
     <label>tab
       <select id="tab">
         <option value="assets" selected>assets</option>
@@ -61,7 +60,7 @@ async def demo_page() -> str:
         <option value="threats">threats</option>
       </select>
     </label>
-    <label>API key <input id="apiKey" value="" size="16" placeholder="X-API-Key (optional)" /></label>
+    <label>API key <input id="apiKey" value="" size="16" placeholder="Leave empty (dev mode)" /></label>
     <button id="ws-btn">Connect WS</button>
     <a href="/docs" target="_blank" rel="noreferrer" style="margin-left:8px">/docs</a>
   </header>
@@ -85,13 +84,26 @@ async def demo_page() -> str:
     const eventsEl = document.getElementById('events');
     const sendBtn = document.getElementById('send');
     const wsBtn = document.getElementById('ws-btn');
-    const org = document.getElementById('org');
-    const user = document.getElementById('user');
+    const sessionId = document.getElementById('sessionId');
     const tab = document.getElementById('tab');
     const msg = document.getElementById('msg');
     const apiKey = document.getElementById('apiKey');
 
     let ws = null;
+
+    // Generate session ID
+    function generateSessionId() {
+      return 'demo_' + Math.random().toString(36).substring(2, 15);
+    }
+
+    function getOrGenerateSessionId() {
+      let sid = sessionId.value.trim();
+      if (!sid) {
+        sid = generateSessionId();
+        sessionId.value = sid;
+      }
+      return sid;
+    }
 
     // --- Chat UI helpers ------------------------------------------------------
     function line(kind, content) {
@@ -206,13 +218,16 @@ async def demo_page() -> str:
       const text = msg.value;
       if (!text.trim()) return;
 
+      const sid = getOrGenerateSessionId();
+
       const payload = {
-        org_id: org.value.trim(),
+        org_id: 'demo-org',  // Hardcoded for demo
         active_tab: tab.value,
         selection: {},
         message: text,
         staging: false,
-        user_id: user.value.trim(),
+        user_id: 'demo-user',  // Hardcoded for demo
+        session_id: sid,  // NEW: session_id for agent
       };
 
       line('me', payload.message || '(empty)');
@@ -268,13 +283,14 @@ async def demo_page() -> str:
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
         ws.close(1000, 'reconnect');
       }
+
+      const sid = getOrGenerateSessionId();
+
       const url = new URL(window.location.href);
       url.protocol = url.protocol.replace('http', 'ws'); // http → ws, https → wss
       url.pathname = '/ws';
-      url.searchParams.set('tab', tab.value);
+      url.searchParams.set('session_id', sid);  // NEW: session_id instead of org_id/user_id
       url.searchParams.set('active_tab', tab.value);
-      url.searchParams.set('org_id', org.value.trim());
-      url.searchParams.set('user_id', user.value.trim());
       url.searchParams.set('accept_language', browserAcceptLanguage());
       const key = apiKey.value.trim();
       if (key) url.searchParams.set('api_key', key);
@@ -332,10 +348,14 @@ async def demo_page() -> str:
       const initialKey = url.searchParams.get('api_key') || '';
       if (initialKey && apiKeyEl) apiKeyEl.value = initialKey;
 
-      if (initialKey || (apiKeyEl && apiKeyEl.value.trim())) {
-        connectWs();
-      } else {
-        line('sys', 'API key missing: add ?api_key=… to URL or fill the box and click Connect.');
+      // Auto-connect (no API key needed in dev mode with DISABLE_AUTH=true)
+      line('sys', 'Welcome! Type a message or click "Connect WS" for real-time updates.');
+      line('sys', 'DEV MODE: Auth disabled (DISABLE_AUTH=true)');
+
+      // Auto-generate session ID
+      if (!sessionId.value.trim()) {
+        sessionId.value = generateSessionId();
+        line('sys', 'Session ID: ' + sessionId.value);
       }
     });
     window.addEventListener('beforeunload', function() { if (ws) try { ws.close(1000, 'leaving'); } catch (e) {} });

@@ -52,25 +52,13 @@ class ServiceGenerator:
         Raises:
             ModelNotAllowedError: If model not in allowed list
         """
+        from workshops_ai.llm.wizard_client import create_wizard_llm_client
+
         settings = get_settings()
         self.settings = settings
 
-        # Resolve model
-        self.model_name = model or settings.llm.model
-
-        # Validate model against allowed list
-        allowed_models = settings.wizard.allowed_models
-        if self.model_name not in allowed_models:
-            raise ModelNotAllowedError(self.model_name, allowed_models)
-
-        # Initialize LangChain ChatOpenAI
-        self.llm = ChatOpenAI(
-            model=self.model_name,
-            temperature=settings.llm.temperature,
-            openai_api_key=settings.llm.api_key,
-            timeout=settings.wizard.llm_timeout_sec,
-            max_retries=0,  # We handle retries ourselves with tenacity
-        )
+        self.llm = create_wizard_llm_client(model)
+        self.model_name = self.llm.model_name
 
         logger.info(
             "ServiceGenerator initialized",
@@ -134,22 +122,26 @@ class ServiceGenerator:
         else:
             sections["previous_services_section"] = ""
 
-        # Website content section (truncate if needed)
-        max_length = self.settings.wizard.max_content_length
-        truncated_content = website_content[:max_length]
-        if len(website_content) > max_length:
-            truncated_content += "\n... [content truncated]"
+        # Website content section (truncate if needed, omit if empty/disabled)
+        if website_content:
+            max_length = self.settings.wizard.max_content_length
+            truncated_content = website_content[:max_length]
+            if len(website_content) > max_length:
+                truncated_content += "\n... [content truncated]"
 
-        sections["website_content_section"] = (
-            f"Website Content:\n{truncated_content}\n"
-        )
+            sections["website_content_section"] = (
+                f"Website Content:\n{truncated_content}\n"
+            )
+        else:
+            sections["website_content_section"] = ""
 
         return sections
 
     def _build_full_prompt_text(
         self,
         language: str,
-        number: int,
+        min_count: Optional[int],
+        max_count: Optional[int],
         sections: Dict[str, str],
         valid_sectors: List[str]
     ) -> str:
@@ -158,8 +150,18 @@ class ServiceGenerator:
 
         Returns truncated version for logging.
         """
+        # Build count constraint text
+        if min_count is not None and max_count is not None:
+            count_constraint = f"Generate between {min_count} and {max_count} core business services."
+        elif min_count is not None:
+            count_constraint = f"Generate at least {min_count} core business services."
+        elif max_count is not None:
+            count_constraint = f"Generate up to {max_count} core business services."
+        else:
+            count_constraint = "Generate core business services based on the organization's needs."
+
         human_prompt = SERVICES_HUMAN_PROMPT_TEMPLATE.format(
-            number=number,
+            count_constraint=count_constraint,
             language=language,
             valid_sectors=", ".join(valid_sectors),
             **sections
@@ -342,7 +344,8 @@ class ServiceGenerator:
         self,
         website_content: str,
         language: str = "en",
-        number_of_services: int = 3,
+        min_services: Optional[int] = None,
+        max_services: Optional[int] = None,
         organization_profile: Optional[Dict[str, Any]] = None,
         user_instructions: Optional[str] = None,
         previous_services: Optional[List[Service]] = None,
@@ -354,7 +357,8 @@ class ServiceGenerator:
         Args:
             website_content: Website text content
             language: Output language (en/sk/cs)
-            number_of_services: Number of services to generate (1-3)
+            min_services: Minimum number of services (optional, if not provided, no minimum enforced)
+            max_services: Maximum number of services (optional, if not provided, no maximum enforced)
             organization_profile: Optional organization metadata
             user_instructions: Optional user refinement instructions
             previous_services: Optional previous services for refinement
@@ -368,13 +372,10 @@ class ServiceGenerator:
             AITimeoutError: If LLM request times out
             AIResponseError: If response cannot be parsed
         """
-        # Clamp number of services to valid range
-        number_of_services = max(1, min(3, number_of_services))
 
-        # Load valid sectors from catalog
+        # Load valid sectors from catalog (already localized by Tazilla backend)
         provider = get_catalog_provider()
         sectors_data = await provider.load_sector_catalog(
-            language=language,
             session_id=session_id
         )
         valid_sectors = [s["name"] for s in sectors_data]
@@ -387,10 +388,21 @@ class ServiceGenerator:
             previous_services=previous_services,
         )
 
+        # Build count constraint text for prompt
+        if min_services is not None and max_services is not None:
+            count_constraint = f"Generate between {min_services} and {max_services} core business services."
+        elif min_services is not None:
+            count_constraint = f"Generate at least {min_services} core business services."
+        elif max_services is not None:
+            count_constraint = f"Generate up to {max_services} core business services."
+        else:
+            count_constraint = "Generate core business services based on the organization's needs."
+
         # Build full prompt for debugging
         prompt_text = self._build_full_prompt_text(
             language=language,
-            number=number_of_services,
+            min_count=min_services,
+            max_count=max_services,
             sections=sections,
             valid_sectors=valid_sectors
         )
@@ -405,7 +417,7 @@ class ServiceGenerator:
         try:
             response_text, usage_metrics = await self._call_llm_with_retry(
                 prompt=prompt,
-                number=number_of_services,
+                count_constraint=count_constraint,
                 language=language,
                 valid_sectors=", ".join(valid_sectors),
                 **sections

@@ -3,7 +3,7 @@
 FastAPI router for catalog endpoints.
 
 Provider Pattern:
-Uses configurable catalog provider (CSV or Tazilla API) based on WORKSHOPS_AI_TAZILA__MODE:
+Uses configurable catalog provider (CSV or Tazilla API) based on CATALOG__MODE:
 - mode=file: CSVCatalogProvider (dev/mockup, ignores session_id)
 - mode=http: TazillaAPICatalogProvider (production, requires session_id)
 
@@ -46,28 +46,25 @@ router = APIRouter(
 # =============================================================================
 
 class ImpactCatalogResponse(BaseModel):
-    """Response for impact catalog endpoint."""
+    """Response for impact catalog endpoint (localized by Tazilla backend)."""
     model_config = ConfigDict(extra="forbid")
 
-    language: str = Field(..., description="Language code (en/sk/cs)")
     total: int = Field(..., description="Total number of impacts")
     impacts: List[Impact] = Field(..., description="List of impacts with categories and weights")
 
 
 class ThreatCatalogResponse(BaseModel):
-    """Response for threat catalog endpoint."""
+    """Response for threat catalog endpoint (localized by Tazilla backend)."""
     model_config = ConfigDict(extra="forbid")
 
-    language: str = Field(..., description="Language code (en/sk/cs)")
     total: int = Field(..., description="Total number of threats")
     threats: List[Threat] = Field(..., description="List of threats with categories and types")
 
 
 class ControlCatalogResponse(BaseModel):
-    """Response for control catalog endpoint."""
+    """Response for control catalog endpoint (localized by Tazilla backend)."""
     model_config = ConfigDict(extra="forbid")
 
-    language: str = Field(..., description="Language code (en/sk/cs)")
     total: int = Field(..., description="Total number of controls")
     controls: List[PlannedControl] = Field(
         ...,
@@ -85,10 +82,9 @@ class AssetTypeItem(BaseModel):
 
 
 class AssetTypeCatalogResponse(BaseModel):
-    """Response for asset type catalog endpoint."""
+    """Response for asset type catalog endpoint (localized by Tazilla backend)."""
     model_config = ConfigDict(extra="forbid")
 
-    language: str = Field(..., description="Language code (en/sk/cs)")
     total: int = Field(..., description="Total number of asset types")
     assetTypes: List[AssetTypeItem] = Field(..., description="List of asset types")
 
@@ -97,15 +93,14 @@ class CategoryItem(BaseModel):
     """Single category item."""
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(..., description="Category name (localized)")
-    description: str = Field(..., description="Category description/notes (localized)")
+    name: str = Field(..., description="Category name (localized by backend)")
+    description: str = Field(..., description="Category description/notes (localized by backend)")
 
 
 class CategoryCatalogResponse(BaseModel):
-    """Response for category catalog endpoints."""
+    """Response for category catalog endpoints (localized by Tazilla backend)."""
     model_config = ConfigDict(extra="forbid")
 
-    language: str = Field(..., description="Language code (en/sk/cs)")
     total: int = Field(..., description="Total number of categories")
     categories: List[CategoryItem] = Field(..., description="List of categories")
 
@@ -118,14 +113,9 @@ class CategoryCatalogResponse(BaseModel):
     "/impacts",
     response_model=ImpactCatalogResponse,
     summary="Get Impact catalog",
-    description="Retrieve the official Impact catalog with categories, weights, and localized names"
+    description="Retrieve the official Impact catalog with categories, weights, and names (localized by Tazilla backend)"
 )
 async def get_impact_catalog(
-    language: str = Query(
-        default="en",
-        regex="^(en|sk|cs)$",
-        description="Language code for localized names (en/sk/cs)"
-    ),
     x_session_id: Optional[str] = Header(
         None,
         alias="X-Session-Id",
@@ -133,16 +123,15 @@ async def get_impact_catalog(
     )
 ) -> ImpactCatalogResponse:
     """
-    Get Impact catalog with localized names and descriptions.
+    Get Impact catalog (already localized by Tazilla backend).
 
     The catalog includes:
-    - Impact name (localized)
-    - Description (localized)
+    - Impact name (localized by backend)
+    - Description (localized by backend)
     - Weight (importance/severity multiplier)
     - Category (Availability, Clients, Confidentiality, Finance, etc.)
 
     Args:
-        language: Language code (en/sk/cs)
         x_session_id: Session ID for client-specific catalogs
 
     Returns:
@@ -154,21 +143,18 @@ async def get_impact_catalog(
     try:
         provider = get_catalog_provider()
         impacts = await provider.load_impact_catalog(
-            language=language,
             session_id=x_session_id
         )
 
         logger.info(
             "impact_catalog_retrieved",
             extra={
-                "language": language,
                 "session_id": x_session_id,
                 "count": len(impacts),
             }
         )
 
         return ImpactCatalogResponse(
-            language=language,
             total=len(impacts),
             impacts=impacts
         )
@@ -177,7 +163,6 @@ async def get_impact_catalog(
         logger.error(
             "impact_catalog_load_failed",
             extra={
-                "language": language,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
@@ -192,14 +177,9 @@ async def get_impact_catalog(
     "/threats",
     response_model=ThreatCatalogResponse,
     summary="Get Threat catalog",
-    description="Retrieve the official Threat catalog with categories, types, and localized names"
+    description="Retrieve the official Threat catalog with categories, types, and names (localized by Tazilla backend)"
 )
 async def get_threat_catalog(
-    language: str = Query(
-        default="en",
-        regex="^(en|sk|cs)$",
-        description="Language code for localized names (en/sk/cs)"
-    ),
     x_session_id: Optional[str] = Header(
         None,
         alias="X-Session-Id",
@@ -207,16 +187,15 @@ async def get_threat_catalog(
     )
 ) -> ThreatCatalogResponse:
     """
-    Get Threat catalog with localized names and descriptions.
+    Get Threat catalog (already localized by Tazilla backend).
 
     The catalog includes:
-    - Threat name (localized)
-    - Description (localized)
+    - Threat name (localized by backend)
+    - Description (localized by backend)
     - Category (Physical, Natural, Human actions, etc.)
     - Type flags (unintentional, intentional, environmental)
 
     Args:
-        language: Language code (en/sk/cs)
         x_session_id: Session ID for client-specific catalogs
 
     Returns:
@@ -228,21 +207,18 @@ async def get_threat_catalog(
     try:
         provider = get_catalog_provider()
         threats = await provider.load_threat_catalog(
-            language=language,
             session_id=x_session_id
         )
 
         logger.info(
             "threat_catalog_retrieved",
             extra={
-                "language": language,
                 "session_id": x_session_id,
                 "count": len(threats),
             }
         )
 
         return ThreatCatalogResponse(
-            language=language,
             total=len(threats),
             threats=threats
         )
@@ -251,7 +227,6 @@ async def get_threat_catalog(
         logger.error(
             "threat_catalog_load_failed",
             extra={
-                "language": language,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
@@ -266,14 +241,9 @@ async def get_threat_catalog(
     "/controls",
     response_model=ControlCatalogResponse,
     summary="Get Control catalog",
-    description="Retrieve the official Control catalog with categories and localized names"
+    description="Retrieve the official Control catalog with categories and names (localized by Tazilla backend)"
 )
 async def get_control_catalog(
-    language: str = Query(
-        default="en",
-        regex="^(en|sk|cs)$",
-        description="Language code for localized names (en/sk/cs)"
-    ),
     x_session_id: Optional[str] = Header(
         None,
         alias="X-Session-Id",
@@ -281,18 +251,17 @@ async def get_control_catalog(
     )
 ) -> ControlCatalogResponse:
     """
-    Get Control catalog with localized names and descriptions.
+    Get Control catalog (already localized by Tazilla backend).
 
     The catalog includes:
-    - Control name (localized)
-    - Description/notes (localized)
+    - Control name (localized by backend)
+    - Description/notes (localized by backend)
     - Category (ISO 27001 aligned - 17 categories)
 
     Note: Costs and threat coverage are NOT included in the catalog.
     These are populated by the AI based on asset context.
 
     Args:
-        language: Language code (en/sk/cs)
         x_session_id: Session ID for client-specific catalogs
 
     Returns:
@@ -304,21 +273,18 @@ async def get_control_catalog(
     try:
         provider = get_catalog_provider()
         controls = await provider.load_control_catalog(
-            language=language,
             session_id=x_session_id
         )
 
         logger.info(
             "control_catalog_retrieved",
             extra={
-                "language": language,
                 "session_id": x_session_id,
                 "count": len(controls),
             }
         )
 
         return ControlCatalogResponse(
-            language=language,
             total=len(controls),
             controls=controls
         )
@@ -327,7 +293,6 @@ async def get_control_catalog(
         logger.error(
             "control_catalog_load_failed",
             extra={
-                "language": language,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
@@ -342,14 +307,9 @@ async def get_control_catalog(
     "/asset-types",
     response_model=AssetTypeCatalogResponse,
     summary="Get Asset Type catalog",
-    description="Retrieve the official Asset Type catalog with localized names"
+    description="Retrieve the official Asset Type catalog (localized by Tazilla backend)"
 )
 async def get_asset_type_catalog(
-    language: str = Query(
-        default="en",
-        regex="^(en|sk|cs)$",
-        description="Language code for localized names (en/sk/cs)"
-    ),
     x_session_id: Optional[str] = Header(
         None,
         alias="X-Session-Id",
@@ -357,15 +317,14 @@ async def get_asset_type_catalog(
     )
 ) -> AssetTypeCatalogResponse:
     """
-    Get Asset Type catalog with localized names and descriptions.
+    Get Asset Type catalog (already localized by Tazilla backend).
 
     The catalog includes:
-    - Asset type name (localized)
-    - Description/notes (localized)
+    - Asset type name (localized by backend)
+    - Description/notes (localized by backend)
     - isDependent flag (whether asset depends on other assets)
 
     Args:
-        language: Language code (en/sk/cs)
         x_session_id: Session ID for client-specific catalogs
 
     Returns:
@@ -377,7 +336,6 @@ async def get_asset_type_catalog(
     try:
         provider = get_catalog_provider()
         asset_types_data = await provider.load_asset_type_catalog(
-            language=language,
             session_id=x_session_id
         )
 
@@ -390,14 +348,12 @@ async def get_asset_type_catalog(
         logger.info(
             "asset_type_catalog_retrieved",
             extra={
-                "language": language,
                 "session_id": x_session_id,
                 "count": len(asset_types),
             }
         )
 
         return AssetTypeCatalogResponse(
-            language=language,
             total=len(asset_types),
             assetTypes=asset_types
         )
@@ -406,7 +362,6 @@ async def get_asset_type_catalog(
         logger.error(
             "asset_type_catalog_load_failed",
             extra={
-                "language": language,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
@@ -424,11 +379,6 @@ async def get_asset_type_catalog(
     description="Retrieve the official Impact Categories catalog with localized names"
 )
 async def get_impact_category_catalog(
-    language: str = Query(
-        default="en",
-        regex="^(en|sk|cs)$",
-        description="Language code for localized names (en/sk/cs)"
-    ),
     x_session_id: Optional[str] = Header(
         None,
         alias="X-Session-Id",
@@ -436,10 +386,9 @@ async def get_impact_category_catalog(
     )
 ) -> CategoryCatalogResponse:
     """
-    Get Impact Categories catalog with localized names.
+    Get Impact Categories catalog (already localized by Tazilla backend).
 
     Args:
-        language: Language code (en/sk/cs)
         x_session_id: Session ID for client-specific catalogs
 
     Returns:
@@ -451,7 +400,6 @@ async def get_impact_category_catalog(
     try:
         provider = get_catalog_provider()
         categories_data = await provider.load_impact_category_catalog(
-            language=language,
             session_id=x_session_id
         )
 
@@ -460,14 +408,12 @@ async def get_impact_category_catalog(
         logger.info(
             "impact_category_catalog_retrieved",
             extra={
-                "language": language,
                 "session_id": x_session_id,
                 "count": len(categories),
             }
         )
 
         return CategoryCatalogResponse(
-            language=language,
             total=len(categories),
             categories=categories
         )
@@ -476,8 +422,6 @@ async def get_impact_category_catalog(
         logger.error(
             "impact_category_catalog_load_failed",
             extra={
-                "language": language,
-                "session_id": x_session_id,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
@@ -495,11 +439,6 @@ async def get_impact_category_catalog(
     description="Retrieve the official Threat Categories catalog with localized names"
 )
 async def get_threat_category_catalog(
-    language: str = Query(
-        default="en",
-        regex="^(en|sk|cs)$",
-        description="Language code for localized names (en/sk/cs)"
-    ),
     x_session_id: Optional[str] = Header(
         None,
         alias="X-Session-Id",
@@ -507,10 +446,9 @@ async def get_threat_category_catalog(
     )
 ) -> CategoryCatalogResponse:
     """
-    Get Threat Categories catalog with localized names.
+    Get Threat Categories catalog (already localized by Tazilla backend).
 
     Args:
-        language: Language code (en/sk/cs)
         x_session_id: Session ID for client-specific catalogs
 
     Returns:
@@ -522,7 +460,6 @@ async def get_threat_category_catalog(
     try:
         provider = get_catalog_provider()
         categories_data = await provider.load_threat_category_catalog(
-            language=language,
             session_id=x_session_id
         )
 
@@ -531,14 +468,12 @@ async def get_threat_category_catalog(
         logger.info(
             "threat_category_catalog_retrieved",
             extra={
-                "language": language,
                 "session_id": x_session_id,
                 "count": len(categories),
             }
         )
 
         return CategoryCatalogResponse(
-            language=language,
             total=len(categories),
             categories=categories
         )
@@ -547,8 +482,6 @@ async def get_threat_category_catalog(
         logger.error(
             "threat_category_catalog_load_failed",
             extra={
-                "language": language,
-                "session_id": x_session_id,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
@@ -566,11 +499,6 @@ async def get_threat_category_catalog(
     description="Retrieve the official Control Categories catalog with localized names"
 )
 async def get_control_category_catalog(
-    language: str = Query(
-        default="en",
-        regex="^(en|sk|cs)$",
-        description="Language code for localized names (en/sk/cs)"
-    ),
     x_session_id: Optional[str] = Header(
         None,
         alias="X-Session-Id",
@@ -578,10 +506,9 @@ async def get_control_category_catalog(
     )
 ) -> CategoryCatalogResponse:
     """
-    Get Control Categories catalog with localized names.
+    Get Control Categories catalog (already localized by Tazilla backend).
 
     Args:
-        language: Language code (en/sk/cs)
         x_session_id: Session ID for client-specific catalogs
 
     Returns:
@@ -593,7 +520,6 @@ async def get_control_category_catalog(
     try:
         provider = get_catalog_provider()
         categories_data = await provider.load_control_category_catalog(
-            language=language,
             session_id=x_session_id
         )
 
@@ -602,14 +528,12 @@ async def get_control_category_catalog(
         logger.info(
             "control_category_catalog_retrieved",
             extra={
-                "language": language,
                 "session_id": x_session_id,
                 "count": len(categories),
             }
         )
 
         return CategoryCatalogResponse(
-            language=language,
             total=len(categories),
             categories=categories
         )
@@ -618,8 +542,6 @@ async def get_control_category_catalog(
         logger.error(
             "control_category_catalog_load_failed",
             extra={
-                "language": language,
-                "session_id": x_session_id,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }
@@ -637,11 +559,6 @@ async def get_control_category_catalog(
     description="Retrieve the official Sectors catalog with localized names"
 )
 async def get_sector_catalog(
-    language: str = Query(
-        default="en",
-        regex="^(en|sk|cs)$",
-        description="Language code for localized names (en/sk/cs)"
-    ),
     x_session_id: Optional[str] = Header(
         None,
         alias="X-Session-Id",
@@ -649,10 +566,9 @@ async def get_sector_catalog(
     )
 ) -> CategoryCatalogResponse:
     """
-    Get Sectors catalog with localized names.
+    Get Sectors catalog (already localized by Tazilla backend).
 
     Args:
-        language: Language code (en/sk/cs)
         x_session_id: Session ID for client-specific catalogs
 
     Returns:
@@ -664,7 +580,6 @@ async def get_sector_catalog(
     try:
         provider = get_catalog_provider()
         sectors_data = await provider.load_sector_catalog(
-            language=language,
             session_id=x_session_id
         )
 
@@ -673,14 +588,12 @@ async def get_sector_catalog(
         logger.info(
             "sector_catalog_retrieved",
             extra={
-                "language": language,
                 "session_id": x_session_id,
                 "count": len(sectors),
             }
         )
 
         return CategoryCatalogResponse(
-            language=language,
             total=len(sectors),
             categories=sectors
         )
@@ -689,8 +602,6 @@ async def get_sector_catalog(
         logger.error(
             "sector_catalog_load_failed",
             extra={
-                "language": language,
-                "session_id": x_session_id,
                 "error": str(e),
                 "error_type": type(e).__name__,
             }

@@ -271,13 +271,20 @@ async def _ws_error(
 @router.websocket("/ws")
 async def ws_endpoint(
     ws: WebSocket,
-    org_id: str = Query(..., description="Organization ID"),
-    user_id: str = Query(..., description="User ID"),
+    session_id: str = Query(..., description="Session ID"),
     active_tab: str = Query("assets", description="assets|impacts|threats|controls"),
     accept_language: Optional[str] = Query(None, description="Optional Accept-Language hint (e.g., 'cs, sk;q=0.9, en;q=0.7')"),
+    # Legacy parameters (optional, for backwards compatibility)
+    org_id: Optional[str] = Query(None, description="Organization ID (legacy)"),
+    user_id: Optional[str] = Query(None, description="User ID (legacy)"),
 ) -> None:
     """
     Real-time chat endpoint.
+
+    NEW: Uses session_id as primary identifier (instead of org_id/user_id).
+    - session_id is required
+    - org_id and user_id are extracted from session state (Redis)
+    - Backwards compatible: accepts org_id/user_id as optional fallback
 
     Language behavior:
       - We select the language ONCE per connection (query > header > default).
@@ -289,6 +296,10 @@ async def ws_endpoint(
       - These are applied on every routed UIRequest regardless of event payload.
     """
     active_tab = active_tab if active_tab in ALLOWED_TABS else "assets"
+
+    # Use legacy org_id/user_id as fallback (for backwards compatibility)
+    effective_org_id = org_id or "demo-org"
+    effective_user_id = user_id or "demo-user"
 
     # Auth before accept
     auth_ok = await verify_ws_auth(ws)
@@ -313,10 +324,10 @@ async def ws_endpoint(
 
     # Initialize per-connection state (context)
     state = Conn(
-        org_id=org_id,
-        user_id=user_id,
+        org_id=effective_org_id,  # Use effective values (from params or defaults)
+        user_id=effective_user_id,
         active_tab=active_tab,
-        sid=sid,
+        sid=session_id,  # Use session_id as sid
         request_id=rid,
         staging=DEFAULT_STAGING,
         accept_language=lang_tag,  # canonical tag (e.g., "cs-CZ")
@@ -335,6 +346,7 @@ async def ws_endpoint(
             "request_id": state.request_id,
             "org_id": state.org_id,
             "user_id": state.user_id,
+            "session_id": session_id,  # NEW: Include session_id in hello
             "sid": state.sid,
             "agent_events": {"subscribed": True, "mode": "raw_json"},
             "staging": state.staging,
@@ -440,6 +452,26 @@ async def ws_endpoint(
 
                     payload = ui_res.model_dump(mode="json") if hasattr(ui_res, "model_dump") else ui_res
                     await _ws_send(ws, "ui_response", payload)
+
+                    # Send proposals as separate message if present
+                    if isinstance(payload, dict) and payload.get("proposals"):
+                        logger.info(
+                            f"WS sending proposals: {list(payload['proposals'].keys()) if isinstance(payload['proposals'], dict) else type(payload['proposals'])}"
+                        )
+                        await _ws_send(ws, "proposals", payload["proposals"])
+                    else:
+                        logger.info(f"WS: no proposals in payload (type={type(payload)}, has_proposals={bool(payload.get('proposals') if isinstance(payload, dict) else False)})")
+
+                    # Extract and send tools used
+                    tools_used = []
+                    if isinstance(payload, dict) and payload.get("agent_events"):
+                        for event in payload["agent_events"]:
+                            if isinstance(event, dict) and event.get("tool"):
+                                tools_used.append(event["tool"])
+
+                    if tools_used:
+                        await _ws_send(ws, "tools_used", {"tools": tools_used})
+
                     await _ws_send(ws, "progress", {"status": "done", "conn_id": state.conn_id, "request_id": state.request_id})
                 except asyncio.TimeoutError:
                     await _ws_error(ws, f"Timed out after {WS_EVENT_TIMEOUT_S}s", conn_id=state.conn_id, state=state)

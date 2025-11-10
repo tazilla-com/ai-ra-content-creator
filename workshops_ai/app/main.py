@@ -187,7 +187,7 @@ class TimingMiddleware:
                 duration = time.perf_counter() - start
                 headers = message.get("headers", [])
                 headers = [(k, v) for (k, v) in headers if k.lower() != b"x-process-time"]
-                headers.append((b"x-process-time", f"{duration:.6f}s".encode()))
+                headers.append((b"x-process-time", f"{duration:.6f}".encode()))
                 message["headers"] = headers
             await send(message)
 
@@ -322,6 +322,18 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         await get_redis()
     except Exception as e:
         logger.warning("redis.init_failed: %s", e)
+
+    # Initialize OpenAI throttle
+    if settings.openai_throttle.enabled:
+        try:
+            from workshops_ai.llm.openai_throttle import init_throttle
+            init_throttle(
+                rpm=settings.openai_throttle.rpm,
+                tpm=settings.openai_throttle.tpm,
+                max_concurrent=settings.openai_throttle.max_concurrent
+            )
+        except Exception as e:
+            logger.warning("openai_throttle.init_failed: %s", e)
 
     yield
 
@@ -464,6 +476,17 @@ def create_app() -> FastAPI:
     async def readyz() -> str:
         # In future, check dependencies (catalogs, storage, etc.)
         return "READY"
+
+    @app.get("/health/openai", tags=["Health"], response_class=_DEFAULT_RESPONSE_CLASS, include_in_schema=False)
+    async def openai_throttle_metrics() -> dict[str, Any]:
+        if not settings.openai_throttle.enabled:
+            return {"enabled": False}
+        try:
+            from workshops_ai.llm.openai_throttle import get_throttle
+            throttle = get_throttle()
+            return throttle.get_metrics()
+        except Exception as e:
+            return {"error": str(e)}
 
     # --------------------------------------------------------------------------
     # Chat UI ("/" → /demo) - hidden from API docs (wizard-only API)

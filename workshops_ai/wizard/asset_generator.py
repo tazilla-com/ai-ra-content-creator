@@ -59,25 +59,13 @@ class AssetGenerator:
         Raises:
             ModelNotAllowedError: If model not in allowed list
         """
+        from workshops_ai.llm.wizard_client import create_wizard_llm_client
+
         settings = get_settings()
         self.settings = settings
 
-        # Resolve model
-        self.model_name = model or settings.llm.model
-
-        # Validate model against allowed list
-        allowed_models = settings.wizard.allowed_models
-        if self.model_name not in allowed_models:
-            raise ModelNotAllowedError(self.model_name, allowed_models)
-
-        # Initialize LangChain ChatOpenAI
-        self.llm = ChatOpenAI(
-            model=self.model_name,
-            temperature=settings.llm.temperature,
-            openai_api_key=settings.llm.api_key,
-            timeout=settings.wizard.llm_timeout_sec,
-            max_retries=0,  # We handle retries ourselves with tenacity
-        )
+        self.llm = create_wizard_llm_client(model)
+        self.model_name = self.llm.model_name
 
         logger.info(
             "AssetGenerator initialized",
@@ -180,22 +168,26 @@ class AssetGenerator:
         else:
             sections["previous_assets_section"] = ""
 
-        # Website content section (truncate if needed)
-        max_length = self.settings.wizard.max_content_length
-        truncated_content = website_content[:max_length]
-        if len(website_content) > max_length:
-            truncated_content += "\n... [content truncated]"
+        # Website content section (truncate if needed, omit if empty/disabled)
+        if website_content:
+            max_length = self.settings.wizard.max_content_length
+            truncated_content = website_content[:max_length]
+            if len(website_content) > max_length:
+                truncated_content += "\n... [content truncated]"
 
-        sections["website_content_section"] = (
-            f"Website Content:\n{truncated_content}\n"
-        )
+            sections["website_content_section"] = (
+                f"Website Content:\n{truncated_content}\n"
+            )
+        else:
+            sections["website_content_section"] = ""
 
         return sections
 
     def _build_full_prompt_text(
         self,
         language: str,
-        number: int,
+        min_count: Optional[int],
+        max_count: Optional[int],
         asset_types: List[str],
         sections: Dict[str, str]
     ) -> str:
@@ -204,8 +196,18 @@ class AssetGenerator:
 
         Returns truncated version for logging.
         """
+        # Build count constraint text
+        if min_count is not None and max_count is not None:
+            count_constraint = f"Generate between {min_count} and {max_count} IT and business assets."
+        elif min_count is not None:
+            count_constraint = f"Generate at least {min_count} IT and business assets."
+        elif max_count is not None:
+            count_constraint = f"Generate up to {max_count} IT and business assets."
+        else:
+            count_constraint = "Generate IT and business assets based on the organization's needs."
+
         human_prompt = ASSETS_HUMAN_PROMPT_TEMPLATE.format(
-            number=number,
+            count_constraint=count_constraint,
             language=language,
             asset_types=", ".join(asset_types),
             **sections
@@ -260,12 +262,12 @@ class AssetGenerator:
             prompt_tokens = usage.get("prompt_tokens", 0)
             completion_tokens = usage.get("completion_tokens", 0)
 
-            # Create usage metrics (with pricing override from settings)
+            # Create usage metrics (with pricing from settings)
             metrics = create_usage_metrics(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 model=self.model_name,
-                pricing_override=self.settings.wizard.openai_pricing_override
+                pricing=self.settings.wizard.openai_pricing
             )
 
             logger.info(
@@ -418,7 +420,8 @@ class AssetGenerator:
         self,
         website_content: str,
         language: str = "en",
-        number_of_assets: int = 10,
+        min_assets: Optional[int] = None,
+        max_assets: Optional[int] = None,
         services: Optional[List[Service]] = None,
         organization_profile: Optional[Dict[str, Any]] = None,
         user_instructions: Optional[str] = None,
@@ -430,7 +433,8 @@ class AssetGenerator:
         Args:
             website_content: Website text content
             language: Output language (en/sk/cs)
-            number_of_assets: Number of assets to generate (1-50)
+            min_assets: Minimum number of assets (optional, if not provided, no minimum enforced)
+            max_assets: Maximum number of assets (optional, if not provided, no maximum enforced)
             services: Optional services from previous step
             organization_profile: Optional organization metadata
             user_instructions: Optional user refinement instructions
@@ -444,8 +448,6 @@ class AssetGenerator:
             AITimeoutError: If LLM request times out
             AIResponseError: If response cannot be parsed
         """
-        # Clamp number of assets to valid range
-        number_of_assets = max(1, min(50, number_of_assets))
 
         # Extract allowed asset types from Asset model
         allowed_asset_types = self._allowed_asset_types_from_model()
@@ -461,10 +463,21 @@ class AssetGenerator:
             previous_assets=previous_assets,
         )
 
+        # Build count constraint text for prompt
+        if min_assets is not None and max_assets is not None:
+            count_constraint = f"Generate between {min_assets} and {max_assets} IT and business assets."
+        elif min_assets is not None:
+            count_constraint = f"Generate at least {min_assets} IT and business assets."
+        elif max_assets is not None:
+            count_constraint = f"Generate up to {max_assets} IT and business assets."
+        else:
+            count_constraint = "Generate IT and business assets based on the organization's needs."
+
         # Build full prompt for debugging
         prompt_text = self._build_full_prompt_text(
             language=language,
-            number=number_of_assets,
+            min_count=min_assets,
+            max_count=max_assets,
             asset_types=allowed_asset_types,
             sections=sections
         )
@@ -479,7 +492,7 @@ class AssetGenerator:
         try:
             response_text, usage_metrics = await self._call_llm_with_retry(
                 prompt=prompt,
-                number=number_of_assets,
+                count_constraint=count_constraint,
                 language=language,
                 asset_types=", ".join(allowed_asset_types),
                 **sections
@@ -491,8 +504,9 @@ class AssetGenerator:
                 allowed_asset_types=allowed_asset_types
             )
 
-            # Limit to requested number
-            assets = assets[:number_of_assets]
+            # Apply max limit if specified
+            if max_assets is not None:
+                assets = assets[:max_assets]
 
             # Build debug info
             debug_info = {
