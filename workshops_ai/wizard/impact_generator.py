@@ -25,10 +25,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from workshops_ai.settings import get_settings
 from workshops_ai.api.schema.asset import Asset
 from workshops_ai.api.schema.impact import ImpactEvaluation, AssetImpact
-from workshops_ai.wizard.schemas import Service
+from workshops_ai.wizard.schemas import Service, ImpactsResponse
 from workshops_ai.wizard.prompts import (
     IMPACTS_SYSTEM_PROMPT,
     IMPACTS_HUMAN_PROMPT_TEMPLATE,
+    IMPACTS_JSON_SCHEMA,
 )
 from workshops_ai.wizard.catalog_loader import load_impact_catalog, get_impact_names
 from workshops_ai.wizard.cost_calculator import create_usage_metrics, UsageMetrics
@@ -37,6 +38,11 @@ from workshops_ai.wizard.exceptions import (
     AITimeoutError,
     ValidationRetriesExhausted,
     ModelNotAllowedError,
+)
+from workshops_ai.llm.langfuse_helper import (
+    get_langfuse_client,
+    get_langfuse_callback_handler,
+    get_langchain_prompt_from_langfuse,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,7 +74,10 @@ class ImpactGenerator:
         settings = get_settings()
         self.settings = settings
 
-        self.llm = create_wizard_llm_client(model)
+        self.llm = create_wizard_llm_client(
+            model=model,
+            response_format=ImpactsResponse
+        )
         self.model_name = self.llm.model_name
 
         logger.info(
@@ -155,6 +164,7 @@ class ImpactGenerator:
     async def _call_llm_with_retry(
         self,
         prompt: ChatPromptTemplate,
+        session_id: Optional[str] = None,
         **kwargs
     ) -> Tuple[str, UsageMetrics]:
         """
@@ -162,6 +172,7 @@ class ImpactGenerator:
 
         Args:
             prompt: LangChain ChatPromptTemplate
+            session_id: Session ID for Langfuse tracing
             **kwargs: Prompt variables
 
         Returns:
@@ -173,38 +184,110 @@ class ImpactGenerator:
             AIResponseError: If response cannot be parsed
         """
         try:
+            # Get Langfuse callback handler for tracing
+            langfuse_handler = get_langfuse_callback_handler()
+            langfuse_client = get_langfuse_client()
+
             # Format messages
             messages = prompt.format_messages(**kwargs)
 
-            # Invoke LLM (timeout already configured in ChatOpenAI constructor)
-            response = await self.llm.ainvoke(messages)
+            # Prepare invocation kwargs
+            invoke_kwargs = {}
+            if langfuse_handler:
+                invoke_kwargs["config"] = {"callbacks": [langfuse_handler]}
 
-            # Extract response text
-            response_text = response.content
+            # Invoke LLM with Langfuse tracing
+            if langfuse_client:
+                with langfuse_client.start_as_current_span(
+                    name="llm-invoke",
+                    input={
+                        "model": self.model_name,
+                        "messages_count": len(messages),
+                        "temperature": self.settings.llm.temperature,
+                        "timeout_sec": self.settings.wizard.llm_timeout_sec,
+                        "attempt_number": getattr(self, '_current_retry_attempt', 1),
+                    },
+                    metadata={
+                        "max_attempts": self.settings.wizard.llm_max_retries,
+                    }
+                ) as llm_span:
+                    try:
+                        # LLM invocation - CallbackHandler will create child generation under current span
+                        response = await self.llm.ainvoke(messages, **invoke_kwargs)
 
-            # Extract usage from response metadata
-            usage = response.response_metadata.get("token_usage", {})
-            prompt_tokens = usage.get("prompt_tokens", 0)
-            completion_tokens = usage.get("completion_tokens", 0)
+                        # Extract response text
+                        response_text = response.content
 
-            # Create usage metrics (with pricing from settings)
-            metrics = create_usage_metrics(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                model=self.model_name,
-                pricing=self.settings.wizard.openai_pricing
-            )
+                        # Extract usage from response metadata
+                        usage = response.response_metadata.get("token_usage", {})
+                        prompt_tokens = usage.get("prompt_tokens", 0)
+                        completion_tokens = usage.get("completion_tokens", 0)
 
-            logger.info(
-                "LLM call successful",
-                extra={
-                    "model": self.model_name,
-                    "tokens": metrics.total_tokens,
-                    "cost_usd": metrics.cost_usd,
-                }
-            )
+                        # Create usage metrics (with pricing override from settings)
+                        metrics = create_usage_metrics(
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            model=self.model_name,
+                            pricing=self.settings.wizard.openai_pricing
+                        )
 
-            return response_text, metrics
+                        # Update span with success output
+                        llm_span.update(
+                            output={
+                                "response_length": len(response_text),
+                                "response_preview": response_text[:200],
+                                "usage": {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "total_tokens": metrics.total_tokens,
+                                    "cost_usd": metrics.cost_usd,
+                                },
+                            }
+                        )
+
+                        logger.info(
+                            "LLM call successful",
+                            extra={
+                                "model": self.model_name,
+                                "tokens": metrics.total_tokens,
+                                "cost_usd": metrics.cost_usd,
+                            }
+                        )
+
+                        return response_text, metrics
+
+                    except Exception as e:
+                        # Update span with error
+                        llm_span.update(
+                            level="ERROR",
+                            status_message=str(e),
+                        )
+                        raise
+            else:
+                # Fallback without Langfuse
+                response = await self.llm.ainvoke(messages, **invoke_kwargs)
+                response_text = response.content
+                usage = response.response_metadata.get("token_usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+
+                metrics = create_usage_metrics(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    model=self.model_name,
+                    pricing=self.settings.wizard.openai_pricing
+                )
+
+                logger.info(
+                    "LLM call successful",
+                    extra={
+                        "model": self.model_name,
+                        "tokens": metrics.total_tokens,
+                        "cost_usd": metrics.cost_usd,
+                    }
+                )
+
+                return response_text, metrics
 
         except Exception as e:
             # Check if it's a timeout error from OpenAI/httpx
@@ -243,15 +326,16 @@ class ImpactGenerator:
         """
         Parse JSON response and validate impact evaluations.
 
-        Filters out level 0 (not applicable) and preserves catalog order.
+        LLM should only return relevant impacts (level 1-4). If level 0 is found,
+        it's logged as a warning and filtered out.
 
         Args:
             response_text: Raw LLM response
             allowed_impact_names: List of allowed impact names
-            ordered_catalog_names: List of catalog names in order
+            ordered_catalog_names: List of catalog names in order (for fallback sorting)
 
         Returns:
-            List of validated ImpactEvaluation objects (level 1-4 only)
+            List of validated ImpactEvaluation objects (level 1-4 only, in LLM's order)
 
         Raises:
             AIResponseError: If JSON cannot be parsed
@@ -299,12 +383,23 @@ class ImpactGenerator:
                         )
                         continue
 
-                    # Filter out level 0 (not applicable)
+                    # Validate level and filter out level 0
+                    if impact_level == 0:
+                        # LLM should not return level 0, log warning
+                        logger.warning(
+                            f"LLM returned level 0 for '{impact_name}' (should only return 1-4), skipping"
+                        )
+                        continue
+
                     if 1 <= impact_level <= 4:
                         refined.append(ImpactEvaluation(
                             impactName=impact_name,
                             impactLevel=impact_level
                         ))
+                    else:
+                        logger.warning(
+                            f"Invalid impactLevel {impact_level} for '{impact_name}', skipping"
+                        )
 
                 except (ValueError, ValidationError) as e:
                     logger.error(
@@ -313,14 +408,8 @@ class ImpactGenerator:
                     )
                     continue
 
-            # Preserve catalog order
-            order_index = {n: i for i, n in enumerate(ordered_catalog_names)}
-            final_evals = sorted(
-                refined,
-                key=lambda x: order_index.get(x.impactName, 10**9)
-            )
-
-            return final_evals
+            # Return impacts in LLM's order (already sorted by relevance)
+            return refined
 
         except json.JSONDecodeError as e:
             raise AIResponseError(
@@ -339,6 +428,7 @@ class ImpactGenerator:
         organization_profile: Optional[Dict[str, Any]] = None,
         services: Optional[List[Service]] = None,
         user_instructions: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Tuple[List[AssetImpact], UsageMetrics, Dict[str, Any]]:
         """
         Generate impact evaluations for each asset.
@@ -385,11 +475,20 @@ class ImpactGenerator:
             user_instructions=user_instructions,
         )
 
-        # Create LangChain prompt
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", IMPACTS_SYSTEM_PROMPT),
-            ("human", IMPACTS_HUMAN_PROMPT_TEMPLATE),
-        ])
+        # Get Langfuse client for tracing
+        langfuse_client = get_langfuse_client()
+
+        # Prepare span input
+        span_input = {
+            "assets_count": len(assets),
+            "language": language,
+            "min_impacts_per_asset": min_impacts_per_asset,
+            "max_impacts_per_asset": max_impacts_per_asset,
+            "has_website_content": bool(website_content),
+            "has_organization_profile": bool(organization_profile),
+            "has_services": bool(services),
+            "has_user_instructions": bool(user_instructions),
+        }
 
         results: List[AssetImpact] = []
         total_prompt_tokens = 0
@@ -397,111 +496,357 @@ class ImpactGenerator:
         last_response_text = ""
         last_prompt_text = ""
 
-        # Process each asset individually
-        for asset in assets:
-            try:
-                # Single-asset JSON
-                assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
+        # Main span: generate-impacts
+        if langfuse_client and session_id:
+            from langfuse import propagate_attributes
 
-                # Format prompt for debug preview
-                messages = prompt.format_messages(
-                    assets_json=assets_json,
-                    ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
-                    impacts_constraint=impacts_constraint,
-                    language=language,
-                    **sections
-                )
-                last_prompt_text = str(messages)
+            with langfuse_client.start_as_current_span(
+                name="generate-impacts",
+                input=span_input,
+                metadata={"endpoint": "impacts", "model": self.model_name},
+            ) as main_span:
+                with propagate_attributes(session_id=session_id):
+                    # Fetch prompt with child span
+                    with langfuse_client.start_as_current_span(
+                        name="get-impacts-prompts",
+                        input={"prompt_name": "wizard/impacts"},
+                    ) as prompt_span:
+                        # Try to fetch unified prompt from Langfuse
+                        prompt = get_langchain_prompt_from_langfuse(
+                            prompt_name="wizard/impacts",
+                            fallback_template=None,  # Will build fallback manually
+                            fallback_variables=None,
+                        )
 
-                # Call LLM with retry logic
-                response_text, usage_metrics = await self._call_llm_with_retry(
-                    prompt=prompt,
-                    assets_json=assets_json,
-                    ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
-                    impacts_constraint=impacts_constraint,
-                    language=language,
-                    **sections
-                )
+                        prompt_source = "langfuse"
+                        prompt_version = None
+                        prompt_type = "chat"  # Default to chat
+                        prompt_tags = []
+                        prompt_labels = []
 
-                # Accumulate usage
-                total_prompt_tokens += usage_metrics.prompt_tokens
-                total_completion_tokens += usage_metrics.completion_tokens
-                last_response_text = response_text
+                        # If Langfuse fetch failed, build fallback from local templates
+                        if prompt is None:
+                            logger.info("Building fallback prompt from local templates")
+                            prompt = ChatPromptTemplate.from_messages([
+                                ("system", IMPACTS_SYSTEM_PROMPT),
+                                ("human", IMPACTS_HUMAN_PROMPT_TEMPLATE),
+                            ])
+                            prompt_source = "local"
+                        else:
+                            # Extract details from metadata (stored by get_langchain_prompt_from_langfuse)
+                            if hasattr(prompt, 'metadata') and prompt.metadata:
+                                langfuse_prompt_obj = prompt.metadata.get('langfuse_prompt')
+                                if langfuse_prompt_obj:
+                                    if hasattr(langfuse_prompt_obj, 'version'):
+                                        prompt_version = langfuse_prompt_obj.version
+                                    if hasattr(langfuse_prompt_obj, 'tags'):
+                                        prompt_tags = langfuse_prompt_obj.tags or []
+                                    if hasattr(langfuse_prompt_obj, 'labels'):
+                                        prompt_labels = langfuse_prompt_obj.labels or []
+                                    if hasattr(langfuse_prompt_obj, 'type'):
+                                        prompt_type = langfuse_prompt_obj.type
 
-                # Parse and validate
-                evaluations = self._parse_and_validate_impacts(
-                    response_text=response_text,
-                    allowed_impact_names=list(allowed_names_set),
-                    ordered_catalog_names=ordered_catalog_names,
-                )
+                        # Extract prompt messages/content
+                        prompt_content = []
+                        if hasattr(prompt, 'messages'):
+                            for msg in prompt.messages:
+                                if hasattr(msg, 'prompt') and hasattr(msg.prompt, 'template'):
+                                    # Extract role from class name
+                                    class_name = msg.__class__.__name__
+                                    if 'System' in class_name:
+                                        role = 'system'
+                                    elif 'Human' in class_name:
+                                        role = 'user'
+                                    elif 'AI' in class_name or 'Assistant' in class_name:
+                                        role = 'assistant'
+                                    else:
+                                        role = 'unknown'
 
-                # Apply max limit if specified
-                if max_impacts_per_asset is not None:
-                    evaluations = evaluations[:max_impacts_per_asset]
+                                    prompt_content.append({
+                                        "role": role,
+                                        "content": msg.prompt.template
+                                    })
 
-                # Create AssetImpact
-                results.append(AssetImpact(
-                    assetId=asset.id,
-                    assetName=asset.name,
-                    impacts=evaluations
-                ))
+                        prompt_span.update(
+                            output={
+                                "name": "wizard/impacts",
+                                "isFallback": prompt_source == "local",
+                                "version": prompt_version,
+                                "type": prompt_type,
+                                "tags": prompt_tags,
+                                "labels": prompt_labels,
+                                "prompt": prompt_content,
+                            }
+                        )
 
-                logger.info(
-                    f"Impact evaluation completed for asset '{asset.name}'",
-                    extra={
-                        "asset_id": str(asset.id) if asset.id else None,
-                        "impacts_count": len(evaluations),
+                    # Process each asset individually
+                    for asset in assets:
+                        # Child span: evaluate-asset-impact
+                        with langfuse_client.start_as_current_span(
+                            name="evaluate-asset-impact",
+                            input={
+                                "asset_id": str(asset.id) if asset.id else None,
+                                "asset_name": asset.name,
+                                "catalog_impacts_count": len(ordered_catalog_names),
+                            },
+                            metadata={"asset_type": asset.assetType if hasattr(asset, 'assetType') else None},
+                        ) as asset_span:
+                            try:
+                                # Single-asset JSON
+                                assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
+
+                                # Format prompt for debug preview
+                                messages = prompt.format_messages(
+                                    assets_json=assets_json,
+                                    ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                                    impacts_constraint=impacts_constraint,
+                                    impacts_json_schema=IMPACTS_JSON_SCHEMA,
+                                    language=language,
+                                    **sections
+                                )
+                                last_prompt_text = str(messages)
+
+                                # Call LLM with retry logic
+                                response_text, usage_metrics = await self._call_llm_with_retry(
+                                    prompt=prompt,
+                                    session_id=session_id,
+                                    assets_json=assets_json,
+                                    ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                                    impacts_constraint=impacts_constraint,
+                                    impacts_json_schema=IMPACTS_JSON_SCHEMA,
+                                    language=language,
+                                    **sections
+                                )
+
+                                # Accumulate usage
+                                total_prompt_tokens += usage_metrics.prompt_tokens
+                                total_completion_tokens += usage_metrics.completion_tokens
+                                last_response_text = response_text
+
+                                # Parse and validate
+                                evaluations = self._parse_and_validate_impacts(
+                                    response_text=response_text,
+                                    allowed_impact_names=list(allowed_names_set),
+                                    ordered_catalog_names=ordered_catalog_names,
+                                )
+
+                                # Apply max limit if specified
+                                if max_impacts_per_asset is not None:
+                                    evaluations = evaluations[:max_impacts_per_asset]
+
+                                # Create AssetImpact
+                                results.append(AssetImpact(
+                                    assetId=asset.id,
+                                    assetName=asset.name,
+                                    impacts=evaluations
+                                ))
+
+                                # Update asset span with success
+                                asset_span.update(
+                                    output={
+                                        "impacts_count": len(evaluations),
+                                        "impacts_preview": [{"name": e.impactName, "level": e.impactLevel} for e in evaluations[:5]],
+                                    }
+                                )
+
+                                logger.info(
+                                    f"Impact evaluation completed for asset '{asset.name}'",
+                                    extra={
+                                        "asset_id": str(asset.id) if asset.id else None,
+                                        "impacts_count": len(evaluations),
+                                    }
+                                )
+
+                            except AITimeoutError:
+                                # Update span with error
+                                asset_span.update(
+                                    level="ERROR",
+                                    status_message="LLM timeout",
+                                )
+                                # Re-raise timeout errors immediately - don't continue with other assets
+                                raise
+                            except (AIResponseError, ValidationRetriesExhausted):
+                                # Update span with error
+                                asset_span.update(
+                                    level="ERROR",
+                                    status_message="AI response or validation error",
+                                )
+                                # Re-raise AI-specific errors immediately
+                                raise
+                            except Exception as e:
+                                # Update span with error
+                                asset_span.update(
+                                    level="ERROR",
+                                    status_message=str(e),
+                                )
+
+                                logger.error(
+                                    f"Impact evaluation failed for asset '{asset.name}'",
+                                    extra={
+                                        "asset_id": str(asset.id) if asset.id else None,
+                                        "error": str(e),
+                                        "error_type": type(e).__name__,
+                                    }
+                                )
+                                # For other unexpected errors, continue with other assets
+                                results.append(AssetImpact(
+                                    assetId=asset.id,
+                                    assetName=asset.name,
+                                    impacts=[]
+                                ))
+
+                    # Create aggregated usage metrics
+                    aggregated_metrics = create_usage_metrics(
+                        prompt_tokens=total_prompt_tokens,
+                        completion_tokens=total_completion_tokens,
+                        model=self.model_name,
+                        pricing=self.settings.wizard.openai_pricing
+                    )
+
+                    # Build debug info
+                    debug_info = {
+                        "assets_processed": len(assets),
+                        "catalog_impacts_count": len(ordered_catalog_names),
+                        "min_impacts_per_asset": min_impacts_per_asset,
+                        "max_impacts_per_asset": max_impacts_per_asset,
+                        "impacts_constraint": impacts_constraint,
+                        "last_prompt_preview": last_prompt_text[:500],
+                        "last_response_preview": last_response_text[:500],
                     }
-                )
 
-            except AITimeoutError:
-                # Re-raise timeout errors immediately - don't continue with other assets
-                raise
-            except (AIResponseError, ValidationRetriesExhausted):
-                # Re-raise AI-specific errors immediately
-                raise
-            except Exception as e:
-                logger.error(
-                    f"Impact evaluation failed for asset '{asset.name}'",
-                    extra={
-                        "asset_id": str(asset.id) if asset.id else None,
-                        "error": str(e),
-                        "error_type": type(e).__name__,
-                    }
-                )
-                # For other unexpected errors, continue with other assets
-                results.append(AssetImpact(
-                    assetId=asset.id,
-                    assetName=asset.name,
-                    impacts=[]
-                ))
+                    # Update main span with final output
+                    main_span.update(
+                        output={
+                            "assets_processed": len(results),
+                            "total_impacts_generated": sum(len(r.impacts) for r in results),
+                            "total_tokens": aggregated_metrics.total_tokens,
+                            "cost_usd": aggregated_metrics.cost_usd,
+                        }
+                    )
 
-        # Create aggregated usage metrics
-        aggregated_metrics = create_usage_metrics(
-            prompt_tokens=total_prompt_tokens,
-            completion_tokens=total_completion_tokens,
-            model=self.model_name,
-            pricing=self.settings.wizard.openai_pricing
-        )
+                    logger.info(
+                        "Impact evaluations generated successfully",
+                        extra={
+                            "assets_count": len(assets),
+                            "total_tokens": aggregated_metrics.total_tokens,
+                            "cost_usd": aggregated_metrics.cost_usd,
+                        }
+                    )
 
-        # Build debug info
-        debug_info = {
-            "assets_processed": len(assets),
-            "catalog_impacts_count": len(ordered_catalog_names),
-            "min_impacts_per_asset": min_impacts_per_asset,
-            "max_impacts_per_asset": max_impacts_per_asset,
-            "impacts_constraint": impacts_constraint,
-            "last_prompt_preview": last_prompt_text[:500],
-            "last_response_preview": last_response_text[:500],
-        }
+                    return results, aggregated_metrics, debug_info
+        else:
+            # Fallback without Langfuse tracing
+            # Create fallback prompt from local templates
+            logger.info("Building fallback prompt from local templates (no Langfuse)")
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", IMPACTS_SYSTEM_PROMPT),
+                ("human", IMPACTS_HUMAN_PROMPT_TEMPLATE),
+            ])
 
-        logger.info(
-            "Impact evaluations generated successfully",
-            extra={
-                "assets_count": len(assets),
-                "total_tokens": aggregated_metrics.total_tokens,
-                "cost_usd": aggregated_metrics.cost_usd,
+            for asset in assets:
+                try:
+                    # Single-asset JSON
+                    assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
+
+                    # Format prompt for debug preview
+                    messages = prompt.format_messages(
+                        assets_json=assets_json,
+                        ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                        impacts_constraint=impacts_constraint,
+                        impacts_json_schema=IMPACTS_JSON_SCHEMA,
+                        language=language,
+                        **sections
+                    )
+                    last_prompt_text = str(messages)
+
+                    # Call LLM with retry logic
+                    response_text, usage_metrics = await self._call_llm_with_retry(
+                        prompt=prompt,
+                        session_id=None,
+                        assets_json=assets_json,
+                        ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                        impacts_constraint=impacts_constraint,
+                        impacts_json_schema=IMPACTS_JSON_SCHEMA,
+                        language=language,
+                        **sections
+                    )
+
+                    # Accumulate usage
+                    total_prompt_tokens += usage_metrics.prompt_tokens
+                    total_completion_tokens += usage_metrics.completion_tokens
+                    last_response_text = response_text
+
+                    # Parse and validate
+                    evaluations = self._parse_and_validate_impacts(
+                        response_text=response_text,
+                        allowed_impact_names=list(allowed_names_set),
+                        ordered_catalog_names=ordered_catalog_names,
+                    )
+
+                    # Apply max limit if specified
+                    if max_impacts_per_asset is not None:
+                        evaluations = evaluations[:max_impacts_per_asset]
+
+                    # Create AssetImpact
+                    results.append(AssetImpact(
+                        assetId=asset.id,
+                        assetName=asset.name,
+                        impacts=evaluations
+                    ))
+
+                    logger.info(
+                        f"Impact evaluation completed for asset '{asset.name}'",
+                        extra={
+                            "asset_id": str(asset.id) if asset.id else None,
+                            "impacts_count": len(evaluations),
+                        }
+                    )
+
+                except AITimeoutError:
+                    raise
+                except (AIResponseError, ValidationRetriesExhausted):
+                    raise
+                except Exception as e:
+                    logger.error(
+                        f"Impact evaluation failed for asset '{asset.name}'",
+                        extra={
+                            "asset_id": str(asset.id) if asset.id else None,
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                        }
+                    )
+                    results.append(AssetImpact(
+                        assetId=asset.id,
+                        assetName=asset.name,
+                        impacts=[]
+                    ))
+
+            # Create aggregated usage metrics
+            aggregated_metrics = create_usage_metrics(
+                prompt_tokens=total_prompt_tokens,
+                completion_tokens=total_completion_tokens,
+                model=self.model_name,
+                pricing=self.settings.wizard.openai_pricing
+            )
+
+            # Build debug info
+            debug_info = {
+                "assets_processed": len(assets),
+                "catalog_impacts_count": len(ordered_catalog_names),
+                "min_impacts_per_asset": min_impacts_per_asset,
+                "max_impacts_per_asset": max_impacts_per_asset,
+                "impacts_constraint": impacts_constraint,
+                "last_prompt_preview": last_prompt_text[:500],
+                "last_response_preview": last_response_text[:500],
             }
-        )
 
-        return results, aggregated_metrics, debug_info
+            logger.info(
+                "Impact evaluations generated successfully",
+                extra={
+                    "assets_count": len(assets),
+                    "total_tokens": aggregated_metrics.total_tokens,
+                    "cost_usd": aggregated_metrics.cost_usd,
+                }
+            )
+
+            return results, aggregated_metrics, debug_info

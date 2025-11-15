@@ -198,10 +198,11 @@ async def get_http_client() -> AsyncIterator[httpx.AsyncClient]:
 
 @retry(
     reraise=True,
-    stop=stop_after_attempt(lambda: get_settings().wizard.scrape_max_retries + 1),
+    stop=stop_after_attempt(get_settings().wizard.scrape_max_retries + 1),
     wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
     retry=retry_if_exception_type((
         httpx.ConnectError,
+        httpx.ConnectTimeout,
         httpx.ReadTimeout,
         httpx.NetworkError
     )),
@@ -294,24 +295,25 @@ async def fetch_with_final_url(url: str) -> Optional[Tuple[str, str]]:
 
             return text, final_url
 
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.NetworkError) as e:
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.NetworkError) as e:
             # Retry-able errors - tenacity will handle
             logger.debug(
                 "fetch_retry",
-                extra={"url": url, "error": str(e), "error_type": type(e).__name__}
+                extra={"url": url, "error": str(e) or type(e).__name__, "error_type": type(e).__name__}
             )
             raise
 
         except httpx.HTTPError as e:
             # Non-retryable HTTP errors
+            error_msg = str(e) or type(e).__name__
             logger.error(
                 "fetch_failed",
-                extra={"url": url, "error": str(e), "error_type": type(e).__name__}
+                extra={"url": url, "error": error_msg, "error_type": type(e).__name__}
             )
 
             raise ScraperError(
                 url=url,
-                reason=f"HTTP error: {str(e)}",
+                reason=f"HTTP error: {error_msg}",
                 error_type=ScraperErrorType.NETWORK,
                 details={"error_type": type(e).__name__}
             ) from e
@@ -333,10 +335,11 @@ async def fetch_with_final_url(url: str) -> Optional[Tuple[str, str]]:
 
 @retry(
     reraise=True,
-    stop=stop_after_attempt(lambda: get_settings().wizard.scrape_max_retries + 1),
+    stop=stop_after_attempt(get_settings().wizard.scrape_max_retries + 1),
     wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
     retry=retry_if_exception_type((
         httpx.ConnectError,
+        httpx.ConnectTimeout,
         httpx.ReadTimeout,
         httpx.NetworkError
     )),

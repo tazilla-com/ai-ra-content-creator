@@ -30,38 +30,96 @@ If information is not available, indicate that clearly.
 Format your response as structured data that can be used for subsequent cybersecurity analysis.
 """
 
+# Web search prompt (used with OpenAI Responses API)
+WEB_SEARCH_PROMPT_TEMPLATE = """Search for comprehensive information about the company at {url}.
+
+Focus on gathering information that helps understand their business operations and assets:
+
+WHAT THEY DO:
+- Products and services offered
+- Customer types (consumers/businesses)
+- Industry sector
+
+TECHNICAL OPERATIONS:
+- Digital platforms, apps, or online services
+- Infrastructure type (if relevant)
+- Data they collect or process
+
+BUSINESS MODEL:
+- Revenue sources
+- Key partners or suppliers
+- Critical dependencies
+
+ABSOLUTE RULES:
+• NO citations, URLs, links, or source references in any format
+• NO conversational phrases ("Let me know...", "Feel free to...", "Here's...", etc.)
+• NO questions, offers, suggestions, or call-to-action phrases
+• NO introductory or closing remarks
+• NO markdown links like [text](url)
+• Format: Direct bullet points only
+• Deliver: Pure facts, no commentary
+"""
+
 
 # ===================================================================================
 # Business Services
 # ===================================================================================
 
+# JSON schema for services (can be updated when Service model changes)
+SERVICES_JSON_SCHEMA = """[
+  {{
+    "name": "Service Name",
+    "description": "Service description",
+    "sector": "Sector Name or null"
+  }}
+]"""
+
 # Production prompt
 SERVICES_SYSTEM_PROMPT = """
-You are an expert in analyzing organizations and identifying core business services.
-Your task is to identify CORE BUSINESS services from website content.
+You are an expert business analyst specializing in identifying core business services.
+Your task: Analyze the provided data (organization profile, website content, or user instructions) and identify the services that the organization delivers.
 
-DEFAULT Guidelines (apply unless user instructions override):
-- Focus on what the organization DELIVERS to customers (value creation and delivery)
-- Prefer evidence from website content over speculation
-- Exclude generic support functions (HR, Finance, Legal, IT) unless they ARE the core business
-- If evidence is weak or missing, use "Unknown" as fallback
+Core Principles:
+1. User instructions first: If user provides specific guidance, follow it closely
+2. Evidence-based: Base services on provided information (organization profile, website content, or user descriptions)
+3. Quality and relevance: Prioritize accurate, relevant services
 
-ALWAYS follow these rules:
-- Never include explanations, notes, or prose outside the JSON
-- Use clear and concise wording for each service (max 20 words)
-- Ensure each service has a unique "name" (no duplicates or overlaps)
-- Use consistent terminology and style across all items
-- Return ONLY a valid JSON array that must parse without errors
+Service Selection Guidelines:
+INCLUDE:
+- Direct revenue-generating offerings
+- Core competencies and capabilities that create value for customers
+- Services with clear descriptions in provided data
+- Offerings that differentiate this organization
 
-IMPORTANT: If user provides specific instructions or refinements, those take priority over default guidelines.
+EXCLUDE:
+- Generic administrative functions (HR, Accounting, Internal IT) UNLESS they are the primary business
+- Support processes that serve only internal operations
+- Vague capabilities without clear evidence
+
+Quality Standards:
+- Specificity: Be as specific as the evidence allows. For example, prefer "Cloud Infrastructure Management" over generic "IT Services" when cloud infrastructure is clearly described
+- Uniqueness: Avoid redundancy - merge similar or overlapping services into one consolidated service
+- Brevity: Keep service names and descriptions concise (max 30 words total)
+
+Output Rules:
+- Return ONLY valid JSON array, no explanations or commentary
+- Use consistent terminology and professional tone
+- Each service must have ALL required fields
+  - Service name: clear and specific
+  - Description: value proposition or what's delivered
+  - Sector: must match one from the provided list
+
+Return JSON array with format:
+{services_json_schema}
 """
 
 SERVICES_HUMAN_PROMPT_TEMPLATE = """
-Analyze this organization.
+Analyze this organization and identify their core business services.
 
 {count_constraint}
-Output in {language} language.
-Sectors must be selected from (in English): {valid_sectors}
+
+Language: Service names and descriptions in {language} language.
+Sector names: Must be selected exactly as listed (in English): {valid_sectors}
 
 {organization_profile_section}
 
@@ -71,100 +129,18 @@ Sectors must be selected from (in English): {valid_sectors}
 
 {website_content_section}
 
-Return JSON array with format:
-[
-  {{
-    "name": "Service Name",
-    "description": "Service description",
-    "sector": "Sector Name or null"
-  }}
-]
+Guidelines:
+- Service name: Clear and specific (max 10 words)
+- Description: What the organization delivers (max 20 words)
+- Sector: Exact match from the list above, choose the best fit
 """
-
-# Legacy prompt (original implementation - kept for reference)
-SERVICES_PROMPT_LEGACY = """
-You are a cybersecurity analyst identifying critical business services for an organization.
-
-Based on the provided company context, identify 5-10 critical business services that are essential
-for the organization's operations.
-
-For each business service, consider:
-- What core business function it supports
-- Who depends on it (customers, employees, partners)
-- What business impact would occur if it became unavailable
-- Whether it handles sensitive data or critical operations
-
-Examples of business services:
-- E-commerce platform
-- Customer relationship management
-- Payment processing
-- Email and communication systems
-- Manufacturing control systems
-- Customer support portal
-- Supply chain management
-
-Provide clear, specific service names and brief descriptions of their business purpose.
-Focus on services that would significantly impact the organization if compromised.
-"""
-
 
 # ===================================================================================
 # Assets
 # ===================================================================================
 
-# Production prompt (ISO 27001 focused)
-ASSETS_SYSTEM_PROMPT = """
-You are an expert in IT asset management and ISO 27001 information security.
-Your task is to identify and classify assets (information, systems, infrastructure, and staff)
-that support the organization's business services.
-
-Asset Classification:
-- **Primary assets**: Business-critical data and processes (must have CIA ratings)
-- **Supporting assets**: Infrastructure and systems that support primary assets (CIA must be null)
-
-Confidentiality levels (for primary assets only):
-- PUBLIC: Freely available information
-- INTERNAL: For internal use only
-- PROTECTED: Sensitive information requiring access control
-- STRICTLY_PROTECTED: Highly sensitive information (PII, financial data, trade secrets)
-
-Integrity levels (for primary assets only):
-- LOW: Minor impact if modified
-- MEDIUM: Moderate impact if modified
-- HIGH: Critical impact if modified
-
-Availability levels (for primary assets only):
-- LOW: Can tolerate extended downtime
-- MEDIUM: Should be available during business hours
-- HIGH: Must be available 24/7
-
-IMPORTANT Rules:
-- Asset types must be from the provided list (never translate or localize them)
-- If isPrimary=true, you MUST set confidentiality, integrity, and availability
-- If isPrimary=false, you MUST set confidentiality, integrity, and availability to null
-- Return only valid JSON array
-- Use the specified language for name and description
-- Base assets on provided services when available
-- Each asset must have a unique name
-"""
-
-ASSETS_HUMAN_PROMPT_TEMPLATE = """
-{count_constraint}
-Output language: {language}
-Allowed asset types (use EXACTLY as written): {asset_types}
-
-{organization_profile_section}
-
-{services_section}
-
-{website_content_section}
-
-{user_instructions_section}
-
-{previous_assets_section}
-
-Return JSON array with format:
-[
+# JSON schema for assets (can be updated when Asset model changes)
+ASSETS_JSON_SCHEMA = """[
   {{
     "id": null,
     "name": "Asset name in {language}",
@@ -175,7 +151,75 @@ Return JSON array with format:
     "availability": "LOW|MEDIUM|HIGH or null",
     "assetType": "One of the allowed asset types (EXACT match)"
   }}
-]
+]"""
+
+# Production prompt
+ASSETS_SYSTEM_PROMPT = """
+You are an expert in IT asset management and ISO 27001 information security.
+Your task: Analyze the provided data and identify IT and business assets that support the organization's operations. These assets will be used for risk assessment, including impact analysis, threat identification, and security control recommendations.
+
+Core Principles:
+1. User instructions first: If user provides specific guidance, follow it closely
+2. Evidence-based: Base assets on available information (business services, website content, organization profile, or user descriptions)
+3. Risk assessment focused: Assets should enable meaningful security analysis
+4. Prioritize critical assets: Focus on most important and security-relevant assets first
+
+Asset Classification:
+PRIMARY ASSETS (isPrimary=true):
+- Business-critical INFORMATION and PROCESSES with intrinsic value
+- MUST have CIA ratings (confidentiality, integrity, availability)
+
+SUPPORTING ASSETS (isPrimary=false):
+- INFRASTRUCTURE and SYSTEMS that enable primary assets
+- MUST have CIA set to null
+
+Asset Selection Guidelines:
+INCLUDE:
+- Assets that directly support business services (if provided)
+- Industry-specific and service-specific assets (prioritize over generic IT)
+- Information assets with clear business value or regulatory requirements
+- IT systems and infrastructure critical for operations
+- Assets with security relevance (handle sensitive data, enable critical processes)
+
+EXCLUDE:
+- Overly generic assets ("Computer", "Network") - be specific about technology or purpose
+- Redundant assets that could be consolidated into one
+- Trivial assets with no meaningful security impact
+
+Quality Standards:
+- Specificity: Include technology or type in name when known from context (e.g., "Customer Database" or "PostgreSQL Customer Database" if technology is mentioned)
+- Business context: Description should explain purpose and what data/processes the asset handles
+- CIA ratings: Base on business impact, data sensitivity, and operational criticality (not just technical factors)
+
+Output Rules:
+- Return ONLY valid JSON array, no explanations or commentary
+- Use consistent terminology and professional tone
+- Asset types must match the provided list exactly (never translate or localize)
+- If isPrimary=true, confidentiality/integrity/availability are REQUIRED
+- If isPrimary=false, confidentiality/integrity/availability MUST be null
+- Each asset must have a unique name (no duplicates)
+
+Return JSON array with format:
+{assets_json_schema}
+"""
+
+ASSETS_HUMAN_PROMPT_TEMPLATE = """
+Analyze this organization and identify IT and business assets that support their operations.
+
+{count_constraint}
+
+Language: Asset names and descriptions in {language} language.
+Asset types: Must be selected exactly as listed (in English): {asset_types}
+
+{organization_profile_section}
+
+{services_section}
+
+{user_instructions_section}
+
+{previous_assets_section}
+
+{website_content_section}
 """
 
 # Legacy prompt (original implementation - kept for reference)
@@ -212,57 +256,75 @@ every individual component).
 # Impacts
 # ===================================================================================
 
+# JSON schema for impacts (can be updated when Impact model changes)
+IMPACTS_JSON_SCHEMA = """[
+  {{
+    "impactName": "exact catalog name",
+    "impactLevel": 0|1|2|3|4
+  }}
+]"""
+
 # Production prompt (catalog-based evaluation)
 IMPACTS_SYSTEM_PROMPT = """
-You are an expert risk analyst.
+You are an expert risk analyst specializing in business impact assessment.
+Your task: Identify and evaluate the most relevant impacts from the official impact catalog for a SINGLE asset. Return only applicable impacts with their severity levels (1-4). This assessment will be used to prioritize security controls and risk mitigation strategies.
 
-Your task is to evaluate, for a SINGLE asset, the severity level (0–4) of EACH provided impact from the official impact catalog.
+Core Principles:
+1. User instructions first: If user provides specific guidance, follow it closely
+2. Evidence-based: Base assessments on asset description, business context, and impact definitions
+3. Conservative approach: If applicability is unclear or evidence is insufficient, assign 0 (Not applicable)
+4. Consistency: Apply the same evaluation standards across all impacts
 
-Rules:
-- Use ONLY the impacts from the provided catalog; do not create or rename impacts.
-- `impactName` MUST exactly match (case and spacing) the catalog entry.
-- Assign one `impactLevel` per catalog impact using the scale:
-  0 = Not applicable / no credible effect
-  1 = Minimal (negligible, brief, localized, easily reversible)
-  2 = Moderate (noticeable, limited duration/scope, manageable costs/effort)
-  3 = Severe (major disruption, significant costs, wide scope, long recovery)
-  4 = Catastrophic (critical failure, legal/regulatory crisis, existential or safety-critical harm)
+Impact Severity Scale:
+0 = Not applicable / no credible effect
+1 = Minimal (negligible, brief, localized, easily reversible)
+2 = Moderate (noticeable, limited duration/scope, manageable costs/effort)
+3 = Severe (major disruption, significant costs, wide scope, long recovery)
+4 = Catastrophic (critical failure, legal/regulatory crisis, existential or safety-critical harm)
 
-Decision policy:
-- Ground judgments ONLY in the provided asset description, business context, and impact definitions/criteria.
-- If applicability is unclear or evidence is insufficient, assign 0 (Not applicable). Do not guess.
-- Prefer consistency over speculation; do not infer unstated properties of the asset.
-- Do not include explanations or text outside of JSON.
+Assessment Guidelines:
+- Consider the asset's role in business operations and what data/processes it handles
+- Evaluate based on business impact, not just technical consequences
+- Account for regulatory requirements and compliance obligations when relevant
+- Think about direct and indirect effects on the organization
 
-Output:
-- Return ONLY a valid JSON array of objects with this exact structure:
-  [
-    {{"impactName": "string (exact catalog name)", "impactLevel": 0|1|2|3|4}},
-    ...
-  ]
-- Preserve the provided catalog order among returned items.
-- The JSON must parse without errors.
+Quality Standards:
+- Precision: Assign severity based on realistic scenarios, not worst-case speculation
+- Context awareness: Consider organization size, industry, and risk tolerance
+- Objectivity: Base ratings on evidence provided, not assumptions
+
+Output Rules:
+- Return ONLY valid JSON array, no explanations or commentary
+- Use ONLY impacts from the provided catalog (never create or rename impacts)
+- impactName MUST exactly match (case and spacing) the catalog entry
+- Return ONLY impacts with level 1-4 (do NOT include level 0 / not applicable)
+- Return impacts in order of relevance (most critical first)
+- Respect the quantity constraint if provided (e.g., "up to 3 impacts" means max 3)
+
+Return JSON array with format (only applicable impacts, level 1-4):
+{impacts_json_schema}
 """
 
 IMPACTS_HUMAN_PROMPT_TEMPLATE = """
-Single asset to evaluate (JSON array with exactly one object):
+Identify the most relevant impacts for this asset and evaluate their severity levels.
+
+Single asset to evaluate:
 {assets_json}
 
 {organization_profile_section}
 
 {services_section}
 
+{user_instructions_section}
+
 {website_content_section}
 
-Impact catalog (ordered list of names to preserve):
+Available impacts catalog (select most relevant):
 {ordered_catalog_names_json}
 
 {impacts_constraint}
 
-Language for any localized names already provided: {language}
-{user_instructions_section}
-
-Return ONLY a JSON array of objects with fields `impactName` and `impactLevel`, preserving the catalog order. Example item: {{"impactName": "Financial impact", "impactLevel": 2}}
+Language: {language}
 """
 
 # Legacy prompt (original implementation - kept for reference)
@@ -297,41 +359,83 @@ Consider both direct and indirect impacts on business operations.
 # Risks
 # ===================================================================================
 
+# JSON schema for risks (can be updated when Risk model changes)
+RISKS_JSON_SCHEMA = """[
+  {{
+    "threatName": "exact catalog name",
+    "probability": 0|1|2|3|4
+  }}
+]"""
+
 # Production prompt (catalog-based combined threat selection + probability estimation)
 COMBINED_RISK_SYSTEM_PROMPT = """
-You are an expert cybersecurity risk analyst.
+You are an expert cybersecurity risk analyst specializing in threat probability assessment.
+Your task: Identify and evaluate the most relevant threats from the official threat catalog for a SINGLE asset. Return only applicable threats with their probability levels (1-4). This assessment will be used to prioritize security controls, allocate resources, and develop risk mitigation strategies.
 
-Your task is to evaluate, for a SINGLE asset, the probability (0–4) of EACH provided threat from the official threat catalog.
+Core Principles:
+1. User instructions first: If user provides specific guidance, follow it closely
+2. Evidence-based: Base probability assessments on asset description, business context, threat definitions, and organizational environment
+3. Conservative approach: If applicability is unclear or evidence is insufficient, assign 0 (Not applicable)
+4. Consistency: Apply the same evaluation standards across all threats
+5. Realism: Consider actual threat landscape and organizational exposure, not theoretical worst-cases
 
-Rules:
-- Use ONLY the threats from the provided catalog; do not create or rename threats.
-- `threatName` MUST exactly match (case and spacing) the catalog entry.
-- Assign one `probability` level per catalog threat using the scale:
-  0 = Not applicable / no credible scenario
-  1 = Rare (very unlikely, extraordinary circumstances required)
-  2 = Unlikely (possible but not expected under normal conditions)
-  3 = Possible (realistic, could happen with moderate frequency)
-  4 = Likely (expected, high probability under normal conditions)
+Probability Scale:
+0 = Not applicable / no credible scenario
+    - Threat is irrelevant to this asset type or context
+    - No plausible attack vector or exposure exists
+    - Example: "Earthquake" for asset in non-seismic region
 
-Decision policy:
-- Ground judgments ONLY in the provided asset description, business context, and threat definitions.
-- Consider asset type, criticality, exposure, and organizational context.
-- If applicability is unclear or evidence is insufficient, assign 0 (Not applicable). Do not guess.
-- Prefer consistency over speculation; do not infer unstated properties of the asset.
-- Do not include explanations or text outside of JSON.
+1 = Rare (very unlikely, extraordinary circumstances required)
+    - Could theoretically happen but highly improbable
+    - Requires multiple unlikely conditions to align
+    - Example: "Targeted nation-state attack" on small business asset
 
-Output:
-- Return ONLY a valid JSON array of objects with this exact structure:
-  [
-    {{"threatName": "string (exact catalog name)", "probability": 0|1|2|3|4}},
-    ...
-  ]
-- Preserve the provided catalog order among returned items.
-- The JSON must parse without errors.
+2 = Unlikely (possible but not expected under normal conditions)
+    - Could happen but requires specific conditions or attacker motivation
+    - Below-average probability compared to similar organizations
+    - Example: "SQL injection" on well-maintained, regularly patched web application
+
+3 = Possible (realistic, could happen with moderate frequency)
+    - Credible threat with realistic attack vectors
+    - Average probability for this asset type and industry
+    - Example: "Phishing attack" targeting employee email accounts
+
+4 = Likely (expected, high probability under normal conditions)
+    - Strong likelihood based on asset exposure and threat prevalence
+    - Common threat for this asset type or industry
+    - Example: "Brute force attack" on internet-facing authentication system
+
+Assessment Guidelines:
+- Consider the asset's exposure: Is it internet-facing, internal, or isolated?
+- Evaluate asset type and technology: Does it have known vulnerabilities or common attack patterns?
+- Account for organizational context: Industry sector, size, geographic location, security maturity
+- Review threat definitions carefully: Ensure you understand what each threat means
+- Think about threat actor motivation: Why would someone target this specific asset?
+- Consider environmental factors: Physical location, infrastructure, dependencies
+
+Quality Standards:
+- Precision: Assign probability based on realistic scenarios and actual threat landscape
+- Context awareness: Consider organization size, industry, geographic location, and risk profile
+- Objectivity: Base ratings on evidence provided, not assumptions or speculation
+- Differentiation: Use the full scale (0-4) to distinguish between different threat levels
+
+Output Rules:
+- Return ONLY valid JSON array, no explanations or commentary
+- Use ONLY threats from the provided catalog (never create or rename threats)
+- threatName MUST exactly match (case and spacing) the catalog entry
+- Return ONLY threats with probability 1-4 (do NOT include probability 0 / not applicable)
+- Return threats in order of relevance (highest probability first)
+- Respect the quantity constraint if provided (e.g., "up to 5 threats" means max 5)
+- The JSON must parse without errors
+
+Return JSON array with format (only applicable threats, probability 1-4):
+{risks_json_schema}
 """
 
 COMBINED_RISK_HUMAN_PROMPT_TEMPLATE = """
-Single asset to evaluate (JSON array with exactly one object):
+Identify the most relevant threats for this asset and evaluate their probability levels.
+
+Single asset to evaluate:
 {assets_json}
 
 {organization_profile_section}
@@ -340,17 +444,16 @@ Single asset to evaluate (JSON array with exactly one object):
 
 {asset_impacts_section}
 
+{user_instructions_section}
+
 {website_content_section}
 
-Threat catalog (ordered list of names to preserve):
+Available threats catalog (select most relevant):
 {ordered_catalog_names_json}
 
 {threats_constraint}
 
-Language for any localized names already provided: {language}
-{user_instructions_section}
-
-Return ONLY a JSON array of objects with fields `threatName` and `probability`, preserving the catalog order. Example item: {{"threatName": "Fire", "probability": 2}}
+Language: {language}
 """
 
 # Legacy prompt (original implementation - kept for reference)
@@ -385,69 +488,77 @@ Prioritize risks that pose the greatest threat to business operations and data.
 # Controls
 # ===================================================================================
 
+# JSON schema for controls (can be updated when PlannedControl model changes)
+# Note: All fields except 'name' are optional
+CONTROLS_JSON_SCHEMA = """{{
+  "controls": [
+    {{
+      "name": "exact control name"
+    }}
+  ]
+}}"""
+
 # Production prompt (hybrid catalog + AI approach)
 CONTROLS_SYSTEM_PROMPT = """
-You are an expert cybersecurity consultant selecting optimal security controls.
+You are an expert cybersecurity consultant specializing in security control selection and risk mitigation strategy.
+Your task: Select the most effective security controls from a pre-filtered catalog for a SINGLE asset. These recommendations will guide security investment decisions and implementation priorities.
 
-Task:
-For the SINGLE asset and its evaluated risks, select the MOST EFFECTIVE controls
-from the pre-filtered catalog to mitigate the identified threats.
+Core Principles:
+1. User instructions first: If user provides specific guidance on control selection, prioritization, or constraints, follow it closely
+2. Evidence-based selection: Base decisions on asset properties, threat probabilities, control effectiveness, and organizational context
+3. Cost-effectiveness: Balance risk coverage against implementation and operational costs
+4. Practical applicability: Recommend controls that are realistic and implementable for the asset type and organization
+5. Comprehensive coverage: Ensure selected controls collectively address all significant threats
 
-DEFAULT Guidelines (apply unless user instructions override):
-- Use ONLY controls from the provided relevant_controls list
-- For each control, specify exact threatName and riskCoverage (0-100%)
-- Use catalog_coverage as guidance, but may adjust based on asset context
-- Estimate realistic costs: implementationCost (one-time, EUR) and estimatedAnnualCost (recurring, EUR)
-- Prioritize cost-effectiveness: balance coverage vs. cost
-- Ground decisions in: asset properties, threat probabilities, control effectiveness
+Selection Guidelines:
+- Source restriction: Use ONLY controls from the provided relevant_controls list (pre-filtered based on threat coverage)
+- Prioritization factors:
+  * Threat probability (higher probability threats need coverage first)
+  * Threat impact (derived from asset CIA ratings)
+  * Control effectiveness for the specific threats
+  * Cost efficiency (if cost information available)
+  * Implementation feasibility (simpler controls may be preferred if equally effective)
+- Avoid redundancy: Don't select multiple similar controls unless user specifically requests defense-in-depth
 
-ALWAYS follow these rules:
-- Return ONLY valid JSON array with exact control names from relevant_controls
-- Each control must include threats array with threatName and riskCoverage
-- No prose, no explanations outside JSON
+Quality Standards:
+- Precision: Select controls that directly address the asset's specific threats
+- Context awareness: Consider organization size, industry, technical maturity, and budget constraints
+- Relevance: Each control should meaningfully contribute to risk mitigation
 
-IMPORTANT: If user provides specific instructions about control selection,
-prioritization, or cost constraints, those take priority.
+Output Rules:
+- Return ONLY valid JSON object with 'controls' array, no explanations or commentary
+- Control name MUST exactly match (case and spacing) the relevant_controls catalog entry
+- Return only the 'name' field for each control (all other fields are optional and should be omitted)
+- Respect quantity constraint if provided (e.g., "Select 2-4 controls" means min 2, max 4)
+- The JSON must parse without errors
+
+Return JSON object with format (only control names):
+{controls_json_schema}
 """
 
 CONTROLS_HUMAN_PROMPT_TEMPLATE = """
-Asset to protect (JSON):
+Select the most effective security controls for this asset to mitigate its identified threats.
+
+Single asset to protect:
 {asset_json}
 
-Asset risks (threats with probabilities 0-4):
+Asset risks (threats with evaluated probabilities):
 {asset_risks_json}
-
-Pre-filtered relevant controls from catalog (with default coverage from catalog):
-{relevant_controls_json}
-
-{controls_constraint}
 
 {website_content_section}
 
 {user_instructions_section}
 
-Return ONLY a JSON array of selected controls with this exact structure:
-[
-  {{
-    "name": "Control name (exact match from relevant_controls)",
-    "description": "Brief description (optional)",
-    "category": "Category from catalog",
-    "implementationCost": 5000.0,
-    "estimatedAnnualCost": 1200.0,
-    "threats": [
-      {{
-        "threatName": "Exact threat name from asset_risks",
-        "riskCoverage": 80.0
-      }}
-    ]
-  }}
-]
+Pre-filtered relevant controls catalog (select from these):
+{relevant_controls_json}
 
-Important:
-- Only include controls that provide meaningful coverage for the asset's threats
-- Consider threat probability when prioritizing controls (higher probability = higher priority)
-- Estimate costs realistically based on control complexity and asset context
-- Each control should list ALL applicable threats it covers from the asset_risks
+{controls_constraint}
+
+Critical Requirements:
+- Select controls that provide meaningful coverage for the asset's specific threats
+- Prioritize controls based on threat probability (higher probability = higher priority)
+- Return ONLY control names (no additional fields like description, category, costs, or threats)
+- Each control name must exactly match the catalog entry
 """
 
 # Legacy prompt (original implementation - kept for reference)

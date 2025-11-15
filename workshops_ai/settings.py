@@ -286,6 +286,25 @@ class LangchainSettings(BaseModel):
     project: Optional[str] = None
 
 
+class LangfuseSettings(BaseModel):
+    """
+    Langfuse tracing and prompt management config.
+
+    Canonical (nested) ENV:
+      WORKSHOPS_AI_LANGFUSE__ENABLED=true
+      WORKSHOPS_AI_LANGFUSE__PUBLIC_KEY=pk-lf-...
+      WORKSHOPS_AI_LANGFUSE__SECRET_KEY=sk-lf-...
+      WORKSHOPS_AI_LANGFUSE__BASE_URL=https://cloud.langfuse.com
+
+    Legacy (flat) ENV handled in AppSettings.model_post_init():
+      LANGFUSE_ENABLED, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL
+    """
+    enabled: bool = False
+    public_key: Optional[str] = None
+    secret_key: Optional[str] = None
+    base_url: str = "https://cloud.langfuse.com"
+
+
 class ManagerSettings(BaseModel):
     """
     Manager / router timeouts for agents (production-grade knobs).
@@ -313,6 +332,9 @@ class WizardSettings(BaseModel):
       WORKSHOPS_AI_WIZARD__EXPOSE_DEBUG_INFO=true
       WORKSHOPS_AI_WIZARD__MAX_CONTENT_LENGTH=20000
       WORKSHOPS_AI_WIZARD__OPENAI_PRICING='{"gpt-4o":{"prompt":0.0025,"completion":0.010}}'
+
+      # Entity mapping
+      WORKSHOPS_AI_WIZARD__USE_THREAT_MAPPING=true
 
       # Web search (AI-powered)
       WORKSHOPS_AI_WIZARD__WEB_SEARCH_ENABLED=true
@@ -576,6 +598,7 @@ class AppSettings(BaseSettings):
     chat: ChatSettings = Field(default_factory=ChatSettings)
     ws: WSSettings = Field(default_factory=WSSettings)
     langchain: LangchainSettings = Field(default_factory=LangchainSettings)
+    langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)
     manager: ManagerSettings = Field(default_factory=ManagerSettings)
     wizard: WizardSettings = Field(default_factory=WizardSettings)
     rag: RagSettings = Field(default_factory=RagSettings)
@@ -629,6 +652,12 @@ class AppSettings(BaseSettings):
     langchain_endpoint_flat: Optional[str] = Field(default=None, validation_alias="LANGCHAIN_ENDPOINT")
     langchain_api_key_flat: Optional[str] = Field(default=None, validation_alias="LANGCHAIN_API_KEY")
     langchain_project_flat: Optional[str] = Field(default=None, validation_alias="LANGCHAIN_PROJECT")
+
+    # Langfuse flat (standard Langfuse ENV names without WORKSHOPS_AI_ prefix)
+    langfuse_enabled_flat: Optional[bool] = Field(default=None, validation_alias="LANGFUSE_ENABLED")
+    langfuse_public_key_flat: Optional[str] = Field(default=None, validation_alias="LANGFUSE_PUBLIC_KEY")
+    langfuse_secret_key_flat: Optional[str] = Field(default=None, validation_alias="LANGFUSE_SECRET_KEY")
+    langfuse_base_url_flat: Optional[str] = Field(default=None, validation_alias="LANGFUSE_BASE_URL")
 
     # LLM legacy flat
     llm_model_flat: Optional[str] = Field(default=None, validation_alias="LLM_MODEL")
@@ -698,6 +727,13 @@ class AppSettings(BaseSettings):
         if lc.get("api_key"):
             lc["api_key"] = "***"
 
+        # Langfuse
+        lf = data.get("langfuse", {})
+        if lf.get("public_key"):
+            lf["public_key"] = "***"
+        if lf.get("secret_key"):
+            lf["secret_key"] = "***"
+
         return data
 
     # Post-processing to apply legacy/flat env knobs
@@ -737,6 +773,16 @@ class AppSettings(BaseSettings):
             self.langchain.api_key = self.langchain_api_key_flat
         if self.langchain_project_flat:
             self.langchain.project = self.langchain_project_flat
+
+        # Langfuse flat env overrides (standard Langfuse ENV names)
+        if self.langfuse_enabled_flat is not None:
+            self.langfuse.enabled = bool(self.langfuse_enabled_flat)
+        if self.langfuse_public_key_flat:
+            self.langfuse.public_key = self.langfuse_public_key_flat
+        if self.langfuse_secret_key_flat:
+            self.langfuse.secret_key = self.langfuse_secret_key_flat
+        if self.langfuse_base_url_flat:
+            self.langfuse.base_url = self.langfuse_base_url_flat
 
         # LLM flat env overrides
         if self.llm_model_flat:

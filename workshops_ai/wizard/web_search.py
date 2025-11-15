@@ -24,39 +24,10 @@ from openai import AsyncOpenAI, RateLimitError, APIConnectionError
 from workshops_ai.settings import get_settings
 from workshops_ai.wizard.exceptions import AIResponseError, AITimeoutError
 from workshops_ai.wizard.cost_calculator import create_usage_metrics, UsageMetrics
+from workshops_ai.wizard.prompts import WEB_SEARCH_PROMPT_TEMPLATE
+from workshops_ai.llm.langfuse_helper import get_langfuse_client
 
 logger = logging.getLogger(__name__)
-
-
-# System prompt for web search
-WEB_SEARCH_PROMPT_TEMPLATE = """Search for comprehensive information about the company at {url}.
-
-Focus on gathering information that helps understand their business operations and assets:
-
-WHAT THEY DO:
-- Products and services offered
-- Customer types (consumers/businesses)
-- Industry sector
-
-TECHNICAL OPERATIONS:
-- Digital platforms, apps, or online services
-- Infrastructure type (if relevant)
-- Data they collect or process
-
-BUSINESS MODEL:
-- Revenue sources
-- Key partners or suppliers
-- Critical dependencies
-
-ABSOLUTE RULES:
-• NO citations, URLs, links, or source references in any format
-• NO conversational phrases ("Let me know...", "Feel free to...", "Here's...", etc.)
-• NO questions, offers, suggestions, or call-to-action phrases
-• NO introductory or closing remarks
-• NO markdown links like [text](url)
-• Format: Direct bullet points only
-• Deliver: Pure facts, no commentary
-• Terminate: Immediately after last fact"""
 
 
 async def get_website_via_search(
@@ -88,6 +59,28 @@ async def get_website_via_search(
             "Web search is disabled in configuration",
             model=ai_model or settings.wizard.web_search_model
         )
+
+    # Fetch prompt from Langfuse with fallback to local
+    task_prompt_template = WEB_SEARCH_PROMPT_TEMPLATE  # Default fallback
+    prompt_source = "local"
+
+    langfuse_client = get_langfuse_client()
+    if langfuse_client:
+        try:
+            logger.debug("Fetching web-search prompt from Langfuse")
+            langfuse_prompt = langfuse_client.get_prompt("helper/web_search")
+
+            # Extract prompt text (should be a text prompt with {{url}} variable)
+            if hasattr(langfuse_prompt, 'prompt'):
+                # Convert Langfuse double braces {{var}} to Python single braces {var}
+                task_prompt_template = langfuse_prompt.prompt.replace('{{', '{').replace('}}', '}')
+                prompt_source = "langfuse"
+                logger.info(
+                    f"Successfully loaded web-search prompt from Langfuse "
+                    f"(version: {langfuse_prompt.version if hasattr(langfuse_prompt, 'version') else 'unknown'})"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to fetch web-search prompt from Langfuse: {e}. Using local fallback.")
 
     # Parse URL and extract domain for filtering
     try:
@@ -134,8 +127,8 @@ async def get_website_via_search(
     )
     model = settings.wizard.web_search_model  # Always use configured model, ignore ai_model parameter
 
-    # Construct search prompt
-    task_prompt = WEB_SEARCH_PROMPT_TEMPLATE.format(url=url)
+    # Construct search prompt from template (either Langfuse or local)
+    task_prompt = task_prompt_template.format(url=url)
 
     logger.debug(
         "web_search_calling_openai",
@@ -143,6 +136,7 @@ async def get_website_via_search(
             "model": model,
             "domain_filter": domain,
             "timeout_sec": settings.wizard.web_search_timeout_sec,
+            "prompt_source": prompt_source,
         }
     )
 
@@ -298,6 +292,7 @@ async def get_website_via_search(
         "url": url,
         "domain": domain,
         "model": model,
+        "prompt_source": prompt_source,
         "content_length": len(limited_content),
         "original_content_length": len(clean_content),
         "response_preview": limited_content[:500],

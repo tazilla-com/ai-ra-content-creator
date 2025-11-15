@@ -372,7 +372,7 @@ async def generate_services(
         response.headers["X-GPT-Tokens-Prompt"] = str(usage_metrics.prompt_tokens)
         response.headers["X-GPT-Tokens-Completion"] = str(usage_metrics.completion_tokens)
         response.headers["X-GPT-Tokens-Total"] = str(usage_metrics.total_tokens)
-        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
+        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.8f}"
 
         # Wizard headers (session-level metrics)
         response.headers["X-Wizard-Content-Source"] = content_metadata.get("source", "unknown")
@@ -557,6 +557,7 @@ async def generate_assets(
             organization_profile=organization_profile,
             user_instructions=request.user_instructions,
             previous_assets=previous_assets,
+            session_id=session_id,
         )
 
         logger.info(
@@ -602,7 +603,7 @@ async def generate_assets(
         response.headers["X-GPT-Tokens-Prompt"] = str(usage_metrics.prompt_tokens)
         response.headers["X-GPT-Tokens-Completion"] = str(usage_metrics.completion_tokens)
         response.headers["X-GPT-Tokens-Total"] = str(usage_metrics.total_tokens)
-        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
+        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.8f}"
 
         # Wizard headers (session-level metrics)
         # Session ID already set in response header by get_session_id dependency
@@ -775,6 +776,7 @@ async def generate_impacts(
             organization_profile=organization_profile,
             services=services,
             user_instructions=request.user_instructions,
+            session_id=session_id,
         )
 
         logger.info(
@@ -821,7 +823,7 @@ async def generate_impacts(
         response.headers["X-GPT-Tokens-Prompt"] = str(usage_metrics.prompt_tokens)
         response.headers["X-GPT-Tokens-Completion"] = str(usage_metrics.completion_tokens)
         response.headers["X-GPT-Tokens-Total"] = str(usage_metrics.total_tokens)
-        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
+        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.8f}"
 
         # Wizard headers (session-level metrics)
         # Session ID already set in response header by get_session_id dependency
@@ -1010,6 +1012,7 @@ async def generate_risks(
             services=services,
             asset_impacts=asset_impacts,
             user_instructions=request.user_instructions,
+            session_id=session_id,
         )
 
         logger.info(
@@ -1056,7 +1059,7 @@ async def generate_risks(
         response.headers["X-GPT-Tokens-Prompt"] = str(usage_metrics.prompt_tokens)
         response.headers["X-GPT-Tokens-Completion"] = str(usage_metrics.completion_tokens)
         response.headers["X-GPT-Tokens-Total"] = str(usage_metrics.total_tokens)
-        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
+        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.8f}"
 
         # Wizard headers (session-level metrics)
         # Session ID already set in response header by get_session_id dependency
@@ -1072,8 +1075,7 @@ async def generate_risks(
             "assets_processed": debug_info.get("assets_processed"),
             "catalog_threats_total": debug_info.get("catalog_threats_total"),
             "threats_per_asset": debug_info.get("threats_per_asset"),
-            "priors_available": debug_info.get("priors_available"),
-            "priors_count": debug_info.get("priors_count"),
+            "mapped_asset_types_count": debug_info.get("mapped_asset_types_count"),
             "services_count": len(services) if services else 0,
             "asset_impacts_count": len(asset_impacts) if asset_impacts else 0,
             "last_prompt_preview": debug_info.get("last_prompt_preview", "")[:500],
@@ -1240,6 +1242,7 @@ async def generate_controls(
             max_controls_per_asset=request.max_controls_per_asset,
             website_content=website_content,
             user_instructions=request.user_instructions,
+            session_id=session_id,
         )
 
         logger.info(
@@ -1286,7 +1289,7 @@ async def generate_controls(
         response.headers["X-GPT-Tokens-Prompt"] = str(usage_metrics.prompt_tokens)
         response.headers["X-GPT-Tokens-Completion"] = str(usage_metrics.completion_tokens)
         response.headers["X-GPT-Tokens-Total"] = str(usage_metrics.total_tokens)
-        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.6f}"
+        response.headers["X-GPT-Cost-USD"] = f"{usage_metrics.cost_usd:.8f}"
 
         # Wizard headers (session-level metrics)
         # Session ID already set in response header by get_session_id dependency
@@ -1559,6 +1562,7 @@ async def generate_evaluation(
                     organization_profile=organization_profile,
                     user_instructions=None,
                     previous_assets=None,
+                    session_id=session_id,
                 )
 
                 results.assets = assets
@@ -1638,6 +1642,7 @@ async def generate_evaluation(
                     organization_profile=organization_profile,
                     services=results.services,
                     user_instructions=None,
+                    session_id=session_id,
                 )
 
                 results.asset_impacts = asset_impacts
@@ -1718,6 +1723,7 @@ async def generate_evaluation(
                     services=results.services,
                     asset_impacts=results.asset_impacts,
                     user_instructions=None,
+                    session_id=session_id,
                 )
 
                 results.asset_risks = asset_risks
@@ -1796,6 +1802,7 @@ async def generate_evaluation(
                     min_controls_per_asset=request.min_controls_per_asset,
                     max_controls_per_asset=request.max_controls_per_asset,
                     user_instructions=None,
+                    session_id=session_id,
                 )
 
                 results.asset_controls = asset_controls

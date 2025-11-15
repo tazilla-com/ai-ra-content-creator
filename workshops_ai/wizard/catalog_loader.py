@@ -566,15 +566,15 @@ def get_sector_names(language: str = "en", session_id: Optional[str] = None) -> 
     return [s["name"] for s in sectors]
 
 
-def load_asset_type_threat_priors() -> Dict[str, List[str]]:
+def load_asset_type_threat_mapping() -> Dict[str, List[str]]:
     """
-    Load AssetType -> Threat priors from CSV (optional for smart threat selection).
+    Load AssetType -> Threat mapping from CSV (optional for smart threat selection).
 
     Returns:
         Dict mapping asset type to list of relevant threat names
     """
     rows = _read_csv(CATALOG_BASE / "Asset type x Threat.csv")
-    priors: Dict[str, List[str]] = {}
+    threat_mapping: Dict[str, List[str]] = {}
 
     for r in rows:
         asset_type = (r.get("Asset type") or "").strip()
@@ -583,13 +583,13 @@ def load_asset_type_threat_priors() -> Dict[str, List[str]]:
         if not asset_type or not threat:
             continue
 
-        if asset_type not in priors:
-            priors[asset_type] = []
+        if asset_type not in threat_mapping:
+            threat_mapping[asset_type] = []
 
-        priors[asset_type].append(threat)
+        threat_mapping[asset_type].append(threat)
 
-    logger.info(f"Loaded {len(priors)} asset type -> threat prior mappings")
-    return priors
+    logger.info(f"Loaded threat mapping for {len(threat_mapping)} asset types")
+    return threat_mapping
 
 
 # ===================================================================================

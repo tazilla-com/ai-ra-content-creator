@@ -28,6 +28,12 @@ from workshops_ai.wizard.schemas import Service
 from workshops_ai.wizard.prompts import (
     ASSETS_SYSTEM_PROMPT,
     ASSETS_HUMAN_PROMPT_TEMPLATE,
+    ASSETS_JSON_SCHEMA,
+)
+from workshops_ai.llm.langfuse_helper import (
+    get_langfuse_client,
+    get_langfuse_callback_handler,
+    get_langchain_prompt_from_langfuse,
 )
 from workshops_ai.wizard.cost_calculator import create_usage_metrics, UsageMetrics
 from workshops_ai.wizard.exceptions import (
@@ -60,12 +66,18 @@ class AssetGenerator:
             ModelNotAllowedError: If model not in allowed list
         """
         from workshops_ai.llm.wizard_client import create_wizard_llm_client
+        from workshops_ai.wizard.schemas import AssetsResponse
 
         settings = get_settings()
         self.settings = settings
 
-        self.llm = create_wizard_llm_client(model)
+        # Create LLM client with structured outputs (Pydantic model)
+        self.llm = create_wizard_llm_client(
+            model=model,
+            response_format=AssetsResponse
+        )
         self.model_name = self.llm.model_name
+        self._current_retry_attempt = 1  # Track current retry attempt
 
         logger.info(
             "AssetGenerator initialized",
@@ -73,6 +85,7 @@ class AssetGenerator:
                 "model": self.model_name,
                 "temperature": settings.llm.temperature,
                 "timeout_sec": settings.wizard.llm_timeout_sec,
+                "structured_outputs": True,
             }
         )
 
@@ -210,6 +223,7 @@ class AssetGenerator:
             count_constraint=count_constraint,
             language=language,
             asset_types=", ".join(asset_types),
+            assets_json_schema=ASSETS_JSON_SCHEMA,
             **sections
         )
 
@@ -221,15 +235,21 @@ class AssetGenerator:
             return full_prompt[:max_log_length] + "... [truncated for logging]"
         return full_prompt
 
+    def _before_retry(self, retry_state: RetryCallState) -> None:
+        """Track retry attempt number before each retry."""
+        self._current_retry_attempt = retry_state.attempt_number
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception_type(ValidationError),
+        before=lambda retry_state: retry_state.args[0]._before_retry(retry_state),
         reraise=True,
     )
     async def _call_llm_with_retry(
         self,
         prompt: ChatPromptTemplate,
+        session_id: Optional[str] = None,
         **kwargs
     ) -> Tuple[str, UsageMetrics]:
         """
@@ -237,6 +257,7 @@ class AssetGenerator:
 
         Args:
             prompt: LangChain ChatPromptTemplate
+            session_id: Session ID for Langfuse tracing
             **kwargs: Prompt variables
 
         Returns:
@@ -248,40 +269,122 @@ class AssetGenerator:
             AIResponseError: If response cannot be parsed
         """
         try:
+            # Get Langfuse callback handler for tracing
+            langfuse_handler = get_langfuse_callback_handler()
+            langfuse_client = get_langfuse_client()
+
             # Format messages
             messages = prompt.format_messages(**kwargs)
 
-            # Invoke LLM (timeout already configured in ChatOpenAI constructor)
-            response = await self.llm.ainvoke(messages)
+            # Invoke LLM with Langfuse tracing (timeout already configured in ChatOpenAI constructor)
+            invoke_kwargs = {}
+            if langfuse_handler is not None:
+                invoke_kwargs["config"] = {"callbacks": [langfuse_handler]}
 
-            # Extract response text
-            response_text = response.content
+            # Wrap LLM call in span if Langfuse is available
+            if langfuse_client:
+                with langfuse_client.start_as_current_span(
+                    name="llm-invoke",
+                    input={
+                        "model": self.model_name,
+                        "messages_count": len(messages),
+                        "temperature": self.settings.llm.temperature,
+                        "timeout_sec": self.settings.wizard.llm_timeout_sec,
+                        "attempt_number": self._current_retry_attempt,
+                    },
+                    metadata={
+                        "max_attempts": self.settings.wizard.llm_max_retries,
+                    }
+                ) as llm_span:
+                    try:
+                        # LLM invocation - CallbackHandler will create child generation under current span
+                        response = await self.llm.ainvoke(messages, **invoke_kwargs)
 
-            # Extract usage from response metadata
-            usage = response.response_metadata.get("token_usage", {})
-            prompt_tokens = usage.get("prompt_tokens", 0)
-            completion_tokens = usage.get("completion_tokens", 0)
+                        # Extract response text
+                        response_text = response.content
 
-            # Create usage metrics (with pricing from settings)
-            metrics = create_usage_metrics(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                model=self.model_name,
-                pricing=self.settings.wizard.openai_pricing
-            )
+                        # Extract usage from response metadata
+                        usage = response.response_metadata.get("token_usage", {})
+                        prompt_tokens = usage.get("prompt_tokens", 0)
+                        completion_tokens = usage.get("completion_tokens", 0)
 
-            logger.info(
-                "LLM call successful",
-                extra={
-                    "model": self.model_name,
-                    "tokens": metrics.total_tokens,
-                    "cost_usd": metrics.cost_usd,
-                }
-            )
+                        # Create usage metrics (with pricing override from settings)
+                        metrics = create_usage_metrics(
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            model=self.model_name,
+                            pricing=self.settings.wizard.openai_pricing
+                        )
 
-            return response_text, metrics
+                        # Update span with success output
+                        llm_span.update(
+                            output={
+                                "response_length": len(response_text),
+                                "response_preview": response_text[:200],
+                                "usage": {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "total_tokens": metrics.total_tokens,
+                                    "cost_usd": round(metrics.cost_usd, 8),
+                                }
+                            },
+                            metadata={"status": "success"}
+                        )
+
+                        logger.info(
+                            "LLM call successful",
+                            extra={
+                                "model": self.model_name,
+                                "tokens": metrics.total_tokens,
+                                "cost_usd": metrics.cost_usd,
+                            }
+                        )
+
+                        return response_text, metrics
+
+                    except Exception as e:
+                        # Update span with error
+                        llm_span.update(
+                            metadata={
+                                "status": "error",
+                                "error": str(e),
+                                "error_type": type(e).__name__
+                            }
+                        )
+                        raise
+            else:
+                # No Langfuse - proceed without span
+                response = await self.llm.ainvoke(messages, **invoke_kwargs)
+
+                # Extract response text
+                response_text = response.content
+
+                # Extract usage from response metadata
+                usage = response.response_metadata.get("token_usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+
+                # Create usage metrics (with pricing override from settings)
+                metrics = create_usage_metrics(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    model=self.model_name,
+                    pricing=self.settings.wizard.openai_pricing
+                )
+
+                logger.info(
+                    "LLM call successful",
+                    extra={
+                        "model": self.model_name,
+                        "tokens": metrics.total_tokens,
+                        "cost_usd": metrics.cost_usd,
+                    }
+                )
+
+                return response_text, metrics
 
         except Exception as e:
+            # Check if it's a timeout error from OpenAI/httpx
             error_msg = str(e).lower()
             if "timeout" in error_msg or "timed out" in error_msg:
                 logger.error(
@@ -316,12 +419,15 @@ class AssetGenerator:
         """
         Parse JSON response and validate assets.
 
+        With OpenAI structured outputs, response is guaranteed to be valid JSON
+        in format: {"assets": [...]}
+
         Enforces ISO 27001 rules:
         - Primary assets (isPrimary=true): CIA ratings required
         - Supporting assets (isPrimary=false): CIA must be null
 
         Args:
-            response_text: Raw LLM response
+            response_text: Raw LLM response (guaranteed valid JSON)
             allowed_asset_types: List of allowed asset type strings
 
         Returns:
@@ -332,29 +438,22 @@ class AssetGenerator:
             AIResponseError: If JSON cannot be parsed
         """
         try:
-            # Try to extract JSON array from response
-            # Handle cases where LLM includes extra text
-            response_text = response_text.strip()
+            # With structured outputs, response is guaranteed valid JSON
+            response_data = json.loads(response_text.strip())
 
-            # Find JSON array boundaries
-            start_idx = response_text.find("[")
-            end_idx = response_text.rfind("]")
-
-            if start_idx == -1 or end_idx == -1:
+            # Extract assets array
+            if not isinstance(response_data, dict) or "assets" not in response_data:
                 raise AIResponseError(
-                    "No JSON array found in response",
+                    "Response missing 'assets' key",
                     model=self.model_name,
                     details={"response_preview": response_text[:200]}
                 )
 
-            json_text = response_text[start_idx:end_idx + 1]
-
-            # Parse JSON
-            assets_data = json.loads(json_text)
+            assets_data = response_data["assets"]
 
             if not isinstance(assets_data, list):
                 raise AIResponseError(
-                    "Response is not a JSON array",
+                    "Assets field is not an array",
                     model=self.model_name
                 )
 
@@ -426,6 +525,7 @@ class AssetGenerator:
         organization_profile: Optional[Dict[str, Any]] = None,
         user_instructions: Optional[str] = None,
         previous_assets: Optional[List[Asset]] = None,
+        session_id: Optional[str] = None,
     ) -> Tuple[List[Asset], UsageMetrics, Dict[str, Any]]:
         """
         Generate assets from website content and services.
@@ -439,6 +539,7 @@ class AssetGenerator:
             organization_profile: Optional organization metadata
             user_instructions: Optional user refinement instructions
             previous_assets: Optional previous assets for refinement
+            session_id: Session ID for Langfuse tracing
 
         Returns:
             Tuple of (assets list, usage metrics, debug info dict)
@@ -482,54 +583,280 @@ class AssetGenerator:
             sections=sections
         )
 
-        # Create LangChain prompt
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", ASSETS_SYSTEM_PROMPT),
-            ("human", ASSETS_HUMAN_PROMPT_TEMPLATE),
-        ])
+        # Try to load prompts from Langfuse with fallback to local
+        langfuse_client = get_langfuse_client()
 
-        # Call LLM with retry logic
-        try:
-            response_text, usage_metrics = await self._call_llm_with_retry(
-                prompt=prompt,
-                count_constraint=count_constraint,
-                language=language,
-                asset_types=", ".join(allowed_asset_types),
-                **sections
-            )
+        # Wrap everything in top-level span if Langfuse is available
+        if langfuse_client and session_id:
+            from langfuse import propagate_attributes
 
-            # Parse and validate
-            assets = self._parse_and_validate_assets(
-                response_text=response_text,
-                allowed_asset_types=allowed_asset_types
-            )
-
-            # Apply max limit if specified
-            if max_assets is not None:
-                assets = assets[:max_assets]
-
-            # Build debug info
-            debug_info = {
-                "prompt_text": prompt_text,
-                "response_text": response_text[:500],  # Truncate for logging
-                "assets_count": len(assets),
-                "allowed_asset_types": allowed_asset_types,
+            # Prepare span input data
+            span_input = {
+                "language": language,
+                "min_assets": min_assets,
+                "max_assets": max_assets,
+                "allowed_asset_types_count": len(allowed_asset_types),
+                "organization_profile": organization_profile,
+                "user_instructions_preview": user_instructions[:100] + "..." if user_instructions and len(user_instructions) > 100 else user_instructions,
+                "has_previous_assets": bool(previous_assets),
+                "previous_assets_count": len(previous_assets) if previous_assets else 0,
+                "services_count": len(services) if services else 0,
+                "website_content_length": len(website_content) if website_content else 0,
             }
 
-            logger.info(
-                "Assets generated successfully",
-                extra={
-                    "count": len(assets),
+            with langfuse_client.start_as_current_span(
+                name="generate-assets",
+                input=span_input,
+                metadata={
+                    "endpoint": "assets",
                     "model": self.model_name,
-                    "tokens": usage_metrics.total_tokens,
-                }
+                },
+            ) as main_span:
+                with propagate_attributes(session_id=session_id):
+                    # Fetch prompt with child span
+                    with langfuse_client.start_as_current_span(
+                        name="get-assets-prompts",
+                        input={"prompt_name": "wizard/assets"},
+                    ) as prompt_span:
+                        # Try to fetch unified prompt from Langfuse
+                        prompt = get_langchain_prompt_from_langfuse(
+                            prompt_name="wizard/assets",
+                            fallback_template=None,  # Will build fallback manually
+                            fallback_variables=None,
+                        )
+
+                        prompt_source = "langfuse"
+                        prompt_version = None
+                        prompt_type = "chat"  # Default to chat
+                        prompt_tags = []
+                        prompt_labels = []
+
+                        # If Langfuse fetch failed, build fallback from local templates
+                        if prompt is None:
+                            logger.info("Building fallback prompt from local templates")
+                            prompt = ChatPromptTemplate.from_messages([
+                                ("system", ASSETS_SYSTEM_PROMPT),
+                                ("human", ASSETS_HUMAN_PROMPT_TEMPLATE),
+                            ])
+                            prompt_source = "local"
+                        else:
+                            # Extract details from metadata (stored by get_langchain_prompt_from_langfuse)
+                            if hasattr(prompt, 'metadata') and prompt.metadata:
+                                langfuse_prompt_obj = prompt.metadata.get('langfuse_prompt')
+                                if langfuse_prompt_obj:
+                                    if hasattr(langfuse_prompt_obj, 'version'):
+                                        prompt_version = langfuse_prompt_obj.version
+                                    if hasattr(langfuse_prompt_obj, 'tags'):
+                                        prompt_tags = langfuse_prompt_obj.tags or []
+                                    if hasattr(langfuse_prompt_obj, 'labels'):
+                                        prompt_labels = langfuse_prompt_obj.labels or []
+                                    if hasattr(langfuse_prompt_obj, 'type'):
+                                        prompt_type = langfuse_prompt_obj.type
+
+                        # Extract prompt messages/content
+                        prompt_content = []
+                        if hasattr(prompt, 'messages'):
+                            for msg in prompt.messages:
+                                if hasattr(msg, 'prompt') and hasattr(msg.prompt, 'template'):
+                                    # Extract role from class name
+                                    class_name = msg.__class__.__name__
+                                    if 'System' in class_name:
+                                        role = 'system'
+                                    elif 'Human' in class_name:
+                                        role = 'user'
+                                    elif 'AI' in class_name or 'Assistant' in class_name:
+                                        role = 'assistant'
+                                    else:
+                                        role = 'unknown'
+
+                                    prompt_content.append({
+                                        "role": role,
+                                        "content": msg.prompt.template
+                                    })
+
+                        prompt_span.update(
+                            output={
+                                "name": "wizard/assets",
+                                "isFallback": prompt_source == "local",
+                                "version": prompt_version,
+                                "type": prompt_type,
+                                "tags": prompt_tags,
+                                "labels": prompt_labels,
+                                "prompt": prompt_content,
+                            }
+                        )
+
+                    # Call LLM with retry logic
+                    try:
+                        response_text, usage_metrics = await self._call_llm_with_retry(
+                            prompt=prompt,
+                            session_id=session_id,
+                            count_constraint=count_constraint,
+                            language=language,
+                            asset_types=", ".join(allowed_asset_types),
+                            assets_json_schema=ASSETS_JSON_SCHEMA,
+                            **sections
+                        )
+
+                        # Parse and validate with dedicated span
+                        # Try to count raw assets before validation
+                        raw_assets_count = None
+                        try:
+                            # With structured outputs, response is {"assets": [...]}
+                            response_data = json.loads(response_text.strip())
+                            if isinstance(response_data, dict) and "assets" in response_data:
+                                assets_data = response_data["assets"]
+                                if isinstance(assets_data, list):
+                                    raw_assets_count = len(assets_data)
+                        except Exception:
+                            pass  # If counting fails, proceed without it
+
+                        # Parse JSON for span input
+                        try:
+                            response_json = json.loads(response_text.strip())
+                        except Exception:
+                            response_json = {"error": "Failed to parse JSON", "preview": response_text[:200]}
+
+                        with langfuse_client.start_as_current_span(
+                            name="parse-and-validate-assets",
+                            input={
+                                "response_json": response_json if isinstance(response_json, dict) else {"assets_count": len(response_json)},
+                                "allowed_asset_types_count": len(allowed_asset_types),
+                                "raw_assets_count": raw_assets_count,
+                            }
+                        ) as parse_span:
+                            try:
+                                assets = self._parse_and_validate_assets(
+                                    response_text=response_text,
+                                    allowed_asset_types=allowed_asset_types
+                                )
+
+                                # Apply max limit if specified
+                                if max_assets is not None:
+                                    assets = assets[:max_assets]
+
+                                parse_span.update(
+                                    output={
+                                        "assets_count": len(assets),
+                                        "assets": [a.model_dump() for a in assets[:5]],  # First 5 for preview
+                                    }
+                                )
+                            except (ValidationError, AIResponseError) as e:
+                                parse_span.update(
+                                    metadata={
+                                        "status": "error",
+                                        "error": str(e),
+                                        "error_type": type(e).__name__
+                                    }
+                                )
+                                raise
+
+                        # Update main span with enhanced output
+                        main_span.update(
+                            output={
+                                "assets_count": len(assets),
+                                "response_preview": response_text[:200],
+                                "prompt_source": prompt_source,
+                                "prompt_version": prompt_version,
+                                "usage": {
+                                    "total_tokens": usage_metrics.total_tokens,
+                                    "prompt_tokens": usage_metrics.prompt_tokens,
+                                    "completion_tokens": usage_metrics.completion_tokens,
+                                    "cost_usd": round(usage_metrics.cost_usd, 8),
+                                }
+                            },
+                            metadata={"status": "success"}
+                        )
+
+                        # Build debug info
+                        debug_info = {
+                            "prompt_text": prompt_text,
+                            "response_text": response_text[:500],  # Truncate for logging
+                            "assets_count": len(assets),
+                            "allowed_asset_types": allowed_asset_types,
+                        }
+
+                        logger.info(
+                            "Assets generated successfully",
+                            extra={
+                                "count": len(assets),
+                                "model": self.model_name,
+                                "tokens": usage_metrics.total_tokens,
+                            }
+                        )
+
+                        return assets, usage_metrics, debug_info
+
+                    except ValidationError as e:
+                        # Retries exhausted
+                        main_span.update(
+                            metadata={"status": "error", "error": str(e)}
+                        )
+                        raise ValidationRetriesExhausted(
+                            retries=self.settings.wizard.llm_max_retries,
+                            errors=[str(e)]
+                        ) from e
+
+        else:
+            # No Langfuse - proceed without tracing
+            # Try to fetch unified prompt from Langfuse (even without tracing)
+            prompt = get_langchain_prompt_from_langfuse(
+                prompt_name="wizard/assets",
+                fallback_template=None,
             )
 
-            return assets, usage_metrics, debug_info
+            # If Langfuse fetch failed, build fallback from local templates
+            if prompt is None:
+                logger.info("Building fallback prompt from local templates (no Langfuse)")
+                prompt = ChatPromptTemplate.from_messages([
+                    ("system", ASSETS_SYSTEM_PROMPT),
+                    ("human", ASSETS_HUMAN_PROMPT_TEMPLATE),
+                ])
 
-        except ValidationError as e:
-            # Retries exhausted
-            raise ValidationRetriesExhausted(
-                retries=self.settings.wizard.llm_max_retries,
-                errors=[str(e)]
-            ) from e
+            # Call LLM with retry logic
+            try:
+                response_text, usage_metrics = await self._call_llm_with_retry(
+                    prompt=prompt,
+                    session_id=session_id,
+                    count_constraint=count_constraint,
+                    language=language,
+                    asset_types=", ".join(allowed_asset_types),
+                    assets_json_schema=ASSETS_JSON_SCHEMA,
+                    **sections
+                )
+
+                # Parse and validate
+                assets = self._parse_and_validate_assets(
+                    response_text=response_text,
+                    allowed_asset_types=allowed_asset_types
+                )
+
+                # Apply max limit if specified
+                if max_assets is not None:
+                    assets = assets[:max_assets]
+
+                # Build debug info
+                debug_info = {
+                    "prompt_text": prompt_text,
+                    "response_text": response_text[:500],  # Truncate for logging
+                    "assets_count": len(assets),
+                    "allowed_asset_types": allowed_asset_types,
+                }
+
+                logger.info(
+                    "Assets generated successfully",
+                    extra={
+                        "count": len(assets),
+                        "model": self.model_name,
+                        "tokens": usage_metrics.total_tokens,
+                    }
+                )
+
+                return assets, usage_metrics, debug_info
+
+            except ValidationError as e:
+                # Retries exhausted
+                raise ValidationRetriesExhausted(
+                    retries=self.settings.wizard.llm_max_retries,
+                    errors=[str(e)]
+                ) from e

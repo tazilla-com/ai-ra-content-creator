@@ -10,9 +10,9 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from typing import Optional, List, Literal, Any
 from workshops_ai.api.schema.asset import Asset
-from workshops_ai.api.schema.impact import AssetImpact
-from workshops_ai.api.schema.threat import AssetRisk
-from workshops_ai.api.schema.control import AssetControls
+from workshops_ai.api.schema.impact import AssetImpact, ImpactEvaluation
+from workshops_ai.api.schema.threat import AssetRisk, Risk
+from workshops_ai.api.schema.control import AssetControls, PlannedControl
 
 # ===================================================================================
 # Domain Models
@@ -34,6 +34,92 @@ class Service(BaseModel):
         None,
         description="Optional sector classification. Must match catalog; must not be translated."
     )
+
+
+# ===================================================================================
+# Structured Output Response Models (for OpenAI Structured Outputs)
+# ===================================================================================
+
+class ServicesResponse(BaseModel):
+    """
+    Wrapper for services generation response with OpenAI Structured Outputs.
+
+    This model is used as response_format in LLM calls to enforce JSON schema
+    validation at the API level, ensuring the LLM returns valid structured data.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    services: List[Service] = Field(
+        ...,
+        description="List of core business services identified for the organization"
+    )
+
+
+class AssetsResponse(BaseModel):
+    """
+    Wrapper for assets generation response with OpenAI Structured Outputs.
+
+    This model is used as response_format in LLM calls to enforce JSON schema
+    validation at the API level, ensuring the LLM returns valid structured data.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    assets: List[Asset] = Field(
+        ...,
+        description="List of IT and business assets identified for the organization"
+    )
+
+
+class ImpactsResponse(BaseModel):
+    """
+    Wrapper for impacts evaluation response with OpenAI Structured Outputs.
+
+    This model is used as response_format in LLM calls to enforce JSON schema
+    validation at the API level, ensuring the LLM returns valid structured data.
+
+    Reuses ImpactEvaluation from api.schema.impact for consistency.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    impacts: List[ImpactEvaluation] = Field(
+        ...,
+        description="List of impact evaluations with impactName and impactLevel (0-4) for a single asset"
+    )
+
+
+class RisksResponse(BaseModel):
+    """
+    Wrapper for risks evaluation response with OpenAI Structured Outputs.
+
+    This model is used as response_format in LLM calls to enforce JSON schema
+    validation at the API level, ensuring the LLM returns valid structured data.
+
+    Reuses Risk from api.schema.threat for consistency.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    risks: List[Risk] = Field(
+        ...,
+        description="List of risk evaluations with threatName and probability (0-4) for a single asset"
+    )
+
+
+class ControlsResponse(BaseModel):
+    """
+    Wrapper for control recommendations response with OpenAI Structured Outputs.
+
+    This model is used as response_format in LLM calls to enforce JSON schema
+    validation at the API level, ensuring the LLM returns valid structured data.
+
+    Reuses PlannedControl from api.schema.control for consistency.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    controls: List[PlannedControl] = Field(
+        ...,
+        description="List of selected controls with threat coverage and cost estimates for a single asset"
+    )
+
 
 # ===================================================================================
 # Common/Shared Request Models

@@ -98,3 +98,7 @@ class ThrottledChatOpenAI(ChatOpenAI):
         elif isinstance(input, str):
             return [{"role": "user", "content": input}]
         return []
+
+
+# Override class name for better display in Langfuse/tracing tools
+ThrottledChatOpenAI.__name__ = "ChatOpenAI"
