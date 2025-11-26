@@ -543,7 +543,7 @@ class ServiceGenerator:
             ) as main_span:
                 with propagate_attributes(session_id=session_id):
                     # Fetch prompt with child span
-                    requested_label = settings.langfuse.prompt_label
+                    requested_label = self.settings.langfuse.prompt_label
                     with langfuse_client.start_as_current_span(
                         name="get-services-prompts",
                         input={
