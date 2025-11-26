@@ -246,7 +246,6 @@ class ImpactUpsert(BaseModel):
     name: StrictStr
     category: StrictStr
     description: Optional[str] = None
-    weight: Optional[StrictFloat] = None
 
     # Trim + basic non-empty checks (backwards compatible)
     @field_validator("code", "name", "category", "description")

@@ -195,7 +195,7 @@ class TazillaAPICatalogProvider(CatalogProvider):
     def __init__(
         self,
         endpoint: str,
-        auth_token: str,
+        auth_token: Optional[str] = None,
         timeout: int = 30
     ):
         """
@@ -203,20 +203,24 @@ class TazillaAPICatalogProvider(CatalogProvider):
 
         Args:
             endpoint: Base URL for Tazilla API
-            auth_token: Bearer token for authentication
+            auth_token: Bearer token for authentication (optional for cluster-internal calls)
             timeout: Request timeout in seconds
         """
         self.endpoint = endpoint.rstrip("/")
         self.auth_token = auth_token
         self.timeout = timeout
 
+        # Build headers - only add Authorization if token is provided
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
+
         # Create async HTTP client
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout),
-            headers={
-                "Authorization": f"Bearer {auth_token}",
-                "Content-Type": "application/json",
-            }
+            headers=headers
         )
 
         logger.info(
@@ -224,6 +228,7 @@ class TazillaAPICatalogProvider(CatalogProvider):
             extra={
                 "endpoint": self.endpoint,
                 "timeout": timeout,
+                "auth_enabled": auth_token is not None,
             }
         )
 
@@ -542,11 +547,17 @@ def get_catalog_provider() -> CatalogProvider:
         _provider_instance = CSVCatalogProvider()
 
     elif mode == "http":
+        if not settings.catalog.endpoint:
+            raise ValueError(
+                "CATALOG__ENDPOINT is required when CATALOG__MODE=http"
+            )
+
         logger.info(
             "Using Tazilla API catalog provider",
             extra={
                 "endpoint": settings.catalog.endpoint,
                 "timeout": settings.catalog.timeout_sec,
+                "auth_enabled": settings.catalog.auth_token is not None,
             }
         )
         _provider_instance = TazillaAPICatalogProvider(

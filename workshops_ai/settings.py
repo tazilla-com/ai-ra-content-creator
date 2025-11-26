@@ -125,7 +125,7 @@ class CatalogSettings(BaseModel):
     ENV mapping (both forms work):
       WORKSHOPS_AI_CATALOG__MODE=file|http  or  CATALOG__MODE=file|http
       WORKSHOPS_AI_CATALOG__ENDPOINT=https://api.tazilla.com  or  CATALOG__ENDPOINT=...
-      WORKSHOPS_AI_CATALOG__AUTH_TOKEN=Bearer ...  or  CATALOG__AUTH_TOKEN=...
+      WORKSHOPS_AI_CATALOG__AUTH_TOKEN=Bearer ...  or  CATALOG__AUTH_TOKEN=... (optional for cluster-internal calls)
       WORKSHOPS_AI_CATALOG__TIMEOUT_SEC=30  or  CATALOG__TIMEOUT_SEC=30
     """
     mode: Literal["file", "http"] = Field(

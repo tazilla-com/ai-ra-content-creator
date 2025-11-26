@@ -17,7 +17,6 @@ class ImpactDefCreate(BaseModel):
     """
     name: str = Field(..., description="Unique impact name (already localized).")
     description: str = Field(..., description="Localized description of the impact.")
-    weight: float = Field(..., description="Relative importance vs. other impacts.")
     impactCategory: ImpactCategory = Field(
         ..., description="Canonical EN category (reused Literal from client)."
     )
@@ -38,14 +37,6 @@ class ImpactDefCreate(BaseModel):
             raise ValueError("description must not be empty")
         return v
 
-    @field_validator("weight")
-    @classmethod
-    def _weight_positive(cls, v: float) -> float:
-        # Drop or relax this if you allow zero/negative weights.
-        if v <= 0:
-            raise ValueError("weight must be > 0")
-        return v
-
 
 class ImpactDefUpdate(BaseModel):
     """
@@ -55,7 +46,6 @@ class ImpactDefUpdate(BaseModel):
     """
     name: str = Field(..., description="Target impact name to update.")
     description: str | None = Field(None, description="New localized description.")
-    weight: float | None = Field(None, description="New relative importance.")
     impactCategory: ImpactCategory | None = Field(
         None, description="New canonical EN category."
     )
@@ -66,13 +56,4 @@ class ImpactDefUpdate(BaseModel):
         v = (v or "").strip()
         if not v:
             raise ValueError("name must not be empty")
-        return v
-
-    @field_validator("weight")
-    @classmethod
-    def _weight_positive_if_present(cls, v: float | None) -> float | None:
-        if v is None:
-            return v
-        if v <= 0:
-            raise ValueError("weight must be > 0 when provided")
         return v

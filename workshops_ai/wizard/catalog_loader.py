@@ -265,14 +265,6 @@ def load_impact_catalog(language: str = "en", session_id: Optional[str] = None) 
             name = base_name
             desc = (r.get("EN Description") or r.get("Description") or "").strip()
 
-        # Parse weight (handle comma decimal separator)
-        weight_str = (r.get("Weight") or "1").replace(",", ".")
-        try:
-            weight = float(weight_str)
-        except ValueError:
-            weight = 1.0
-            logger.warning(f"Invalid weight '{weight_str}' for impact '{name}', using 1.0")
-
         # Get category from mapping (use base name for lookup)
         category = mapping.get(base_name.lower(), "Other")
         if category not in allowed_categories:
@@ -282,7 +274,6 @@ def load_impact_catalog(language: str = "en", session_id: Optional[str] = None) 
         impacts.append(Impact(
             name=name,
             description=desc,
-            weight=weight,
             impactCategory=category
         ))
 
@@ -311,12 +302,13 @@ def get_impact_names(language: str = "en", session_id: Optional[str] = None) -> 
 
 def clear_cache():
     """Clear cached catalog data (for testing)."""
-    global _impact_cache, _map_cache, _threat_cache, _threat_map_cache
+    global _impact_cache, _map_cache, _threat_cache, _threat_map_cache, _threat_asset_types_cache
     global _control_cache, _control_map_cache, _control_threat_coverage_cache
     _impact_cache = None
     _map_cache = None
     _threat_cache = None
     _threat_map_cache = None
+    _threat_asset_types_cache = None
     _control_cache = None
     _control_map_cache = None
     _control_threat_coverage_cache = None
@@ -353,6 +345,47 @@ def load_threat_to_category() -> Dict[str, str]:
     return mapping
 
 
+# Cache for threat-to-asset-types mapping
+_threat_asset_types_cache: Optional[Dict[str, List[str]]] = None
+
+
+def load_threat_to_asset_types() -> Dict[str, List[str]]:
+    """
+    Load threat-to-asset-types mapping from CSV.
+
+    The presence of a row in the CSV indicates the mapping relationship.
+    The Value column (TRUE/FALSE) is ignored - it represents other information.
+
+    Returns:
+        Dict mapping threat name (lowercase) to list of asset type names
+    """
+    global _threat_asset_types_cache
+    if _threat_asset_types_cache is not None:
+        return _threat_asset_types_cache
+
+    rows = _read_csv(CATALOG_BASE / "Asset type x Threat.csv")
+    mapping: Dict[str, List[str]] = {}
+
+    for r in rows:
+        threat = (r.get("Threat") or "").strip()
+        asset_type = (r.get("Asset type") or "").strip()
+
+        if not threat or not asset_type:
+            continue
+
+        # Row presence = mapping relationship (ignore Value column)
+        threat_key = threat.lower()
+        if threat_key not in mapping:
+            mapping[threat_key] = []
+        # Avoid duplicates (some threats have multiple rows per asset type)
+        if asset_type not in mapping[threat_key]:
+            mapping[threat_key].append(asset_type)
+
+    _threat_asset_types_cache = mapping
+    logger.info(f"Loaded threat-to-asset-types mappings for {len(mapping)} threats")
+    return mapping
+
+
 def load_threat_catalog(language: str = "en", session_id: Optional[str] = None) -> List[Threat]:
     """
     Load threat catalog from CSV file with localization.
@@ -373,7 +406,8 @@ def load_threat_catalog(language: str = "en", session_id: Optional[str] = None) 
         return _threat_cache
 
     rows = _read_csv(CATALOG_BASE / "Threat.csv")
-    mapping = load_threat_to_category()
+    category_mapping = load_threat_to_category()
+    asset_types_mapping = load_threat_to_asset_types()
 
     # Allowed categories (from Threat model)
     allowed_categories = {
@@ -413,8 +447,11 @@ def load_threat_catalog(language: str = "en", session_id: Optional[str] = None) 
         intentional = r.get("Intentional", "").strip().lower() in ["true", "1", "yes"]
         environmental = r.get("Environmental", "").strip().lower() in ["true", "1", "yes"]
 
+        # Get asset types from mapping (use base name for lookup)
+        asset_types = asset_types_mapping.get(base_name.lower(), [])
+
         # Get category from mapping (use base name for lookup)
-        category = mapping.get(base_name.lower(), "Other")
+        category = category_mapping.get(base_name.lower(), "Other")
         if category not in allowed_categories:
             logger.warning(f"Invalid category '{category}' for threat '{name}', using 'Other'")
             category = "Other"
@@ -425,7 +462,8 @@ def load_threat_catalog(language: str = "en", session_id: Optional[str] = None) 
             category=category,
             unintentional=unintentional,
             intentional=intentional,
-            environmental=environmental
+            environmental=environmental,
+            assetTypes=asset_types
         ))
 
     # Cache only EN version

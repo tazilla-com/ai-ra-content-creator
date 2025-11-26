@@ -52,6 +52,12 @@ class Threat(BaseModel):
         description="Indicates if the threat is environmental or natural (e.g., flood, fire, earthquake)."
     )
 
+    # Asset type associations
+    assetTypes: List[str] = Field(
+        default_factory=list,
+        description="List of asset type names that this threat is relevant for. Empty list means threat applies to all asset types."
+    )
+
 class Risk(BaseModel):
     """
     Represents the evaluation of a single threat against an asset.

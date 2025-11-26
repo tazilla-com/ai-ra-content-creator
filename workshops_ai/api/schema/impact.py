@@ -13,9 +13,6 @@ class Impact(BaseModel):
     description: str = Field(
         ..., description="Explanation of the impact's relevance in the security or business context; already localized."
     )
-    weight: float = Field(
-        ..., description="Relative importance of this impact compared to other impacts."
-    )
     # Code list; always in english; get via API from backend
     impactCategory: Literal[
         "Availability",

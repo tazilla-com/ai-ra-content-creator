@@ -8,8 +8,8 @@ Uses configurable catalog provider (CSV or Tazilla API) based on CATALOG__MODE:
 - mode=http: TazillaAPICatalogProvider (production, requires session_id)
 
 Endpoints:
-- GET /api/catalogs/impacts - Impact catalog with categories and weights
-- GET /api/catalogs/threats - Threat catalog with categories and types
+- GET /api/catalogs/impacts - Impact catalog with categories
+- GET /api/catalogs/threats - Threat catalog with categories, types, and asset type associations
 - GET /api/catalogs/controls - Control catalog with categories
 - GET /api/catalogs/asset-types - Asset type catalog with dependencies
 - GET /api/catalogs/impact-categories - Impact category catalog
@@ -50,7 +50,7 @@ class ImpactCatalogResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     total: int = Field(..., description="Total number of impacts")
-    impacts: List[Impact] = Field(..., description="List of impacts with categories and weights")
+    impacts: List[Impact] = Field(..., description="List of impacts with categories")
 
 
 class ThreatCatalogResponse(BaseModel):
@@ -58,7 +58,7 @@ class ThreatCatalogResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     total: int = Field(..., description="Total number of threats")
-    threats: List[Threat] = Field(..., description="List of threats with categories and types")
+    threats: List[Threat] = Field(..., description="List of threats with categories, types, and asset type associations")
 
 
 class ControlCatalogResponse(BaseModel):
@@ -113,7 +113,7 @@ class CategoryCatalogResponse(BaseModel):
     "/impacts",
     response_model=ImpactCatalogResponse,
     summary="Get Impact catalog",
-    description="Retrieve the official Impact catalog with categories, weights, and names (localized by Tazilla backend)"
+    description="Retrieve the official Impact catalog with categories and names (localized by Tazilla backend)"
 )
 async def get_impact_catalog(
     x_session_id: Optional[str] = Header(
@@ -128,7 +128,6 @@ async def get_impact_catalog(
     The catalog includes:
     - Impact name (localized by backend)
     - Description (localized by backend)
-    - Weight (importance/severity multiplier)
     - Category (Availability, Clients, Confidentiality, Finance, etc.)
 
     Args:
@@ -177,7 +176,7 @@ async def get_impact_catalog(
     "/threats",
     response_model=ThreatCatalogResponse,
     summary="Get Threat catalog",
-    description="Retrieve the official Threat catalog with categories, types, and names (localized by Tazilla backend)"
+    description="Retrieve the official Threat catalog with categories, types, asset type associations, and names (localized by Tazilla backend)"
 )
 async def get_threat_catalog(
     x_session_id: Optional[str] = Header(
@@ -194,6 +193,7 @@ async def get_threat_catalog(
     - Description (localized by backend)
     - Category (Physical, Natural, Human actions, etc.)
     - Type flags (unintentional, intentional, environmental)
+    - Asset types (list of asset type names this threat is relevant for)
 
     Args:
         x_session_id: Session ID for client-specific catalogs
