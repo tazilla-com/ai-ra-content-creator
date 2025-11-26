@@ -295,14 +295,19 @@ class LangfuseSettings(BaseModel):
       WORKSHOPS_AI_LANGFUSE__PUBLIC_KEY=pk-lf-...
       WORKSHOPS_AI_LANGFUSE__SECRET_KEY=sk-lf-...
       WORKSHOPS_AI_LANGFUSE__BASE_URL=https://cloud.langfuse.com
+      WORKSHOPS_AI_LANGFUSE__PROMPT_LABEL=production
 
     Legacy (flat) ENV handled in AppSettings.model_post_init():
-      LANGFUSE_ENABLED, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL
+      LANGFUSE_ENABLED, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL, LANGFUSE_PROMPT_LABEL
     """
     enabled: bool = False
     public_key: Optional[str] = None
     secret_key: Optional[str] = None
     base_url: str = "https://cloud.langfuse.com"
+    prompt_label: Optional[str] = Field(
+        default=None,
+        description="Label to use when fetching prompts from Langfuse (e.g., 'production', 'development'). If not set, uses latest production version."
+    )
 
 
 class ManagerSettings(BaseModel):
@@ -658,6 +663,7 @@ class AppSettings(BaseSettings):
     langfuse_public_key_flat: Optional[str] = Field(default=None, validation_alias="LANGFUSE_PUBLIC_KEY")
     langfuse_secret_key_flat: Optional[str] = Field(default=None, validation_alias="LANGFUSE_SECRET_KEY")
     langfuse_base_url_flat: Optional[str] = Field(default=None, validation_alias="LANGFUSE_BASE_URL")
+    langfuse_prompt_label_flat: Optional[str] = Field(default=None, validation_alias="LANGFUSE_PROMPT_LABEL")
 
     # LLM legacy flat
     llm_model_flat: Optional[str] = Field(default=None, validation_alias="LLM_MODEL")
@@ -783,6 +789,8 @@ class AppSettings(BaseSettings):
             self.langfuse.secret_key = self.langfuse_secret_key_flat
         if self.langfuse_base_url_flat:
             self.langfuse.base_url = self.langfuse_base_url_flat
+        if self.langfuse_prompt_label_flat:
+            self.langfuse.prompt_label = self.langfuse_prompt_label_flat
 
         # LLM flat env overrides
         if self.llm_model_flat:

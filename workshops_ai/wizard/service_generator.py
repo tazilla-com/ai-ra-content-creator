@@ -543,9 +543,13 @@ class ServiceGenerator:
             ) as main_span:
                 with propagate_attributes(session_id=session_id):
                     # Fetch prompt with child span
+                    requested_label = settings.langfuse.prompt_label
                     with langfuse_client.start_as_current_span(
                         name="get-services-prompts",
-                        input={"prompt_name": "wizard/services"},
+                        input={
+                            "prompt_name": "wizard/services",
+                            "requested_label": requested_label,
+                        },
                     ) as prompt_span:
                         # Try to fetch unified prompt from Langfuse
                         prompt = get_langchain_prompt_from_langfuse(

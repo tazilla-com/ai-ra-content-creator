@@ -98,7 +98,7 @@ def get_langchain_prompt_from_langfuse(
         fallback_template: Template string to use if Langfuse fetch fails
         fallback_variables: List of variable names for fallback template
         version: Specific version to fetch (default: latest production)
-        label: Label to fetch (e.g., "production", "staging")
+        label: Label to fetch (e.g., "production", "staging"). If not provided, uses settings.langfuse.prompt_label
 
     Returns:
         LangChain PromptTemplate or ChatPromptTemplate or None if both Langfuse and fallback fail
@@ -108,7 +108,13 @@ def get_langchain_prompt_from_langfuse(
     # Try Langfuse first
     if client is not None:
         try:
-            logger.debug(f"Fetching prompt '{prompt_name}' from Langfuse")
+            # If no label provided, use from settings
+            if label is None:
+                from workshops_ai.settings import get_settings
+                settings = get_settings()
+                label = settings.langfuse.prompt_label
+
+            logger.debug(f"Fetching prompt '{prompt_name}' from Langfuse (label={label})")
 
             fetch_kwargs = {"name": prompt_name}
             if version is not None:

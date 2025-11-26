@@ -601,9 +601,13 @@ class ControlGenerator:
             ) as main_span:
                 with propagate_attributes(session_id=session_id):
                     # Fetch prompt with child span
+                    requested_label = self.settings.langfuse.prompt_label
                     with langfuse_client.start_as_current_span(
                         name="get-controls-prompts",
-                        input={"prompt_name": "wizard/controls"},
+                        input={
+                            "prompt_name": "wizard/controls",
+                            "requested_label": requested_label,
+                        },
                     ) as prompt_span:
                         # Try to fetch unified prompt from Langfuse
                         prompt = get_langchain_prompt_from_langfuse(
