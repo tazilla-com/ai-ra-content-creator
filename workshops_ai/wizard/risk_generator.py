@@ -32,11 +32,8 @@ from workshops_ai.wizard.prompts import (
     COMBINED_RISK_HUMAN_PROMPT_TEMPLATE,
     RISKS_JSON_SCHEMA,
 )
-from workshops_ai.wizard.catalog_loader import (
-    load_threat_catalog,
-    get_threat_names,
-    load_asset_type_threat_mapping,
-)
+from workshops_ai.wizard.catalog_loader import load_asset_type_threat_mapping
+from workshops_ai.wizard.prompt_context import PromptContextBuilder
 from workshops_ai.wizard.cost_calculator import create_usage_metrics, UsageMetrics
 from workshops_ai.wizard.exceptions import (
     AIResponseError,
@@ -93,87 +90,6 @@ class RiskGenerator:
                 "timeout_sec": settings.wizard.llm_timeout_sec,
             }
         )
-
-    def _build_prompt_sections(
-        self,
-        website_content: str,
-        organization_profile: Optional[Dict[str, Any]],
-        services: Optional[List[Service]],
-        asset_impacts: Optional[List[AssetImpact]],
-        user_instructions: Optional[str],
-    ) -> Dict[str, str]:
-        """
-        Build prompt sections from inputs.
-
-        Args:
-            website_content: Website text content
-            organization_profile: Optional org metadata
-            services: Optional services for context
-            asset_impacts: Optional asset impacts for context
-            user_instructions: Optional user refinement instructions
-
-        Returns:
-            Dict of section names to content
-        """
-        sections = {}
-
-        # Organization profile section
-        if organization_profile:
-            profile_json = json.dumps(organization_profile, ensure_ascii=False)
-            sections["organization_profile_section"] = (
-                f"Organization profile (optional JSON):\n{profile_json}\n"
-            )
-        else:
-            sections["organization_profile_section"] = ""
-
-        # Services section (JSON)
-        if services:
-            services_json = json.dumps(
-                [s.model_dump() for s in services],
-                indent=2,
-                ensure_ascii=False
-            )
-            sections["services_section"] = (
-                f"Services (optional JSON array):\n{services_json}\n"
-            )
-        else:
-            sections["services_section"] = ""
-
-        # Asset impacts section (JSON)
-        if asset_impacts:
-            impacts_json = json.dumps(
-                [ai.model_dump() for ai in asset_impacts],
-                indent=2,
-                ensure_ascii=False
-            )
-            sections["asset_impacts_section"] = (
-                f"Asset impacts (optional JSON array):\n{impacts_json}\n"
-            )
-        else:
-            sections["asset_impacts_section"] = ""
-
-        # Website content section (truncate if needed, omit if empty/disabled)
-        if website_content:
-            max_length = self.settings.wizard.max_content_length
-            truncated_content = website_content[:max_length]
-            if len(website_content) > max_length:
-                truncated_content += "\n... [content truncated]"
-
-            sections["website_content_section"] = (
-                f"Website Content:\n{truncated_content}\n"
-            )
-        else:
-            sections["website_content_section"] = ""
-
-        # User instructions section
-        if user_instructions:
-            sections["user_instructions_section"] = (
-                f"Additional user revision requests (optional): {user_instructions}\n"
-            )
-        else:
-            sections["user_instructions_section"] = ""
-
-        return sections
 
     @retry(
         stop=stop_after_attempt(3),
@@ -493,6 +409,7 @@ class RiskGenerator:
         asset_impacts: Optional[List[AssetImpact]] = None,
         user_instructions: Optional[str] = None,
         session_id: Optional[str] = None,
+        include_catalogs: Optional[List[str]] = None,
     ) -> Tuple[List[AssetRisk], UsageMetrics, Dict[str, Any]]:
         """
         Generate risk evaluations for each asset.
@@ -511,6 +428,7 @@ class RiskGenerator:
             asset_impacts: Optional asset impacts for context
             user_instructions: Optional user refinement instructions
             session_id: Optional session ID for Langfuse tracing
+            include_catalogs: Optional list of catalogs to include in prompt (e.g., ["sectors", "impacts", "threats"])
 
         Returns:
             Tuple of (asset risks list, aggregated usage metrics, debug info dict)
@@ -530,8 +448,12 @@ class RiskGenerator:
             threats_constraint = f"Evaluate up to {max_threats_per_asset} most relevant threats."
         else:
             threats_constraint = "Evaluate all relevant threats from the catalog."
-        # Load threat catalog for language
-        all_threat_names = get_threat_names(language)
+
+        # Initialize prompt context builder with session-based caching
+        builder = PromptContextBuilder(session_id=session_id)
+
+        # Load threat catalog (already localized by Tazilla backend if using API)
+        all_threat_names = await builder.get_catalog_names("threats")
         allowed_names_set = set(all_threat_names)
 
         # Load AssetType→Threat mapping (always required for smart threat selection)
@@ -542,14 +464,27 @@ class RiskGenerator:
         except Exception as e:
             logger.warning(f"Failed to load threat mapping, using all threats: {e}")
 
-        # Build shared prompt sections
-        sections = self._build_prompt_sections(
+        # Build shared prompt sections using centralized builder
+        sections = await builder.build_sections(
             website_content=website_content,
             organization_profile=organization_profile,
             services=services,
-            asset_impacts=asset_impacts,
             user_instructions=user_instructions,
+            include_catalogs=include_catalogs,  # Optional catalogs to include in prompt
         )
+
+        # Add asset_impacts section (specific to risk generator)
+        if asset_impacts:
+            impacts_json = json.dumps(
+                [ai.model_dump() for ai in asset_impacts],
+                indent=2,
+                ensure_ascii=False
+            )
+            sections["asset_impacts_section"] = (
+                f"Asset impacts (optional JSON array):\n{impacts_json}\n"
+            )
+        else:
+            sections["asset_impacts_section"] = ""
 
         results: List[AssetRisk] = []
         total_prompt_tokens = 0

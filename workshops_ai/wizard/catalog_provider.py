@@ -285,33 +285,60 @@ class TazillaAPICatalogProvider(CatalogProvider):
 
             return data
 
+        except httpx.TimeoutException as e:
+            logger.error(
+                "tazilla_catalog_timeout",
+                extra={
+                    "catalog_type": catalog_type,
+                    "session_id": session_id,
+                    "timeout_sec": self.timeout,
+                }
+            )
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail=f"Tazilla API timeout after {self.timeout}s (catalog: {catalog_type})"
+            )
+        except httpx.ConnectError as e:
+            logger.error(
+                "tazilla_catalog_connection_failed",
+                extra={
+                    "catalog_type": catalog_type,
+                    "session_id": session_id,
+                    "error": str(e),
+                }
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Cannot connect to Tazilla API (catalog: {catalog_type})"
+            )
         except httpx.HTTPStatusError as e:
             logger.error(
-                "tazilla_catalog_fetch_failed",
+                "tazilla_catalog_http_error",
                 extra={
                     "catalog_type": catalog_type,
                     "session_id": session_id,
                     "status_code": e.response.status_code,
-                    "error": f"HTTP {e.response.status_code}",
+                    "response_preview": e.response.text[:200] if hasattr(e.response, 'text') else None,
                 }
             )
-            # Re-raise without logging full exception (might contain auth headers)
+            # Propagate original status code from Tazilla API
             raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Failed to fetch catalog from Tazilla API: HTTP {e.response.status_code}"
+                status_code=e.response.status_code,
+                detail=f"Tazilla API error (catalog: {catalog_type}): {e.response.text[:200]}"
             )
         except Exception as e:
             logger.error(
-                "tazilla_catalog_fetch_error",
+                "tazilla_catalog_unexpected_error",
                 extra={
                     "catalog_type": catalog_type,
                     "session_id": session_id,
                     "error_type": type(e).__name__,
+                    "error": str(e),
                 }
             )
             raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Failed to fetch catalog from Tazilla API: {type(e).__name__}"
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Unexpected error fetching catalog: {type(e).__name__}"
             )
 
     async def load_impact_catalog(

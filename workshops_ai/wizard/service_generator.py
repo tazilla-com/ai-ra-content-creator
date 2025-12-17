@@ -35,7 +35,7 @@ from workshops_ai.wizard.exceptions import (
     ValidationRetriesExhausted,
     ModelNotAllowedError,
 )
-from workshops_ai.wizard.catalog_provider import get_catalog_provider
+from workshops_ai.wizard.prompt_context import PromptContextBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -78,74 +78,6 @@ class ServiceGenerator:
                 "structured_outputs": True,
             }
         )
-
-    def _build_prompt_sections(
-        self,
-        website_content: str,
-        organization_profile: Optional[Dict[str, Any]],
-        user_instructions: Optional[str],
-        previous_services: Optional[List[Service]],
-    ) -> Dict[str, str]:
-        """
-        Build prompt sections from inputs.
-
-        Args:
-            website_content: Website text content
-            organization_profile: Optional org metadata
-            user_instructions: Optional user refinement instructions
-            previous_services: Optional previous services for refinement
-
-        Returns:
-            Dict of section names to content
-        """
-        sections = {}
-
-        # Organization profile section
-        if organization_profile:
-            profile_text = "\n".join([
-                f"{key}: {value}"
-                for key, value in organization_profile.items()
-            ])
-            sections["organization_profile_section"] = (
-                f"Organization Profile:\n{profile_text}\n"
-            )
-        else:
-            sections["organization_profile_section"] = ""
-
-        # User instructions section
-        if user_instructions:
-            sections["user_instructions_section"] = (
-                f"User Instructions (PRIORITY):\n{user_instructions}\n"
-            )
-        else:
-            sections["user_instructions_section"] = ""
-
-        # Previous services section (for refinement)
-        if previous_services:
-            services_json = json.dumps(
-                [s.model_dump() for s in previous_services],
-                indent=2
-            )
-            sections["previous_services_section"] = (
-                f"Previous Services (refine these):\n{services_json}\n"
-            )
-        else:
-            sections["previous_services_section"] = ""
-
-        # Website content section (truncate if needed, omit if empty/disabled)
-        if website_content:
-            max_length = self.settings.wizard.max_content_length
-            truncated_content = website_content[:max_length]
-            if len(website_content) > max_length:
-                truncated_content += "\n... [content truncated]"
-
-            sections["website_content_section"] = (
-                f"Website Content:\n{truncated_content}\n"
-            )
-        else:
-            sections["website_content_section"] = ""
-
-        return sections
 
     def _build_full_prompt_text(
         self,
@@ -451,6 +383,7 @@ class ServiceGenerator:
         user_instructions: Optional[str] = None,
         previous_services: Optional[List[Service]] = None,
         session_id: Optional[str] = None,
+        include_catalogs: Optional[List[str]] = None,
     ) -> Tuple[List[Service], UsageMetrics, Dict[str, Any]]:
         """
         Generate services from website content.
@@ -464,6 +397,7 @@ class ServiceGenerator:
             user_instructions: Optional user refinement instructions
             previous_services: Optional previous services for refinement
             session_id: Session ID for client-specific catalogs
+            include_catalogs: Optional list of catalogs to include in prompt (e.g., ["sectors", "impacts"])
 
         Returns:
             Tuple of (services list, usage metrics, debug info dict)
@@ -474,19 +408,19 @@ class ServiceGenerator:
             AIResponseError: If response cannot be parsed
         """
 
-        # Load valid sectors from catalog (already localized by Tazilla backend)
-        provider = get_catalog_provider()
-        sectors_data = await provider.load_sector_catalog(
-            session_id=session_id
-        )
-        valid_sectors = [s["name"] for s in sectors_data]
+        # Initialize prompt context builder with session-based caching
+        builder = PromptContextBuilder(session_id=session_id)
 
-        # Build prompt sections
-        sections = self._build_prompt_sections(
+        # Load valid sectors from catalog (already localized by Tazilla backend)
+        valid_sectors = await builder.get_catalog_names("sectors")
+
+        # Build prompt sections using centralized builder
+        sections = await builder.build_sections(
             website_content=website_content,
             organization_profile=organization_profile,
             user_instructions=user_instructions,
             previous_services=previous_services,
+            include_catalogs=include_catalogs,  # Optional catalogs to include in prompt
         )
 
         # Build count constraint text for prompt

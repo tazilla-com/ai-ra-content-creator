@@ -39,10 +39,9 @@ from workshops_ai.wizard.prompts import (
     CONTROLS_HUMAN_PROMPT_TEMPLATE,
     CONTROLS_JSON_SCHEMA,
 )
-from workshops_ai.wizard.catalog_loader import (
-    load_control_catalog,
-    load_control_threat_coverage,
-)
+from workshops_ai.wizard.catalog_loader import load_control_threat_coverage
+from workshops_ai.wizard.catalog_provider import get_catalog_provider
+from workshops_ai.wizard.prompt_context import PromptContextBuilder
 from workshops_ai.wizard.cost_calculator import create_usage_metrics, UsageMetrics
 from workshops_ai.wizard.exceptions import (
     AIResponseError,
@@ -98,46 +97,6 @@ class ControlGenerator:
                 "timeout_sec": settings.wizard.llm_timeout_sec,
             }
         )
-
-    def _build_prompt_sections(
-        self,
-        website_content: str,
-        user_instructions: Optional[str],
-    ) -> Dict[str, str]:
-        """
-        Build prompt sections from inputs.
-
-        Args:
-            website_content: Website text content
-            user_instructions: Optional user refinement instructions
-
-        Returns:
-            Dict of section names to content
-        """
-        sections = {}
-
-        # Website content section (truncate if needed, omit if empty/disabled)
-        if website_content:
-            max_length = self.settings.wizard.max_content_length
-            truncated_content = website_content[:max_length]
-            if len(website_content) > max_length:
-                truncated_content += "\n... [content truncated]"
-
-            sections["website_content_section"] = (
-                f"Website Content:\n{truncated_content}\n"
-            )
-        else:
-            sections["website_content_section"] = ""
-
-        # User instructions section
-        if user_instructions:
-            sections["user_instructions_section"] = (
-                f"Additional user instructions for control selection: {user_instructions}\n"
-            )
-        else:
-            sections["user_instructions_section"] = ""
-
-        return sections
 
     def _filter_relevant_controls(
         self,
@@ -519,6 +478,7 @@ class ControlGenerator:
         website_content: str = "",
         user_instructions: Optional[str] = None,
         session_id: Optional[str] = None,
+        include_catalogs: Optional[List[str]] = None,
     ) -> Tuple[List[AssetControls], UsageMetrics, Dict[str, Any]]:
         """
         Generate control recommendations for each asset.
@@ -535,6 +495,8 @@ class ControlGenerator:
             max_controls_per_asset: Maximum controls per asset (optional, if not provided, no maximum enforced)
             website_content: Website text content (optional)
             user_instructions: Optional user refinement instructions
+            session_id: Optional session ID for Langfuse tracing
+            include_catalogs: Optional list of catalogs to include in prompt (e.g., ["sectors", "impacts", "threats"])
 
         Returns:
             Tuple of (asset controls list, aggregated usage metrics, debug info dict)
@@ -554,8 +516,15 @@ class ControlGenerator:
             controls_constraint = f"Select up to {max_controls_per_asset} controls."
         else:
             controls_constraint = "Select the optimal number of controls for this asset."
-        # Load control catalog for language
-        control_catalog = load_control_catalog(language)
+
+        # Initialize prompt context builder with session-based caching
+        builder = PromptContextBuilder(session_id=session_id)
+
+        # Load control catalog (already localized by Tazilla backend if using API)
+        provider = get_catalog_provider()
+        control_catalog = await provider.load_control_catalog(session_id=session_id)
+
+        # Load control→threat coverage mapping (from old catalog_loader for now)
         threat_coverage = load_control_threat_coverage()
 
         # Build asset-risk lookup
@@ -566,10 +535,11 @@ class ControlGenerator:
                 risk_lookup[str(ar.assetId)] = ar
             risk_lookup[ar.assetName] = ar
 
-        # Build shared prompt sections
-        sections = self._build_prompt_sections(
+        # Build shared prompt sections using centralized builder
+        sections = await builder.build_sections(
             website_content=website_content,
             user_instructions=user_instructions,
+            include_catalogs=include_catalogs,  # Optional catalogs to include in prompt
         )
 
         results: List[AssetControls] = []

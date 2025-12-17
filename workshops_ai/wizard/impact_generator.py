@@ -31,7 +31,7 @@ from workshops_ai.wizard.prompts import (
     IMPACTS_HUMAN_PROMPT_TEMPLATE,
     IMPACTS_JSON_SCHEMA,
 )
-from workshops_ai.wizard.catalog_loader import load_impact_catalog, get_impact_names
+from workshops_ai.wizard.prompt_context import PromptContextBuilder
 from workshops_ai.wizard.cost_calculator import create_usage_metrics, UsageMetrics
 from workshops_ai.wizard.exceptions import (
     AIResponseError,
@@ -88,72 +88,6 @@ class ImpactGenerator:
                 "timeout_sec": settings.wizard.llm_timeout_sec,
             }
         )
-
-    def _build_prompt_sections(
-        self,
-        website_content: str,
-        organization_profile: Optional[Dict[str, Any]],
-        services: Optional[List[Service]],
-        user_instructions: Optional[str],
-    ) -> Dict[str, str]:
-        """
-        Build prompt sections from inputs.
-
-        Args:
-            website_content: Website text content
-            organization_profile: Optional org metadata
-            services: Optional services for context
-            user_instructions: Optional user refinement instructions
-
-        Returns:
-            Dict of section names to content
-        """
-        sections = {}
-
-        # Organization profile section
-        if organization_profile:
-            profile_json = json.dumps(organization_profile, ensure_ascii=False)
-            sections["organization_profile_section"] = (
-                f"Organization profile (optional JSON):\n{profile_json}\n"
-            )
-        else:
-            sections["organization_profile_section"] = ""
-
-        # Services section (JSON)
-        if services:
-            services_json = json.dumps(
-                [s.model_dump() for s in services],
-                indent=2,
-                ensure_ascii=False
-            )
-            sections["services_section"] = (
-                f"Services (optional JSON array):\n{services_json}\n"
-            )
-        else:
-            sections["services_section"] = ""
-
-        # Website content section (truncate if needed, omit if empty/disabled)
-        if website_content:
-            max_length = self.settings.wizard.max_content_length
-            truncated_content = website_content[:max_length]
-            if len(website_content) > max_length:
-                truncated_content += "\n... [content truncated]"
-
-            sections["website_content_section"] = (
-                f"Website Content:\n{truncated_content}\n"
-            )
-        else:
-            sections["website_content_section"] = ""
-
-        # User instructions section
-        if user_instructions:
-            sections["user_instructions_section"] = (
-                f"Additional user revision requests (optional): {user_instructions}\n"
-            )
-        else:
-            sections["user_instructions_section"] = ""
-
-        return sections
 
     @retry(
         stop=stop_after_attempt(3),
@@ -429,6 +363,7 @@ class ImpactGenerator:
         services: Optional[List[Service]] = None,
         user_instructions: Optional[str] = None,
         session_id: Optional[str] = None,
+        include_catalogs: Optional[List[str]] = None,
     ) -> Tuple[List[AssetImpact], UsageMetrics, Dict[str, Any]]:
         """
         Generate impact evaluations for each asset.
@@ -444,6 +379,8 @@ class ImpactGenerator:
             organization_profile: Optional organization metadata
             services: Optional services for context
             user_instructions: Optional user refinement instructions
+            session_id: Optional session ID for Langfuse tracing
+            include_catalogs: Optional list of catalogs to include in prompt (e.g., ["sectors", "impacts", "threats"])
 
         Returns:
             Tuple of (asset impacts list, aggregated usage metrics, debug info dict)
@@ -463,16 +400,21 @@ class ImpactGenerator:
             impacts_constraint = f"Evaluate up to {max_impacts_per_asset} most relevant impacts."
         else:
             impacts_constraint = "Evaluate all relevant impacts from the catalog."
-        # Load impact catalog for language
-        ordered_catalog_names = get_impact_names(language)
+
+        # Initialize prompt context builder with session-based caching
+        builder = PromptContextBuilder(session_id=session_id)
+
+        # Load impact catalog (already localized by Tazilla backend if using API)
+        ordered_catalog_names = await builder.get_catalog_names("impacts")
         allowed_names_set = set(ordered_catalog_names)
 
-        # Build shared prompt sections
-        sections = self._build_prompt_sections(
+        # Build shared prompt sections using centralized builder
+        sections = await builder.build_sections(
             website_content=website_content,
             organization_profile=organization_profile,
             services=services,
             user_instructions=user_instructions,
+            include_catalogs=include_catalogs,  # Optional catalogs to include in prompt
         )
 
         # Get Langfuse client for tracing
