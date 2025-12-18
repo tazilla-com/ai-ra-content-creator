@@ -25,7 +25,7 @@ from workshops_ai.settings import get_settings
 from workshops_ai.wizard.exceptions import AIResponseError, AITimeoutError
 from workshops_ai.wizard.cost_calculator import create_usage_metrics, UsageMetrics
 from workshops_ai.wizard.prompts import WEB_SEARCH_PROMPT_TEMPLATE
-from workshops_ai.llm.langfuse_helper import get_langfuse_client
+from workshops_ai.llm.langfuse_helper import get_langfuse_client, get_text_prompt_from_langfuse
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,46 @@ async def get_website_via_search(
     """
     settings = get_settings()
 
+    # Wrap entire function in Langfuse span for tracing
+    langfuse_client = get_langfuse_client()
+
+    if langfuse_client:
+        with langfuse_client.start_as_current_span(
+            name="web_search",
+            input={"url": url, "ai_model": ai_model},
+            metadata={"method": "web_search"}
+        ) as search_span:
+            try:
+                result = await _get_website_via_search_impl(url, ai_model, settings, search_span)
+
+                # Update span with success output
+                content, usage_metrics, debug_info = result
+                search_span.update(
+                    output={
+                        "content_length": len(content),
+                        "tokens": usage_metrics.total_tokens,
+                        "cost_usd": usage_metrics.cost_usd,
+                        "model": usage_metrics.model,
+                        "prompt_source": debug_info.get("prompt_source"),
+                    }
+                )
+
+                return result
+            except Exception as e:
+                search_span.update(level="ERROR", status_message=str(e))
+                raise
+    else:
+        # Fallback without Langfuse
+        return await _get_website_via_search_impl(url, ai_model, settings, None)
+
+
+async def _get_website_via_search_impl(
+    url: str,
+    ai_model: Optional[str],
+    settings,
+    search_span=None,
+) -> Tuple[str, UsageMetrics, dict]:
+    """Implementation of get_website_via_search (extracted for Langfuse wrapping)."""
     # Check if web search is enabled
     if not settings.wizard.web_search_enabled:
         raise AIResponseError(
@@ -60,27 +100,40 @@ async def get_website_via_search(
             model=ai_model or settings.wizard.web_search_model
         )
 
-    # Fetch prompt from Langfuse with fallback to local
-    task_prompt_template = WEB_SEARCH_PROMPT_TEMPLATE  # Default fallback
-    prompt_source = "local"
+    # Fetch prompt from Langfuse with fallback to local (using helper)
+    prompt_data = get_text_prompt_from_langfuse(
+        prompt_name="helper/web_search",
+        fallback_text=WEB_SEARCH_PROMPT_TEMPLATE,
+    )
 
-    langfuse_client = get_langfuse_client()
-    if langfuse_client:
-        try:
-            logger.debug("Fetching web-search prompt from Langfuse")
-            langfuse_prompt = langfuse_client.get_prompt("helper/web_search")
+    task_prompt_template = prompt_data["prompt_text"]
+    prompt_source = prompt_data["prompt_source"]
+    prompt_version = prompt_data["version"]
+    prompt_tags = prompt_data["tags"]
+    prompt_labels = prompt_data["labels"]
 
-            # Extract prompt text (should be a text prompt with {{url}} variable)
-            if hasattr(langfuse_prompt, 'prompt'):
-                # Convert Langfuse double braces {{var}} to Python single braces {var}
-                task_prompt_template = langfuse_prompt.prompt.replace('{{', '{').replace('}}', '}')
-                prompt_source = "langfuse"
-                logger.info(
-                    f"Successfully loaded web-search prompt from Langfuse "
-                    f"(version: {langfuse_prompt.version if hasattr(langfuse_prompt, 'version') else 'unknown'})"
-                )
-        except Exception as e:
-            logger.warning(f"Failed to fetch web-search prompt from Langfuse: {e}. Using local fallback.")
+    # Update span with prompt metadata and tags (if span exists)
+    if search_span:
+        # Build tags list for better UI display
+        span_tags = [
+            f"method:web_search",
+            f"tool:openai_web_search",
+            f"prompt_source:{prompt_source}",
+        ]
+        if prompt_version:
+            span_tags.append(f"prompt_version:{prompt_version}")
+        # Add Langfuse prompt tags/labels
+        span_tags.extend(prompt_tags)
+        span_tags.extend([f"label:{label}" for label in prompt_labels])
+
+        search_span.update(
+            tags=span_tags,
+            metadata={
+                "prompt_name": "helper/web_search",
+                "prompt_version": prompt_version,
+                "prompt_source": prompt_source,
+            }
+        )
 
     # Parse URL and extract domain for filtering
     try:

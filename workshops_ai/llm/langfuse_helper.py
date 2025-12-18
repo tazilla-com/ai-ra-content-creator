@@ -176,6 +176,104 @@ def get_langchain_prompt_from_langfuse(
     return None
 
 
+def get_text_prompt_from_langfuse(
+    prompt_name: str,
+    fallback_text: Optional[str] = None,
+    version: Optional[int] = None,
+    label: Optional[str] = None,
+) -> dict:
+    """
+    Fetch a text prompt from Langfuse with metadata (tags, labels, version).
+
+    This is used for non-LangChain integrations (like OpenAI Responses API)
+    where we need the raw text prompt + metadata for tracing.
+
+    Args:
+        prompt_name: Name of the prompt in Langfuse
+        fallback_text: Text to use if Langfuse fetch fails
+        version: Specific version to fetch (default: latest production)
+        label: Label to fetch (e.g., "production", "staging"). If not provided, uses settings.langfuse.prompt_label
+
+    Returns:
+        Dict with:
+            - prompt_text: The prompt text (with {{var}} converted to {var})
+            - tags: List of tags from Langfuse prompt
+            - labels: List of labels from Langfuse prompt
+            - version: Prompt version number (or None)
+            - prompt_source: "langfuse" or "local"
+    """
+    client = get_langfuse_client()
+
+    # Try Langfuse first
+    if client is not None:
+        try:
+            # If no label provided, use from settings
+            if label is None:
+                from workshops_ai.settings import get_settings
+                settings = get_settings()
+                label = settings.langfuse.prompt_label
+
+            logger.debug(f"Fetching text prompt '{prompt_name}' from Langfuse (label={label})")
+
+            fetch_kwargs = {"name": prompt_name}
+            if version is not None:
+                fetch_kwargs["version"] = version
+            if label is not None:
+                fetch_kwargs["label"] = label
+
+            langfuse_prompt = client.get_prompt(**fetch_kwargs)
+
+            # Extract prompt text (assume it's a text prompt with {{var}} syntax)
+            if hasattr(langfuse_prompt, 'prompt'):
+                # Convert Langfuse double braces {{var}} to Python single braces {var}
+                prompt_text = langfuse_prompt.prompt.replace('{{', '{').replace('}}', '}')
+
+                # Extract metadata
+                tags = getattr(langfuse_prompt, 'tags', []) or []
+                labels = getattr(langfuse_prompt, 'labels', []) or []
+                version_num = getattr(langfuse_prompt, 'version', None)
+
+                logger.info(
+                    f"Successfully loaded text prompt '{prompt_name}' from Langfuse "
+                    f"(version: {version_num}, tags: {tags}, labels: {labels})"
+                )
+
+                return {
+                    "prompt_text": prompt_text,
+                    "tags": tags,
+                    "labels": labels,
+                    "version": version_num,
+                    "prompt_source": "langfuse",
+                }
+
+        except Exception as e:
+            logger.warning(
+                f"Failed to fetch text prompt '{prompt_name}' from Langfuse: {e}. "
+                f"Using fallback."
+            )
+
+    # Fallback to local template
+    if fallback_text is not None:
+        logger.info(f"Using fallback text for prompt '{prompt_name}'")
+        return {
+            "prompt_text": fallback_text,
+            "tags": [],
+            "labels": [],
+            "version": None,
+            "prompt_source": "local",
+        }
+
+    # No prompt available
+    logger.error(f"No text prompt available for '{prompt_name}' (Langfuse unavailable, no fallback)")
+    return {
+        "prompt_text": "",
+        "tags": [],
+        "labels": [],
+        "version": None,
+        "prompt_source": "error",
+    }
+
+
 def flush_langfuse():
     """
     Flush any pending Langfuse events.

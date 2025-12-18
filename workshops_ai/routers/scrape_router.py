@@ -44,6 +44,8 @@ async def scrape_website(
 
     Note: This endpoint does NOT use session caching. Each request fetches fresh content.
     """
+    from workshops_ai.llm.langfuse_helper import get_langfuse_client
+
     logger.info(
         "scrape_website_request",
         extra={
@@ -53,6 +55,52 @@ async def scrape_website(
         }
     )
 
+    langfuse_client = get_langfuse_client()
+
+    # Wrap entire endpoint in Langfuse trace for e2e visibility
+    if langfuse_client:
+        with langfuse_client.start_as_current_span(
+            name="scrape_website_endpoint",
+            input={
+                "url": request.url,
+                "search_method": request.search_method,
+            },
+            tags=[
+                f"endpoint:/scrape/website",
+                f"method:{request.search_method}",
+            ],
+            metadata={
+                "endpoint": "/scrape/website",
+            }
+        ) as root_span:
+            try:
+                result = await _scrape_website_impl(request, identity, root_span)
+
+                # Update root span with success output
+                root_span.update(
+                    output={
+                        "url": result.url,
+                        "content_length": len(result.content),
+                    }
+                )
+
+                return result
+
+            except Exception as e:
+                # Update root span with error
+                root_span.update(level="ERROR", status_message=str(e))
+                raise
+    else:
+        # Fallback without Langfuse
+        return await _scrape_website_impl(request, identity, None)
+
+
+async def _scrape_website_impl(
+    request: ScrapeWebsiteInput,
+    identity: Dict[str, Any],
+    root_span = None,
+) -> ScrapeWebsiteOutput:
+    """Implementation of scrape_website logic (extracted for Langfuse wrapping)."""
     try:
         if request.search_method == "web_search":
             # Use AI web search (uses default model from settings)

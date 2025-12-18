@@ -237,8 +237,45 @@ async def get_website(url: str) -> WebsiteContent:
         ScraperError: If homepage cannot be fetched
         AIResponseError: If content fails security checks or is insufficient
     """
+    from workshops_ai.llm.langfuse_helper import get_langfuse_client
+
     settings = get_settings()
 
+    # Wrap entire function in Langfuse span for tracing
+    langfuse_client = get_langfuse_client()
+
+    if langfuse_client:
+        with langfuse_client.start_as_current_span(
+            name="web_scrape",
+            input={"url": url},
+            tags=["method:scrape", "tool:beautifulsoup"],
+            metadata={"method": "scrape", "tool": "beautifulsoup"}
+        ) as scrape_span:
+            try:
+                result = await _get_website_impl(url, settings, scrape_span)
+
+                # Update span with success output
+                scrape_span.update(
+                    output={
+                        "base_url": result.base_url,
+                        "pages_scraped": len(result.pages),
+                        "total_content_length": sum(len(p.content) for p in result.pages),
+                        "had_errors": bool(result.errors),
+                        "had_warnings": bool(result.security_warnings),
+                    }
+                )
+
+                return result
+            except Exception as e:
+                scrape_span.update(level="ERROR", status_message=str(e))
+                raise
+    else:
+        # Fallback without Langfuse
+        return await _get_website_impl(url, settings, None)
+
+
+async def _get_website_impl(url: str, settings, scrape_span=None) -> WebsiteContent:
+    """Implementation of get_website (extracted for Langfuse wrapping)."""
     # Check if scraping is enabled
     if not settings.wizard.scrape_enabled:
         raise AIResponseError(
