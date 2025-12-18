@@ -112,28 +112,23 @@ async def _get_website_via_search_impl(
     prompt_tags = prompt_data["tags"]
     prompt_labels = prompt_data["labels"]
 
-    # Update span with prompt metadata and tags (if span exists)
+    # Update span with prompt metadata (if span exists)
     if search_span:
-        # Build tags list for better UI display
-        span_tags = [
-            f"method:web_search",
-            f"tool:openai_web_search",
-            f"prompt_source:{prompt_source}",
-        ]
-        if prompt_version:
-            span_tags.append(f"prompt_version:{prompt_version}")
-        # Add Langfuse prompt tags/labels
-        span_tags.extend(prompt_tags)
-        span_tags.extend([f"label:{label}" for label in prompt_labels])
+        metadata = {
+            "method": "web_search",
+            "tool": "openai_web_search",
+            "prompt_name": "helper/web_search",
+            "prompt_version": prompt_version,
+            "prompt_source": prompt_source,
+        }
 
-        search_span.update(
-            tags=span_tags,
-            metadata={
-                "prompt_name": "helper/web_search",
-                "prompt_version": prompt_version,
-                "prompt_source": prompt_source,
-            }
-        )
+        # Add Langfuse prompt tags/labels to metadata
+        if prompt_tags:
+            metadata["prompt_tags"] = ",".join(prompt_tags)
+        if prompt_labels:
+            metadata["prompt_labels"] = ",".join(prompt_labels)
+
+        search_span.update(metadata=metadata)
 
     # Parse URL and extract domain for filtering
     try:

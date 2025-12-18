@@ -65,12 +65,9 @@ async def scrape_website(
                 "url": request.url,
                 "search_method": request.search_method,
             },
-            tags=[
-                f"endpoint:/scrape/website",
-                f"method:{request.search_method}",
-            ],
             metadata={
                 "endpoint": "/scrape/website",
+                "method": request.search_method,
             }
         ) as root_span:
             try:

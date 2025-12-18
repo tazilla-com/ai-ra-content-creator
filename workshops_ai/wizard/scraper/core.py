@@ -248,7 +248,6 @@ async def get_website(url: str) -> WebsiteContent:
         with langfuse_client.start_as_current_span(
             name="web_scrape",
             input={"url": url},
-            tags=["method:scrape", "tool:beautifulsoup"],
             metadata={"method": "scrape", "tool": "beautifulsoup"}
         ) as scrape_span:
             try:
