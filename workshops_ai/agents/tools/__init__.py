@@ -10,7 +10,7 @@ Tools:
 """
 from __future__ import annotations
 
-from workshops_ai.graph.assets.tools.assets import (
+from workshops_ai.agents.tools.assets import (
     asset_create_batch,
     asset_update_with_diff,
     confirm_and_submit,
