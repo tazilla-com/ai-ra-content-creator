@@ -127,7 +127,7 @@ async def _build_agent_state(
     selected_assets = [
         a.model_dump() if hasattr(a, 'model_dump') else a
         for a in assets_to_use
-        if getattr(a, 'selected', False) if hasattr(a, 'selected') else a.get('selected', False)
+        if (getattr(a, 'selected', False) if hasattr(a, 'selected') else a.get('selected', False))
     ]
 
     # Convert recent_operations to dict format for AgentState
