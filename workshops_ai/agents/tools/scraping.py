@@ -17,7 +17,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field, HttpUrl
 
 from workshops_ai.wizard.scraper import get_website, flatten_website_content
-from workshops_ai.agents.session import get_agent_session, save_agent_session
+from workshops_ai.session import get_session, save_session
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ async def scrape_company_website(input: ScrapeWebsiteInput) -> dict:
     """
     try:
         # Load session
-        session = await get_agent_session(input.session_id)
+        session = await get_session(input.session_id)
         if not session:
             return {
                 "status": "error",
@@ -87,19 +87,21 @@ async def scrape_company_website(input: ScrapeWebsiteInput) -> dict:
         url_str = str(input.url)
 
         # Check cache first
-        if session.scraped_url == url_str and session.scraped_content:
+        scraped_url = session.wizard_metadata.get("scraped_url")
+        scraped_content = session.wizard_metadata.get("scraped_content")
+        if scraped_url == url_str and scraped_content:
             logger.info(
                 "Using cached scraped content",
                 extra={
                     "session_id": input.session_id,
                     "url": url_str,
-                    "content_length": len(session.scraped_content),
+                    "content_length": len(scraped_content),
                 }
             )
             return {
                 "status": "success",
-                "content": session.scraped_content,
-                "final_url": session.scraped_url,
+                "content": scraped_content,
+                "final_url": scraped_url,
                 "cached": True,
                 "message": "Using cached content from previous scrape",
             }
@@ -116,9 +118,9 @@ async def scrape_company_website(input: ScrapeWebsiteInput) -> dict:
         final_url, combined_text = flatten_website_content(website_content)
 
         # Cache in session
-        session.scraped_url = str(final_url)
-        session.scraped_content = combined_text
-        await save_agent_session(session)
+        session.wizard_metadata["scraped_url"] = str(final_url)
+        session.wizard_metadata["scraped_content"] = combined_text
+        await save_session(session)
 
         logger.info(
             "Website scraped successfully",

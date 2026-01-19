@@ -45,6 +45,12 @@ async def scrape_website(
     Note: This endpoint does NOT use session caching. Each request fetches fresh content.
     """
     from workshops_ai.llm.langfuse_helper import get_langfuse_client
+    from workshops_ai.settings import get_settings
+
+    # Apply default search_method from settings if not provided
+    settings = get_settings()
+    if request.search_method is None:
+        request.search_method = settings.wizard.default_search_method
 
     logger.info(
         "scrape_website_request",

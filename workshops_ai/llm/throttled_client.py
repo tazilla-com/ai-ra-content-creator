@@ -12,9 +12,7 @@ class ThrottledChatOpenAI(ChatOpenAI):
     """ChatOpenAI wrapper s OpenAI throttling."""
 
     async def ainvoke(self, input: Any, config: Optional[Any] = None, **kwargs: Any) -> Any:
-        from workshops_ai.llm.openai_throttle import get_throttle
         from workshops_ai.settings import get_settings
-        from pybreaker import CircuitBreakerError
 
         settings = get_settings()
 
@@ -22,9 +20,11 @@ class ThrottledChatOpenAI(ChatOpenAI):
             return await super().ainvoke(input, config, **kwargs)
 
         try:
+            from workshops_ai.llm.openai_throttle import get_throttle
+            from pybreaker import CircuitBreakerError
             throttle = get_throttle()
-        except RuntimeError:
-            logger.warning("Throttle not initialized, skipping")
+        except (ImportError, RuntimeError) as e:
+            logger.warning(f"Throttle not available ({type(e).__name__}), skipping")
             return await super().ainvoke(input, config, **kwargs)
 
         messages = self._convert_input_to_messages(input)
@@ -44,9 +44,7 @@ class ThrottledChatOpenAI(ChatOpenAI):
             raise
 
     def invoke(self, input: Any, config: Optional[Any] = None, **kwargs: Any) -> Any:
-        from workshops_ai.llm.openai_throttle import get_throttle
         from workshops_ai.settings import get_settings
-        from pybreaker import CircuitBreakerError
 
         settings = get_settings()
 
@@ -54,9 +52,11 @@ class ThrottledChatOpenAI(ChatOpenAI):
             return super().invoke(input, config, **kwargs)
 
         try:
+            from workshops_ai.llm.openai_throttle import get_throttle
+            from pybreaker import CircuitBreakerError
             throttle = get_throttle()
-        except RuntimeError:
-            logger.warning("Throttle not initialized, skipping")
+        except (ImportError, RuntimeError) as e:
+            logger.warning(f"Throttle not available ({type(e).__name__}), skipping")
             return super().invoke(input, config, **kwargs)
 
         import asyncio

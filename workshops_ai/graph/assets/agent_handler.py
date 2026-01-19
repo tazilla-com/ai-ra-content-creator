@@ -27,10 +27,10 @@ from langchain_core.messages import HumanMessage
 
 from workshops_ai.schemas.ui_contract import UIRequest, UIResponse
 from workshops_ai.graph.factory import GraphDeps
-from workshops_ai.agents.session import (
-    AgentSessionState,
-    get_agent_session,
-    save_agent_session,
+from workshops_ai.session import (
+    SessionState,
+    get_session,
+    save_session,
 )
 from workshops_ai.graph.assets.agent_prompts import build_system_prompt
 from workshops_ai.graph.assets.agent_tools_factory import get_bound_tools
@@ -84,24 +84,23 @@ async def run_asset_agent(
         await _send_progress(conn_id, ui_req.org_id, "Loading session...", 10)
 
         # 1. Load or create session
-        session = await get_agent_session(ui_req.session_id)
+        session = await get_session(ui_req.session_id)
 
         if not session:
-            # Create new session
-            # Extract org_id and user_id from auth (these should come from request context)
-            session = AgentSessionState(
-                session_id=ui_req.session_id,
-                org_id=ui_req.org_id,
-                user_id=ui_req.user_id or "anonymous",
-                language=ui_req.language or "en",
-            )
-            logger.info(
-                "Created new agent session",
-                extra={"session_id": session.session_id, "org_id": session.org_id}
-            )
+            # TODO: Update to use new SessionState model with workshop_id
+            # This code uses old protocol and needs refactoring
+            raise NotImplementedError("Old agent_handler not compatible with new SessionState - use ws_router instead")
+            # session = SessionState(
+            #     session_id=ui_req.session_id,
+            #     workshop_id="assets",  # FIXME: Get from ui_req
+            # )
+            # logger.info(
+            #     "Created new agent session",
+            #     extra={"session_id": session.session_id}
+            # )
 
             # CRITICAL: Save new session to Redis IMMEDIATELY so tools can access it!
-            await save_agent_session(session)
+            await save_session(session)
             logger.info(
                 "Saved new session to Redis",
                 extra={"session_id": session.session_id}
@@ -121,7 +120,7 @@ async def run_asset_agent(
             session.existing_assets = [asset.model_dump() for asset in ui_req.existing_assets]
 
         # Save enriched session
-        await save_agent_session(session)
+        await save_session(session)
 
         # Progress: Building agent
         await _send_progress(conn_id, ui_req.org_id, "Preparing AI agent...", 20)
@@ -183,7 +182,7 @@ async def run_asset_agent(
 
         # 8. Reload session to get latest state from tools
         # (tools modify session independently, so we need to reload)
-        session = await get_agent_session(ui_req.session_id) or session
+        session = await get_session(ui_req.session_id) or session
 
         # Progress: Done
         await _send_progress(conn_id, ui_req.org_id, "Complete", 100)

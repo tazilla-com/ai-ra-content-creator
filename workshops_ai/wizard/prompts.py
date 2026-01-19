@@ -264,6 +264,22 @@ IMPACTS_JSON_SCHEMA = """[
   }}
 ]"""
 
+# JSON schema for batch impacts (multiple assets at once)
+# Used in batch processing via OpenAI Structured Outputs
+BATCH_IMPACTS_JSON_SCHEMA = """{{
+  "asset_impacts": [
+    {{
+      "assetName": "exact asset name from input",
+      "impacts": [
+        {{
+          "impactName": "exact catalog name",
+          "impactLevel": 1|2|3|4
+        }}
+      ]
+    }}
+  ]
+}}"""
+
 # Production prompt (catalog-based evaluation)
 IMPACTS_SYSTEM_PROMPT = """
 You are an expert risk analyst specializing in business impact assessment.
@@ -367,10 +383,26 @@ RISKS_JSON_SCHEMA = """[
   }}
 ]"""
 
+# JSON schema for batch risks (multiple assets at once)
+# Used in batch processing via OpenAI Structured Outputs
+BATCH_RISKS_JSON_SCHEMA = """{{
+  "asset_risks": [
+    {{
+      "assetName": "exact asset name from input",
+      "risks": [
+        {{
+          "threatName": "exact catalog name",
+          "probability": 1|2|3|4
+        }}
+      ]
+    }}
+  ]
+}}"""
+
 # Production prompt (catalog-based combined threat selection + probability estimation)
 COMBINED_RISK_SYSTEM_PROMPT = """
 You are an expert cybersecurity risk analyst specializing in threat probability assessment.
-Your task: Identify and evaluate the most relevant threats from the official threat catalog for a SINGLE asset. Return only applicable threats with their probability levels (1-4). This assessment will be used to prioritize security controls, allocate resources, and develop risk mitigation strategies.
+Your task: Identify and evaluate the most relevant threats from the official threat catalog for MULTIPLE assets. Return only applicable threats with their probability levels (1-4) for EACH asset. This assessment will be used to prioritize security controls, allocate resources, and develop risk mitigation strategies.
 
 Core Principles:
 1. User instructions first: If user provides specific guidance, follow it closely
@@ -433,9 +465,9 @@ Return JSON array with format (only applicable threats, probability 1-4):
 """
 
 COMBINED_RISK_HUMAN_PROMPT_TEMPLATE = """
-Identify the most relevant threats for this asset and evaluate their probability levels.
+Identify the most relevant threats for these assets and evaluate their probability levels. Return risks for EACH asset.
 
-Single asset to evaluate:
+Assets to evaluate:
 {assets_json}
 
 {organization_profile_section}
@@ -498,10 +530,25 @@ CONTROLS_JSON_SCHEMA = """{{
   ]
 }}"""
 
+# JSON schema for batch controls (multiple assets at once)
+# Used in batch processing via OpenAI Structured Outputs
+BATCH_CONTROLS_JSON_SCHEMA = """{{
+  "asset_controls": [
+    {{
+      "assetName": "exact asset name from input",
+      "controls": [
+        {{
+          "name": "exact control name"
+        }}
+      ]
+    }}
+  ]
+}}"""
+
 # Production prompt (hybrid catalog + AI approach)
 CONTROLS_SYSTEM_PROMPT = """
 You are an expert cybersecurity consultant specializing in security control selection and risk mitigation strategy.
-Your task: Select the most effective security controls from a pre-filtered catalog for a SINGLE asset. These recommendations will guide security investment decisions and implementation priorities.
+Your task: Select the most effective security controls from a pre-filtered catalog for MULTIPLE assets. Return recommended controls for EACH asset. These recommendations will guide security investment decisions and implementation priorities.
 
 Core Principles:
 1. User instructions first: If user provides specific guidance on control selection, prioritization, or constraints, follow it closely
@@ -537,9 +584,9 @@ Return JSON object with format (only control names):
 """
 
 CONTROLS_HUMAN_PROMPT_TEMPLATE = """
-Select the most effective security controls for this asset to mitigate its identified threats.
+Select the most effective security controls for these assets to mitigate their identified threats. Return controls for EACH asset.
 
-Single asset to protect:
+Assets to protect:
 {asset_json}
 
 Asset risks (threats with evaluated probabilities):

@@ -25,11 +25,12 @@ from langchain_core.prompts import ChatPromptTemplate
 from workshops_ai.settings import get_settings
 from workshops_ai.api.schema.asset import Asset
 from workshops_ai.api.schema.impact import ImpactEvaluation, AssetImpact
-from workshops_ai.wizard.schemas import Service, ImpactsResponse
+from workshops_ai.wizard.schemas import Service, ImpactsResponse, BatchImpactsResponse
 from workshops_ai.wizard.prompts import (
     IMPACTS_SYSTEM_PROMPT,
     IMPACTS_HUMAN_PROMPT_TEMPLATE,
     IMPACTS_JSON_SCHEMA,
+    BATCH_IMPACTS_JSON_SCHEMA,
 )
 from workshops_ai.wizard.prompt_context import PromptContextBuilder
 from workshops_ai.wizard.cost_calculator import create_usage_metrics, UsageMetrics
@@ -352,6 +353,375 @@ class ImpactGenerator:
                 details={"response_preview": response_text[:200]}
             ) from e
 
+    async def _process_assets_batch(
+        self,
+        assets: List[Asset],
+        prompt: ChatPromptTemplate,
+        ordered_catalog_names: List[str],
+        impacts_constraint: str,
+        language: str,
+        sections: Dict[str, Any],
+        max_impacts_per_asset: Optional[int],
+        session_id: Optional[str],
+    ) -> Tuple[List[AssetImpact], int, int, str]:
+        """
+        Process a batch of assets in a single LLM call.
+
+        Args:
+            assets: List of assets to process (1 to max_batch_size)
+            prompt: Prompt template
+            ordered_catalog_names: Catalog names for validation
+            impacts_constraint: Impacts count constraint text
+            language: Output language
+            sections: Prompt sections (organization, services, etc.)
+            max_impacts_per_asset: Max impacts per asset
+            session_id: Session ID for tracing
+
+        Returns:
+            Tuple of (asset_impacts list, prompt_tokens, completion_tokens, response_text)
+
+        Raises:
+            AIResponseError: If response invalid or missing assets
+            AITimeoutError: If LLM times out
+        """
+        from workshops_ai.llm.wizard_client import create_wizard_llm_client
+
+        # Create batch LLM client with BatchImpactsResponse format
+        batch_llm = create_wizard_llm_client(
+            model=self.model_name,
+            response_format=BatchImpactsResponse
+        )
+
+        # Create JSON for all assets in batch
+        assets_json = json.dumps([a.model_dump() for a in assets], ensure_ascii=False)
+
+        # Format messages
+        messages = prompt.format_messages(
+            assets_json=assets_json,
+            ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+            impacts_constraint=impacts_constraint,
+            impacts_json_schema=BATCH_IMPACTS_JSON_SCHEMA,
+            language=language,
+            **sections
+        )
+
+        # Get Langfuse callback handler
+        langfuse_handler = get_langfuse_callback_handler()
+        invoke_kwargs = {}
+        if langfuse_handler:
+            invoke_kwargs["config"] = {"callbacks": [langfuse_handler]}
+
+        # Call LLM
+        try:
+            response = await batch_llm.ainvoke(messages, **invoke_kwargs)
+        except asyncio.TimeoutError as e:
+            raise AITimeoutError(
+                f"LLM timeout after {self.settings.wizard.llm_timeout_sec}s",
+                model=self.model_name,
+                timeout_sec=self.settings.wizard.llm_timeout_sec
+            ) from e
+
+        # Extract response text
+        response_text = response.content
+
+        # Extract usage
+        usage = response.response_metadata.get("token_usage", {})
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+
+        # Parse response (BatchImpactsResponse should be already validated by OpenAI)
+        try:
+            # Extract JSON from response
+            response_text_stripped = response_text.strip()
+            start_idx = response_text_stripped.find("{")
+            end_idx = response_text_stripped.rfind("}")
+
+            if start_idx == -1 or end_idx == -1:
+                raise AIResponseError(
+                    "No JSON object found in batch response",
+                    model=self.model_name,
+                    details={"response_preview": response_text[:200]}
+                )
+
+            json_text = response_text_stripped[start_idx:end_idx + 1]
+            batch_data = json.loads(json_text)
+
+            # Validate structure
+            if "asset_impacts" not in batch_data:
+                raise AIResponseError(
+                    "Missing 'asset_impacts' field in batch response",
+                    model=self.model_name,
+                    details={"response_preview": response_text[:200]}
+                )
+
+            asset_impacts_data = batch_data["asset_impacts"]
+
+            # Validate count matches input (log warning if mismatch, but continue)
+            if len(asset_impacts_data) != len(assets):
+                warning_msg = f"Batch response has {len(asset_impacts_data)} assets, expected {len(assets)} - continuing with partial results"
+                logger.warning(
+                    warning_msg,
+                    extra={
+                        "expected_count": len(assets),
+                        "received_count": len(asset_impacts_data),
+                        "expected_assets": [a.name for a in assets],
+                        "received_assets": [ai.get("assetName") for ai in asset_impacts_data],
+                    }
+                )
+
+            # Parse each AssetImpact
+            results: List[AssetImpact] = []
+            allowed_names_set = set(ordered_catalog_names)
+
+            for ai_data in asset_impacts_data:
+                # Validate and filter impacts
+                valid_impacts = []
+                for imp_data in ai_data.get("impacts", []):
+                    impact_name = imp_data.get("impactName")
+                    impact_level = imp_data.get("impactLevel")
+
+                    # Validate impact name
+                    if impact_name not in allowed_names_set:
+                        logger.warning(
+                            f"Invalid impact name '{impact_name}' for asset '{ai_data.get('assetName')}', skipping"
+                        )
+                        continue
+
+                    # Filter out level 0 (not relevant)
+                    if impact_level == 0:
+                        continue
+
+                    valid_impacts.append(ImpactEvaluation(
+                        impactName=impact_name,
+                        impactLevel=impact_level
+                    ))
+
+                # Apply max limit if specified
+                if max_impacts_per_asset is not None and len(valid_impacts) > max_impacts_per_asset:
+                    valid_impacts = valid_impacts[:max_impacts_per_asset]
+
+                # Create AssetImpact
+                results.append(AssetImpact(
+                    assetId=ai_data.get("assetId"),
+                    assetName=ai_data["assetName"],
+                    impacts=valid_impacts
+                ))
+
+            return results, prompt_tokens, completion_tokens, response_text
+
+        except (json.JSONDecodeError, KeyError, ValidationError) as e:
+            raise AIResponseError(
+                f"Failed to parse batch response: {str(e)}",
+                model=self.model_name,
+                details={"response_preview": response_text[:200]}
+            ) from e
+
+    async def _process_batch_with_recursive_splitting(
+        self,
+        assets: List[Asset],
+        prompt: ChatPromptTemplate,
+        ordered_catalog_names: List[str],
+        impacts_constraint: str,
+        language: str,
+        sections: Dict[str, Any],
+        max_impacts_per_asset: Optional[int],
+        session_id: Optional[str],
+        recursion_level: int = 0,
+        max_recursion_level: int = 3,
+    ) -> Tuple[List[AssetImpact], int, int, str]:
+        """
+        Process batch with recursive splitting on context/limit errors.
+
+        Strategy:
+        - Try processing full batch
+        - On context/limit error: split batch in half and recursively process each half
+        - Max 3 levels of recursive splitting (batch → half → quarter → sequential)
+        - Only fall back to sequential processing after max recursion level reached
+
+        Args:
+            assets: Assets to process in this batch
+            prompt: Chat prompt template
+            ordered_catalog_names: Ordered impact catalog names
+            impacts_constraint: Impacts constraint text
+            language: Output language
+            sections: Prompt sections
+            max_impacts_per_asset: Max impacts per asset
+            session_id: Session ID for tracing
+            recursion_level: Current recursion depth (0 = first attempt)
+            max_recursion_level: Maximum recursion depth before sequential fallback
+
+        Returns:
+            Tuple of (results list, total prompt tokens, total completion tokens, last response text)
+        """
+        langfuse_client = get_langfuse_client()
+
+        try:
+            # Try batch processing
+            batch_results, prompt_tokens, completion_tokens, response_text = await self._process_assets_batch(
+                assets=assets,
+                prompt=prompt,
+                ordered_catalog_names=ordered_catalog_names,
+                impacts_constraint=impacts_constraint,
+                language=language,
+                sections=sections,
+                max_impacts_per_asset=max_impacts_per_asset,
+                session_id=session_id,
+            )
+
+            return batch_results, prompt_tokens, completion_tokens, response_text
+
+        except AITimeoutError as e:
+            # Timeout - check if we can split or need sequential fallback
+            if recursion_level < max_recursion_level and len(assets) > 1:
+                # Split batch in half
+                mid = len(assets) // 2
+                first_half = assets[:mid]
+                second_half = assets[mid:]
+
+                logger.warning(
+                    f"Batch timeout at recursion level {recursion_level}, splitting {len(assets)} assets into {len(first_half)} + {len(second_half)}",
+                    extra={
+                        "recursion_level": recursion_level,
+                        "total_assets": len(assets),
+                        "first_half_size": len(first_half),
+                        "second_half_size": len(second_half),
+                        "reason": "timeout",
+                    }
+                )
+
+                # Recursively process each half
+                results1, tokens1_p, tokens1_c, text1 = await self._process_batch_with_recursive_splitting(
+                    assets=first_half,
+                    prompt=prompt,
+                    ordered_catalog_names=ordered_catalog_names,
+                    impacts_constraint=impacts_constraint,
+                    language=language,
+                    sections=sections,
+                    max_impacts_per_asset=max_impacts_per_asset,
+                    session_id=session_id,
+                    recursion_level=recursion_level + 1,
+                    max_recursion_level=max_recursion_level,
+                )
+
+                results2, tokens2_p, tokens2_c, text2 = await self._process_batch_with_recursive_splitting(
+                    assets=second_half,
+                    prompt=prompt,
+                    ordered_catalog_names=ordered_catalog_names,
+                    impacts_constraint=impacts_constraint,
+                    language=language,
+                    sections=sections,
+                    max_impacts_per_asset=max_impacts_per_asset,
+                    session_id=session_id,
+                    recursion_level=recursion_level + 1,
+                    max_recursion_level=max_recursion_level,
+                )
+
+                # Combine results
+                combined_results = results1 + results2
+                combined_prompt_tokens = tokens1_p + tokens2_p
+                combined_completion_tokens = tokens1_c + tokens2_c
+                last_text = text2  # Use last response text
+
+                return combined_results, combined_prompt_tokens, combined_completion_tokens, last_text
+            else:
+                # Max recursion level reached or single asset - fallback to sequential
+                logger.warning(
+                    f"Max recursion level reached or single asset, falling back to sequential processing",
+                    extra={
+                        "recursion_level": recursion_level,
+                        "max_recursion_level": max_recursion_level,
+                        "assets_count": len(assets),
+                        "reason": "max_recursion_or_single_asset",
+                    }
+                )
+                # Re-raise to trigger sequential fallback in parent
+                raise
+
+        except AIResponseError as e:
+            # Check if error is context/limit related
+            error_msg = str(e).lower()
+
+            if any(keyword in error_msg for keyword in ["context", "limit", "token"]):
+                # Context/limit error - check if we can split
+                if recursion_level < max_recursion_level and len(assets) > 1:
+                    # Split batch in half
+                    mid = len(assets) // 2
+                    first_half = assets[:mid]
+                    second_half = assets[mid:]
+
+                    logger.warning(
+                        f"Batch context/limit error at recursion level {recursion_level}, splitting {len(assets)} assets into {len(first_half)} + {len(second_half)}",
+                        extra={
+                            "recursion_level": recursion_level,
+                            "total_assets": len(assets),
+                            "first_half_size": len(first_half),
+                            "second_half_size": len(second_half),
+                            "error": str(e),
+                            "reason": "context_limit",
+                        }
+                    )
+
+                    # Recursively process each half
+                    results1, tokens1_p, tokens1_c, text1 = await self._process_batch_with_recursive_splitting(
+                        assets=first_half,
+                        prompt=prompt,
+                        ordered_catalog_names=ordered_catalog_names,
+                        impacts_constraint=impacts_constraint,
+                        language=language,
+                        sections=sections,
+                        max_impacts_per_asset=max_impacts_per_asset,
+                        session_id=session_id,
+                        recursion_level=recursion_level + 1,
+                        max_recursion_level=max_recursion_level,
+                    )
+
+                    results2, tokens2_p, tokens2_c, text2 = await self._process_batch_with_recursive_splitting(
+                        assets=second_half,
+                        prompt=prompt,
+                        ordered_catalog_names=ordered_catalog_names,
+                        impacts_constraint=impacts_constraint,
+                        language=language,
+                        sections=sections,
+                        max_impacts_per_asset=max_impacts_per_asset,
+                        session_id=session_id,
+                        recursion_level=recursion_level + 1,
+                        max_recursion_level=max_recursion_level,
+                    )
+
+                    # Combine results
+                    combined_results = results1 + results2
+                    combined_prompt_tokens = tokens1_p + tokens2_p
+                    combined_completion_tokens = tokens1_c + tokens2_c
+                    last_text = text2  # Use last response text
+
+                    return combined_results, combined_prompt_tokens, combined_completion_tokens, last_text
+                else:
+                    # Max recursion level reached or single asset - fallback to sequential
+                    logger.warning(
+                        f"Max recursion level reached or single asset, falling back to sequential processing",
+                        extra={
+                            "recursion_level": recursion_level,
+                            "max_recursion_level": max_recursion_level,
+                            "assets_count": len(assets),
+                            "error": str(e),
+                            "reason": "max_recursion_or_single_asset",
+                        }
+                    )
+                    # Re-raise to trigger sequential fallback in parent
+                    raise
+            else:
+                # Non-recoverable error - re-raise immediately
+                logger.error(
+                    f"Non-recoverable error in batch processing",
+                    extra={
+                        "recursion_level": recursion_level,
+                        "assets_count": len(assets),
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    }
+                )
+                raise
+
     async def generate_asset_impacts(
         self,
         assets: List[Asset],
@@ -368,7 +738,8 @@ class ImpactGenerator:
         """
         Generate impact evaluations for each asset.
 
-        Processes one asset at a time, evaluating impacts from catalog.
+        Processes assets in batches for better performance (configurable via WORKSHOPS_AI_WIZARD__MAX_BATCH_SIZE).
+        Falls back to sequential processing if batch fails.
 
         Args:
             assets: List of assets to evaluate
@@ -525,121 +896,371 @@ class ImpactGenerator:
                             }
                         )
 
-                    # Process each asset individually
-                    for asset in assets:
-                        # Child span: evaluate-asset-impact
+                    # Split assets into batches based on max_batch_size setting
+                    batch_size = self.settings.wizard.max_batch_size
+                    total_batches = (len(assets) + batch_size - 1) // batch_size  # Ceiling division
+
+                    logger.info(
+                        f"Processing {len(assets)} assets in {total_batches} batch(es) of up to {batch_size} assets",
+                        extra={
+                            "total_assets": len(assets),
+                            "batch_size": batch_size,
+                            "total_batches": total_batches,
+                        }
+                    )
+
+                    # Process batches
+                    for batch_idx in range(total_batches):
+                        start_idx = batch_idx * batch_size
+                        end_idx = min(start_idx + batch_size, len(assets))
+                        batch_assets = assets[start_idx:end_idx]
+
+                        # Child span: evaluate-batch-impacts
                         with langfuse_client.start_as_current_span(
-                            name="evaluate-asset-impact",
+                            name="evaluate-batch-impacts",
                             input={
-                                "asset_id": str(asset.id) if asset.id else None,
-                                "asset_name": asset.name,
-                                "catalog_impacts_count": len(ordered_catalog_names),
+                                "batch_index": batch_idx + 1,
+                                "total_batches": total_batches,
+                                "batch_size": len(batch_assets),
+                                "asset_names": [a.name for a in batch_assets],
                             },
-                            metadata={"asset_type": asset.assetType if hasattr(asset, 'assetType') else None},
-                        ) as asset_span:
+                            metadata={"catalog_impacts_count": len(ordered_catalog_names)},
+                        ) as batch_span:
                             try:
-                                # Single-asset JSON
-                                assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
-
-                                # Format prompt for debug preview
-                                messages = prompt.format_messages(
-                                    assets_json=assets_json,
-                                    ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
-                                    impacts_constraint=impacts_constraint,
-                                    impacts_json_schema=IMPACTS_JSON_SCHEMA,
-                                    language=language,
-                                    **sections
-                                )
-                                last_prompt_text = str(messages)
-
-                                # Call LLM with retry logic
-                                response_text, usage_metrics = await self._call_llm_with_retry(
+                                # Process batch with recursive splitting on context/limit errors
+                                batch_results, batch_prompt_tokens, batch_completion_tokens, batch_response_text = await self._process_batch_with_recursive_splitting(
+                                    assets=batch_assets,
                                     prompt=prompt,
-                                    session_id=session_id,
-                                    assets_json=assets_json,
-                                    ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
-                                    impacts_constraint=impacts_constraint,
-                                    impacts_json_schema=IMPACTS_JSON_SCHEMA,
-                                    language=language,
-                                    **sections
-                                )
-
-                                # Accumulate usage
-                                total_prompt_tokens += usage_metrics.prompt_tokens
-                                total_completion_tokens += usage_metrics.completion_tokens
-                                last_response_text = response_text
-
-                                # Parse and validate
-                                evaluations = self._parse_and_validate_impacts(
-                                    response_text=response_text,
-                                    allowed_impact_names=list(allowed_names_set),
                                     ordered_catalog_names=ordered_catalog_names,
+                                    impacts_constraint=impacts_constraint,
+                                    language=language,
+                                    sections=sections,
+                                    max_impacts_per_asset=max_impacts_per_asset,
+                                    session_id=session_id,
+                                    recursion_level=0,
+                                    max_recursion_level=3,
                                 )
 
-                                # Apply max limit if specified
-                                if max_impacts_per_asset is not None:
-                                    evaluations = evaluations[:max_impacts_per_asset]
+                                # Accumulate results and usage
+                                results.extend(batch_results)
+                                total_prompt_tokens += batch_prompt_tokens
+                                total_completion_tokens += batch_completion_tokens
+                                last_response_text = batch_response_text
 
-                                # Create AssetImpact
-                                results.append(AssetImpact(
-                                    assetId=asset.id,
-                                    assetName=asset.name,
-                                    impacts=evaluations
-                                ))
-
-                                # Update asset span with success
-                                asset_span.update(
+                                # Update batch span with success
+                                batch_span.update(
                                     output={
-                                        "impacts_count": len(evaluations),
-                                        "impacts_preview": [{"name": e.impactName, "level": e.impactLevel} for e in evaluations[:5]],
+                                        "assets_processed": len(batch_results),
+                                        "total_impacts_generated": sum(len(r.impacts) for r in batch_results),
+                                        "impacts_preview": [
+                                            {
+                                                "asset": r.assetName,
+                                                "impacts_count": len(r.impacts)
+                                            } for r in batch_results[:5]
+                                        ],
                                     }
                                 )
 
                                 logger.info(
-                                    f"Impact evaluation completed for asset '{asset.name}'",
+                                    f"Batch {batch_idx + 1}/{total_batches} completed successfully",
                                     extra={
-                                        "asset_id": str(asset.id) if asset.id else None,
-                                        "impacts_count": len(evaluations),
+                                        "batch_index": batch_idx + 1,
+                                        "assets_processed": len(batch_results),
+                                        "total_impacts": sum(len(r.impacts) for r in batch_results),
                                     }
                                 )
 
-                            except AITimeoutError:
-                                # Update span with error
-                                asset_span.update(
-                                    level="ERROR",
-                                    status_message="LLM timeout",
-                                )
-                                # Re-raise timeout errors immediately - don't continue with other assets
-                                raise
-                            except (AIResponseError, ValidationRetriesExhausted):
-                                # Update span with error
-                                asset_span.update(
-                                    level="ERROR",
-                                    status_message="AI response or validation error",
-                                )
-                                # Re-raise AI-specific errors immediately
-                                raise
-                            except Exception as e:
-                                # Update span with error
-                                asset_span.update(
-                                    level="ERROR",
-                                    status_message=str(e),
+                            except AITimeoutError as e:
+                                # Timeout = legitimate failure, fallback is appropriate
+                                batch_span.update(
+                                    level="WARNING",
+                                    status_message=f"Batch timeout, falling back to sequential: {str(e)}",
                                 )
 
-                                logger.error(
-                                    f"Impact evaluation failed for asset '{asset.name}'",
+                                logger.warning(
+                                    f"Batch {batch_idx + 1}/{total_batches} timeout, falling back to sequential processing",
                                     extra={
-                                        "asset_id": str(asset.id) if asset.id else None,
+                                        "batch_index": batch_idx + 1,
+                                        "batch_size": len(batch_assets),
                                         "error": str(e),
-                                        "error_type": type(e).__name__,
+                                        "fallback_reason": "timeout",
                                     }
                                 )
-                                # For other unexpected errors, continue with other assets
-                                results.append(AssetImpact(
-                                    assetId=asset.id,
-                                    assetName=asset.name,
-                                    impacts=[]
-                                ))
+
+                                # Fallback: Process assets sequentially
+                                for asset in batch_assets:
+                                    # Child span: evaluate-asset-impact (fallback)
+                                    with langfuse_client.start_as_current_span(
+                                        name="evaluate-asset-impact",
+                                        input={
+                                            "asset_id": str(asset.id) if asset.id else None,
+                                            "asset_name": asset.name,
+                                            "catalog_impacts_count": len(ordered_catalog_names),
+                                        },
+                                        metadata={"asset_type": asset.assetType if hasattr(asset, 'assetType') else None},
+                                    ) as asset_span:
+                                        try:
+                                            # Single-asset JSON
+                                            assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
+
+                                            # Format prompt for debug preview
+                                            messages = prompt.format_messages(
+                                                assets_json=assets_json,
+                                                ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                                                impacts_constraint=impacts_constraint,
+                                                impacts_json_schema=IMPACTS_JSON_SCHEMA,
+                                                language=language,
+                                                **sections
+                                            )
+                                            last_prompt_text = str(messages)
+
+                                            # Call LLM with retry logic
+                                            response_text, usage_metrics = await self._call_llm_with_retry(
+                                                prompt=prompt,
+                                                session_id=session_id,
+                                                assets_json=assets_json,
+                                                ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                                                impacts_constraint=impacts_constraint,
+                                                impacts_json_schema=IMPACTS_JSON_SCHEMA,
+                                                language=language,
+                                                **sections
+                                            )
+
+                                            # Accumulate usage
+                                            total_prompt_tokens += usage_metrics.prompt_tokens
+                                            total_completion_tokens += usage_metrics.completion_tokens
+                                            last_response_text = response_text
+
+                                            # Parse and validate
+                                            evaluations = self._parse_and_validate_impacts(
+                                                response_text=response_text,
+                                                allowed_impact_names=list(allowed_names_set),
+                                                ordered_catalog_names=ordered_catalog_names,
+                                            )
+
+                                            # Apply max limit if specified
+                                            if max_impacts_per_asset is not None:
+                                                evaluations = evaluations[:max_impacts_per_asset]
+
+                                            # Create AssetImpact
+                                            results.append(AssetImpact(
+                                                assetId=asset.id,
+                                                assetName=asset.name,
+                                                impacts=evaluations
+                                            ))
+
+                                            # Update asset span with success
+                                            asset_span.update(
+                                                output={
+                                                    "impacts_count": len(evaluations),
+                                                    "impacts_preview": [{"name": e.impactName, "level": e.impactLevel} for e in evaluations[:5]],
+                                                }
+                                            )
+
+                                            logger.info(
+                                                f"Impact evaluation completed for asset '{asset.name}' (fallback)",
+                                                extra={
+                                                    "asset_id": str(asset.id) if asset.id else None,
+                                                    "impacts_count": len(evaluations),
+                                                }
+                                            )
+
+                                        except AITimeoutError:
+                                            # Update span with error
+                                            asset_span.update(
+                                                level="ERROR",
+                                                status_message="LLM timeout",
+                                            )
+                                            # Re-raise timeout errors immediately - don't continue with other assets
+                                            raise
+                                        except (AIResponseError, ValidationRetriesExhausted):
+                                            # Update span with error
+                                            asset_span.update(
+                                                level="ERROR",
+                                                status_message="AI response or validation error",
+                                            )
+                                            # Re-raise AI-specific errors immediately
+                                            raise
+                                        except Exception as e:
+                                            # Update span with error
+                                            asset_span.update(
+                                                level="ERROR",
+                                                status_message=str(e),
+                                            )
+
+                                            logger.error(
+                                                f"Impact evaluation failed for asset '{asset.name}' (fallback)",
+                                                extra={
+                                                    "asset_id": str(asset.id) if asset.id else None,
+                                                    "error": str(e),
+                                                    "error_type": type(e).__name__,
+                                                }
+                                            )
+                                            # For other unexpected errors, continue with other assets
+                                            results.append(AssetImpact(
+                                                assetId=asset.id,
+                                                assetName=asset.name,
+                                                impacts=[]
+                                            ))
+
+                            except AIResponseError as e:
+                                # Batch response error - decide based on error type
+                                error_msg = str(e).lower()
+
+                                # Legitimate failures that warrant fallback
+                                if any(keyword in error_msg for keyword in ["timeout", "context", "limit", "token"]):
+                                    batch_span.update(
+                                        level="WARNING",
+                                        status_message=f"Batch context/limit issue, falling back to sequential: {str(e)}",
+                                    )
+
+                                    logger.warning(
+                                        f"Batch {batch_idx + 1}/{total_batches} hit context/limit, falling back to sequential",
+                                        extra={
+                                            "batch_index": batch_idx + 1,
+                                            "batch_size": len(batch_assets),
+                                            "error": str(e),
+                                            "fallback_reason": "context_limit",
+                                        }
+                                    )
+
+                                    # Fallback: Process assets sequentially
+                                    for asset in batch_assets:
+                                        # Child span: evaluate-asset-impact (fallback)
+                                        with langfuse_client.start_as_current_span(
+                                            name="evaluate-asset-impact",
+                                            input={
+                                                "asset_id": str(asset.id) if asset.id else None,
+                                                "asset_name": asset.name,
+                                                "catalog_impacts_count": len(ordered_catalog_names),
+                                            },
+                                            metadata={"asset_type": asset.assetType if hasattr(asset, 'assetType') else None},
+                                        ) as asset_span:
+                                            try:
+                                                # Single-asset JSON
+                                                assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
+
+                                                # Format prompt for debug preview
+                                                messages = prompt.format_messages(
+                                                    assets_json=assets_json,
+                                                    ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                                                    impacts_constraint=impacts_constraint,
+                                                    impacts_json_schema=IMPACTS_JSON_SCHEMA,
+                                                    language=language,
+                                                    **sections
+                                                )
+                                                last_prompt_text = str(messages)
+
+                                                # Call LLM with retry logic
+                                                response_text, usage_metrics = await self._call_llm_with_retry(
+                                                    prompt=prompt,
+                                                    session_id=session_id,
+                                                    assets_json=assets_json,
+                                                    ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                                                    impacts_constraint=impacts_constraint,
+                                                    impacts_json_schema=IMPACTS_JSON_SCHEMA,
+                                                    language=language,
+                                                    **sections
+                                                )
+
+                                                # Accumulate usage
+                                                total_prompt_tokens += usage_metrics.prompt_tokens
+                                                total_completion_tokens += usage_metrics.completion_tokens
+                                                last_response_text = response_text
+
+                                                # Parse and validate
+                                                evaluations = self._parse_and_validate_impacts(
+                                                    response_text=response_text,
+                                                    allowed_impact_names=list(allowed_names_set),
+                                                    ordered_catalog_names=ordered_catalog_names,
+                                                )
+
+                                                # Apply max limit if specified
+                                                if max_impacts_per_asset is not None:
+                                                    evaluations = evaluations[:max_impacts_per_asset]
+
+                                                # Create AssetImpact
+                                                results.append(AssetImpact(
+                                                    assetId=asset.id,
+                                                    assetName=asset.name,
+                                                    impacts=evaluations
+                                                ))
+
+                                                # Update asset span with success
+                                                asset_span.update(
+                                                    output={
+                                                        "impacts_count": len(evaluations),
+                                                        "impacts_preview": [{"name": e.impactName, "level": e.impactLevel} for e in evaluations[:5]],
+                                                    }
+                                                )
+
+                                                logger.info(
+                                                    f"Impact evaluation completed for asset '{asset.name}' (fallback context/limit)",
+                                                    extra={
+                                                        "asset_id": str(asset.id) if asset.id else None,
+                                                        "impacts_count": len(evaluations),
+                                                    }
+                                                )
+
+                                            except AITimeoutError:
+                                                # Update span with error
+                                                asset_span.update(
+                                                    level="ERROR",
+                                                    status_message="LLM timeout",
+                                                )
+                                                # Re-raise timeout errors immediately - don't continue with other assets
+                                                raise
+                                            except (AIResponseError, ValidationRetriesExhausted):
+                                                # Update span with error
+                                                asset_span.update(
+                                                    level="ERROR",
+                                                    status_message="AI response or validation error",
+                                                )
+                                                # Re-raise AI-specific errors immediately
+                                                raise
+                                            except Exception as e:
+                                                # Update span with error
+                                                asset_span.update(
+                                                    level="ERROR",
+                                                    status_message=str(e),
+                                                )
+
+                                                logger.error(
+                                                    f"Impact evaluation failed for asset '{asset.name}' (fallback context/limit)",
+                                                    extra={
+                                                        "asset_id": str(asset.id) if asset.id else None,
+                                                        "error": str(e),
+                                                        "error_type": type(e).__name__,
+                                                    }
+                                                )
+                                                # For other unexpected errors, continue with other assets
+                                                results.append(AssetImpact(
+                                                    assetId=asset.id,
+                                                    assetName=asset.name,
+                                                    impacts=[]
+                                                ))
+
+                                else:
+                                    # Unexpected error - don't hide bugs, propagate error
+                                    batch_span.update(
+                                        level="ERROR",
+                                        status_message=f"Unexpected batch error (not retrying): {str(e)}",
+                                    )
+
+                                    logger.critical(
+                                        f"CRITICAL: Batch {batch_idx + 1}/{total_batches} failed with unexpected error - NOT using fallback",
+                                        extra={
+                                            "batch_index": batch_idx + 1,
+                                            "batch_size": len(batch_assets),
+                                            "error": str(e),
+                                            "error_type": type(e).__name__,
+                                            "error_details": getattr(e, 'details', None),
+                                            "asset_names": [a.name for a in batch_assets],
+                                        }
+                                    )
+
+                                    # Re-raise - force investigation, don't hide bugs
+                                    raise
 
                     # Create aggregated usage metrics
                     aggregated_metrics = create_usage_metrics(
@@ -689,83 +1310,250 @@ class ImpactGenerator:
                 ("human", IMPACTS_HUMAN_PROMPT_TEMPLATE),
             ])
 
-            for asset in assets:
+            # Split assets into batches based on max_batch_size setting
+            batch_size = self.settings.wizard.max_batch_size
+            total_batches = (len(assets) + batch_size - 1) // batch_size
+
+            logger.info(
+                f"Processing {len(assets)} assets in {total_batches} batch(es) (no Langfuse)",
+                extra={
+                    "total_assets": len(assets),
+                    "batch_size": batch_size,
+                }
+            )
+
+            # Process batches
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(assets))
+                batch_assets = assets[start_idx:end_idx]
+
                 try:
-                    # Single-asset JSON
-                    assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
-
-                    # Format prompt for debug preview
-                    messages = prompt.format_messages(
-                        assets_json=assets_json,
-                        ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
-                        impacts_constraint=impacts_constraint,
-                        impacts_json_schema=IMPACTS_JSON_SCHEMA,
-                        language=language,
-                        **sections
-                    )
-                    last_prompt_text = str(messages)
-
-                    # Call LLM with retry logic
-                    response_text, usage_metrics = await self._call_llm_with_retry(
+                    # Process batch
+                    batch_results, batch_prompt_tokens, batch_completion_tokens, batch_response_text = await self._process_assets_batch(
+                        assets=batch_assets,
                         prompt=prompt,
-                        session_id=None,
-                        assets_json=assets_json,
-                        ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
-                        impacts_constraint=impacts_constraint,
-                        impacts_json_schema=IMPACTS_JSON_SCHEMA,
-                        language=language,
-                        **sections
-                    )
-
-                    # Accumulate usage
-                    total_prompt_tokens += usage_metrics.prompt_tokens
-                    total_completion_tokens += usage_metrics.completion_tokens
-                    last_response_text = response_text
-
-                    # Parse and validate
-                    evaluations = self._parse_and_validate_impacts(
-                        response_text=response_text,
-                        allowed_impact_names=list(allowed_names_set),
                         ordered_catalog_names=ordered_catalog_names,
+                        impacts_constraint=impacts_constraint,
+                        language=language,
+                        sections=sections,
+                        max_impacts_per_asset=max_impacts_per_asset,
+                        session_id=None,
                     )
 
-                    # Apply max limit if specified
-                    if max_impacts_per_asset is not None:
-                        evaluations = evaluations[:max_impacts_per_asset]
-
-                    # Create AssetImpact
-                    results.append(AssetImpact(
-                        assetId=asset.id,
-                        assetName=asset.name,
-                        impacts=evaluations
-                    ))
+                    # Accumulate results
+                    results.extend(batch_results)
+                    total_prompt_tokens += batch_prompt_tokens
+                    total_completion_tokens += batch_completion_tokens
+                    last_response_text = batch_response_text
 
                     logger.info(
-                        f"Impact evaluation completed for asset '{asset.name}'",
+                        f"Batch {batch_idx + 1}/{total_batches} completed (no Langfuse)",
                         extra={
-                            "asset_id": str(asset.id) if asset.id else None,
-                            "impacts_count": len(evaluations),
+                            "batch_index": batch_idx + 1,
+                            "assets_processed": len(batch_results),
                         }
                     )
 
-                except AITimeoutError:
-                    raise
-                except (AIResponseError, ValidationRetriesExhausted):
-                    raise
-                except Exception as e:
-                    logger.error(
-                        f"Impact evaluation failed for asset '{asset.name}'",
+                except AITimeoutError as e:
+                    # Timeout = legitimate failure, fallback to sequential
+                    logger.warning(
+                        f"Batch {batch_idx + 1}/{total_batches} timed out, falling back to sequential processing (no Langfuse)",
                         extra={
-                            "asset_id": str(asset.id) if asset.id else None,
+                            "batch_index": batch_idx + 1,
+                            "batch_size": len(batch_assets),
                             "error": str(e),
-                            "error_type": type(e).__name__,
                         }
                     )
-                    results.append(AssetImpact(
-                        assetId=asset.id,
-                        assetName=asset.name,
-                        impacts=[]
-                    ))
+
+                    # Fallback: Sequential processing
+                    for asset in batch_assets:
+                        try:
+                            # Single-asset JSON
+                            assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
+
+                            # Format prompt for debug preview
+                            messages = prompt.format_messages(
+                                assets_json=assets_json,
+                                ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                                impacts_constraint=impacts_constraint,
+                                impacts_json_schema=IMPACTS_JSON_SCHEMA,
+                                language=language,
+                                **sections
+                            )
+                            last_prompt_text = str(messages)
+
+                            # Call LLM with retry logic
+                            response_text, usage_metrics = await self._call_llm_with_retry(
+                                prompt=prompt,
+                                session_id=None,
+                                assets_json=assets_json,
+                                ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                                impacts_constraint=impacts_constraint,
+                                impacts_json_schema=IMPACTS_JSON_SCHEMA,
+                                language=language,
+                                **sections
+                            )
+
+                            # Accumulate usage
+                            total_prompt_tokens += usage_metrics.prompt_tokens
+                            total_completion_tokens += usage_metrics.completion_tokens
+                            last_response_text = response_text
+
+                            # Parse and validate
+                            evaluations = self._parse_and_validate_impacts(
+                                response_text=response_text,
+                                allowed_impact_names=list(allowed_names_set),
+                                ordered_catalog_names=ordered_catalog_names,
+                            )
+
+                            # Apply max limit if specified
+                            if max_impacts_per_asset is not None:
+                                evaluations = evaluations[:max_impacts_per_asset]
+
+                            # Create AssetImpact
+                            results.append(AssetImpact(
+                                assetId=asset.id,
+                                assetName=asset.name,
+                                impacts=evaluations
+                            ))
+
+                            logger.info(
+                                f"Impact evaluation completed for asset '{asset.name}' (fallback, no Langfuse)",
+                                extra={
+                                    "asset_id": str(asset.id) if asset.id else None,
+                                    "impacts_count": len(evaluations),
+                                }
+                            )
+
+                        except AITimeoutError:
+                            raise
+                        except (AIResponseError, ValidationRetriesExhausted):
+                            raise
+                        except Exception as e:
+                            logger.error(
+                                f"Impact evaluation failed for asset '{asset.name}' (fallback, no Langfuse)",
+                                extra={
+                                    "asset_id": str(asset.id) if asset.id else None,
+                                    "error": str(e),
+                                    "error_type": type(e).__name__,
+                                }
+                            )
+                            results.append(AssetImpact(
+                                assetId=asset.id,
+                                assetName=asset.name,
+                                impacts=[]
+                            ))
+
+                except AIResponseError as e:
+                    # Check if this is a legitimate failure (context/limit) or unexpected error
+                    error_msg = str(e).lower()
+                    is_legitimate = any(keyword in error_msg for keyword in ["timeout", "context", "limit", "token"])
+
+                    if is_legitimate:
+                        # Context/limit error = legitimate failure, fallback to sequential
+                        logger.warning(
+                            f"Batch {batch_idx + 1}/{total_batches} hit context/limit, falling back to sequential processing (no Langfuse)",
+                            extra={
+                                "batch_index": batch_idx + 1,
+                                "batch_size": len(batch_assets),
+                                "error": str(e),
+                            }
+                        )
+
+                        # Fallback: Sequential processing
+                        for asset in batch_assets:
+                            try:
+                                # Single-asset JSON
+                                assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
+
+                                # Format prompt for debug preview
+                                messages = prompt.format_messages(
+                                    assets_json=assets_json,
+                                    ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                                    impacts_constraint=impacts_constraint,
+                                    impacts_json_schema=IMPACTS_JSON_SCHEMA,
+                                    language=language,
+                                    **sections
+                                )
+                                last_prompt_text = str(messages)
+
+                                # Call LLM with retry logic
+                                response_text, usage_metrics = await self._call_llm_with_retry(
+                                    prompt=prompt,
+                                    session_id=None,
+                                    assets_json=assets_json,
+                                    ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+                                    impacts_constraint=impacts_constraint,
+                                    impacts_json_schema=IMPACTS_JSON_SCHEMA,
+                                    language=language,
+                                    **sections
+                                )
+
+                                # Accumulate usage
+                                total_prompt_tokens += usage_metrics.prompt_tokens
+                                total_completion_tokens += usage_metrics.completion_tokens
+                                last_response_text = response_text
+
+                                # Parse and validate
+                                evaluations = self._parse_and_validate_impacts(
+                                    response_text=response_text,
+                                    allowed_impact_names=list(allowed_names_set),
+                                    ordered_catalog_names=ordered_catalog_names,
+                                )
+
+                                # Apply max limit if specified
+                                if max_impacts_per_asset is not None:
+                                    evaluations = evaluations[:max_impacts_per_asset]
+
+                                # Create AssetImpact
+                                results.append(AssetImpact(
+                                    assetId=asset.id,
+                                    assetName=asset.name,
+                                    impacts=evaluations
+                                ))
+
+                                logger.info(
+                                    f"Impact evaluation completed for asset '{asset.name}' (fallback, no Langfuse)",
+                                    extra={
+                                        "asset_id": str(asset.id) if asset.id else None,
+                                        "impacts_count": len(evaluations),
+                                    }
+                                )
+
+                            except AITimeoutError:
+                                raise
+                            except (AIResponseError, ValidationRetriesExhausted):
+                                raise
+                            except Exception as e:
+                                logger.error(
+                                    f"Impact evaluation failed for asset '{asset.name}' (fallback, no Langfuse)",
+                                    extra={
+                                        "asset_id": str(asset.id) if asset.id else None,
+                                        "error": str(e),
+                                        "error_type": type(e).__name__,
+                                    }
+                                )
+                                results.append(AssetImpact(
+                                    assetId=asset.id,
+                                    assetName=asset.name,
+                                    impacts=[]
+                                ))
+
+                    else:
+                        # Unexpected error - do NOT fallback, force investigation
+                        logger.critical(
+                            f"CRITICAL: Batch {batch_idx + 1}/{total_batches} failed with UNEXPECTED error (no Langfuse). NOT using fallback to force investigation.",
+                            extra={
+                                "batch_index": batch_idx + 1,
+                                "batch_size": len(batch_assets),
+                                "error": str(e),
+                                "error_type": type(e).__name__,
+                                "asset_ids": [str(a.id) if a.id else None for a in batch_assets],
+                            }
+                        )
+                        # Re-raise to propagate the error and fail fast
+                        raise
 
             # Create aggregated usage metrics
             aggregated_metrics = create_usage_metrics(

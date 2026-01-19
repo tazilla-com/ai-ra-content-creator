@@ -237,25 +237,35 @@ async def generate_services(
     service_generator = ServiceGenerator(model=request.ai_model)
 
     # Step 1: Resolve website content
-    # Check if web scraping is disabled (empty website_content object)
+    # Check if web scraping is disabled:
+    # 1. Empty website_content object explicitly provided
+    # 2. No website information provided at all (both website_content and website_url are None)
     scraping_disabled = (
-        request.website_content is not None and
-        not request.website_content.url and
-        not request.website_content.content
+        (request.website_content is not None and
+         not request.website_content.url and
+         not request.website_content.content) or
+        (request.website_content is None and request.website_url is None)
     )
 
     if scraping_disabled:
-        # Web scraping explicitly disabled - use empty content
+        # Web scraping disabled - use empty content (will generate generic services)
         website_content = ""
         content_metadata = {
             "source": "disabled",
             "content_length": 0,
         }
+
+        # Determine reason for logging
+        if request.website_content is not None:
+            reason = "empty_website_content_object"
+        else:
+            reason = "no_website_information_provided"
+
         logger.info(
             "web_scraping_disabled",
             extra={
                 "session_id": session_id,
-                "reason": "empty_website_content_object",
+                "reason": reason,
             }
         )
     else:

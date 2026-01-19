@@ -326,8 +326,7 @@ async def chat_endpoint(
 
     # 1.5) Extract auth identity from request.state (populated by security middleware)
     identity = getattr(request.state, "identity", None)
-    if identity:
-        ui_req.identity = identity
+    # Note: identity is tracked in request.state, no need to copy to ui_req
 
     # 2) Message-length guard (only if message is provided)
     msg = getattr(ui_req, "message", None)

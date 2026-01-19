@@ -20,7 +20,7 @@ from typing import Annotated
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from workshops_ai.agents.session import get_agent_session
+from workshops_ai.session import get_session
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,7 @@ async def detect_asset_dependencies(input: DetectDependenciesInput) -> dict:
     """
     try:
         # Load session for context
-        session = await get_agent_session(input.session_id)
+        session = await get_session(input.session_id)
         if not session:
             return {
                 "status": "error",
@@ -102,10 +102,11 @@ async def detect_asset_dependencies(input: DetectDependenciesInput) -> dict:
         context_parts = []
         if input.context:
             context_parts.append(f"Context: {input.context}")
-        if session.industry:
-            context_parts.append(f"Industry: {session.industry}")
-        if session.company_name:
-            context_parts.append(f"Company: {session.company_name}")
+        if session.organization:
+            if hasattr(session.organization, 'industry') and session.organization.industry:
+                context_parts.append(f"Industry: {session.organization.industry}")
+            if session.organization.name:
+                context_parts.append(f"Company: {session.organization.name}")
 
         full_context = " | ".join(context_parts) if context_parts else "General IT infrastructure"
 
@@ -198,7 +199,7 @@ async def recommend_assets_for_context(input: RecommendAssetsInput) -> dict:
     """
     try:
         # Load session for context
-        session = await get_agent_session(input.session_id)
+        session = await get_session(input.session_id)
         if not session:
             return {
                 "status": "error",
@@ -207,13 +208,16 @@ async def recommend_assets_for_context(input: RecommendAssetsInput) -> dict:
 
         # Build context from session
         company_info_parts = []
-        if session.company_name:
-            company_info_parts.append(f"Company: {session.company_name}")
-        if session.industry:
-            company_info_parts.append(f"Industry: {session.industry}")
-        if session.scraped_content:
+        if session.organization:
+            if session.organization.name:
+                company_info_parts.append(f"Company: {session.organization.name}")
+            if hasattr(session.organization, 'industry') and session.organization.industry:
+                company_info_parts.append(f"Industry: {session.organization.industry}")
+
+        scraped_content = session.wizard_metadata.get("scraped_content")
+        if scraped_content:
             # Use first 500 chars of scraped content for context
-            preview = session.scraped_content[:500]
+            preview = scraped_content[:500]
             company_info_parts.append(f"Website info: {preview}...")
 
         company_info = " | ".join(company_info_parts) if company_info_parts else "General company"

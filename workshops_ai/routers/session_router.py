@@ -9,11 +9,8 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-from workshops_ai.wizard.session import (
-    SESSION_ID_PATTERN,
-    clear_wizard_state,
-    get_wizard_state,
-)
+from workshops_ai.session import get_session, clear_session
+from workshops_ai.session.storage import SESSION_ID_PATTERN
 
 logger = logging.getLogger("workshops_ai.session_router")
 
@@ -62,7 +59,7 @@ class SessionDeleteResponse(BaseModel):
     "",
     response_model=SessionStateResponse,
     summary="Get session state",
-    description="Retrieve the current wizard state for a session",
+    description="Retrieve the full session state (wizard + agent data)",
 )
 async def get_session_state(
     session_id: str = Header(..., alias="X-Session-ID"),
@@ -73,7 +70,13 @@ async def get_session_state(
             detail="Invalid session ID format. Expected: 1-40 alphanumeric characters (a-z, A-Z, 0-9, _, -)",
         )
 
-    state = await get_wizard_state(session_id)
+    session = await get_session(session_id)
+    if not session:
+        # Return empty state if session doesn't exist
+        return SessionStateResponse(session_id=session_id, state={})
+
+    # Return full session as dict (includes wizard_steps, wizard_metadata, organization, assets, etc.)
+    state = session.model_dump()
     return SessionStateResponse(session_id=session_id, state=state)
 
 
@@ -81,7 +84,7 @@ async def get_session_state(
     "",
     response_model=SessionDeleteResponse,
     summary="Delete session",
-    description="Delete the session and all associated data from storage",
+    description="Delete the entire session (wizard + agent data) from storage",
 )
 async def delete_session_state(
     session_id: str = Header(..., alias="X-Session-ID"),
@@ -92,5 +95,5 @@ async def delete_session_state(
             detail="Invalid session ID format. Expected: 1-40 alphanumeric characters (a-z, A-Z, 0-9, _, -)",
         )
 
-    await clear_wizard_state(session_id)
-    return SessionDeleteResponse(session_id=session_id, deleted=True)
+    success = await clear_session(session_id)
+    return SessionDeleteResponse(session_id=session_id, deleted=success)

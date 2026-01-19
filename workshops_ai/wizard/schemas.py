@@ -87,6 +87,21 @@ class ImpactsResponse(BaseModel):
     )
 
 
+class BatchImpactsResponse(BaseModel):
+    """
+    Wrapper for batch impacts evaluation response with OpenAI Structured Outputs.
+
+    Used when processing multiple assets in a single LLM call for better performance.
+    Each asset_impacts entry contains the asset identification and its impact evaluations.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    asset_impacts: List[AssetImpact] = Field(
+        ...,
+        description="List of impact evaluations for multiple assets. Each entry contains assetName, assetId, and impacts list."
+    )
+
+
 class RisksResponse(BaseModel):
     """
     Wrapper for risks evaluation response with OpenAI Structured Outputs.
@@ -104,6 +119,21 @@ class RisksResponse(BaseModel):
     )
 
 
+class BatchRisksResponse(BaseModel):
+    """
+    Wrapper for batch risks evaluation response with OpenAI Structured Outputs.
+
+    Used when processing multiple assets in a single LLM call for better performance.
+    Each asset_risks entry contains the asset identification and its risk evaluations.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    asset_risks: List[AssetRisk] = Field(
+        ...,
+        description="List of assets with their evaluated risks (threats with probability levels)"
+    )
+
+
 class ControlsResponse(BaseModel):
     """
     Wrapper for control recommendations response with OpenAI Structured Outputs.
@@ -118,6 +148,21 @@ class ControlsResponse(BaseModel):
     controls: List[PlannedControl] = Field(
         ...,
         description="List of selected controls with threat coverage and cost estimates for a single asset"
+    )
+
+
+class BatchControlsResponse(BaseModel):
+    """
+    Wrapper for batch control recommendations response with OpenAI Structured Outputs.
+
+    Used when processing multiple assets in a single LLM call for better performance.
+    Each asset_controls entry contains the asset identification and its recommended controls.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    asset_controls: List[AssetControls] = Field(
+        ...,
+        description="List of assets with their recommended security controls"
     )
 
 
@@ -144,9 +189,9 @@ class ScrapeWebsiteInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     url: str = Field(..., description="URL to scrape")
-    search_method: Literal["scrape", "web_search"] = Field(
-        default="scrape",
-        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    search_method: Optional[Literal["scrape", "web_search"]] = Field(
+        default=None,
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search). If not provided, uses WORKSHOPS_AI_WIZARD__DEFAULT_SEARCH_METHOD setting."
     )
 
 
@@ -204,9 +249,9 @@ class ServicesInput(WizardStepInput):
     )
 
     # Search method
-    search_method: Literal["scrape", "web_search"] = Field(
-        default="scrape",
-        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    search_method: Optional[Literal["scrape", "web_search"]] = Field(
+        default=None,
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search). If not provided, uses WORKSHOPS_AI_WIZARD__DEFAULT_SEARCH_METHOD setting."
     )
 
     # Generation parameters
@@ -276,9 +321,9 @@ class AssetsInput(WizardStepInput):
     )
 
     # Search method
-    search_method: Literal["scrape", "web_search"] = Field(
-        default="scrape",
-        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    search_method: Optional[Literal["scrape", "web_search"]] = Field(
+        default=None,
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search). If not provided, uses WORKSHOPS_AI_WIZARD__DEFAULT_SEARCH_METHOD setting."
     )
 
     # Services context (from previous step or direct)
@@ -354,9 +399,9 @@ class ImpactsInput(WizardStepInput):
     )
 
     # Search method
-    search_method: Literal["scrape", "web_search"] = Field(
-        default="scrape",
-        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    search_method: Optional[Literal["scrape", "web_search"]] = Field(
+        default=None,
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search). If not provided, uses WORKSHOPS_AI_WIZARD__DEFAULT_SEARCH_METHOD setting."
     )
 
     # Assets context (from previous step or direct)
@@ -434,9 +479,9 @@ class RisksInput(WizardStepInput):
     )
 
     # Search method
-    search_method: Literal["scrape", "web_search"] = Field(
-        default="scrape",
-        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    search_method: Optional[Literal["scrape", "web_search"]] = Field(
+        default=None,
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search). If not provided, uses WORKSHOPS_AI_WIZARD__DEFAULT_SEARCH_METHOD setting."
     )
 
     # Assets context (from previous step or direct)
@@ -520,9 +565,9 @@ class ControlsInput(WizardStepInput):
     )
 
     # Search method
-    search_method: Literal["scrape", "web_search"] = Field(
-        default="scrape",
-        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    search_method: Optional[Literal["scrape", "web_search"]] = Field(
+        default=None,
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search). If not provided, uses WORKSHOPS_AI_WIZARD__DEFAULT_SEARCH_METHOD setting."
     )
 
     # Assets context (from previous step or direct)
@@ -621,9 +666,9 @@ class EvaluationInput(WizardStepInput):
     )
 
     # Search method
-    search_method: Literal["scrape", "web_search"] = Field(
-        default="scrape",
-        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search)"
+    search_method: Optional[Literal["scrape", "web_search"]] = Field(
+        default=None,
+        description="Content retrieval method: 'scrape' (BeautifulSoup) or 'web_search' (AI web search). If not provided, uses WORKSHOPS_AI_WIZARD__DEFAULT_SEARCH_METHOD setting."
     )
 
     # Common parameters

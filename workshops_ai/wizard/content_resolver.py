@@ -133,26 +133,61 @@ class ContentResolver:
         Returns:
             Cached content if found, None otherwise
         """
-        from workshops_ai.wizard.session import get_wizard_state
+        from workshops_ai.wizard.session import get_wizard_metadata
 
         try:
-            state = await get_wizard_state(session_id)
-            content = state.get("website_content")
+            logger.debug(
+                "content_cache_lookup_started",
+                extra={
+                    "session_id": session_id,
+                    "url": url,
+                }
+            )
+
+            metadata = await get_wizard_metadata(session_id)
+
+            logger.debug(
+                "content_cache_metadata_retrieved",
+                extra={
+                    "session_id": session_id,
+                    "metadata_keys": list(metadata.keys()) if metadata else None,
+                    "has_website_content": "website_content" in metadata if metadata else False,
+                    "has_website_url": "website_url" in metadata if metadata else False,
+                }
+            )
+
+            if not metadata:
+                logger.warning(
+                    "content_cache_empty_metadata",
+                    extra={
+                        "session_id": session_id,
+                        "url": url,
+                    }
+                )
+                return None
+
+            content = metadata.get("website_content")
+            cached_url = metadata.get("website_url")
 
             if content:
                 logger.info(
                     "content_cache_hit",
                     extra={
                         "session_id": session_id,
-                        "url": url,
+                        "requested_url": url,
+                        "cached_url": cached_url,
                         "content_length": len(content),
                     }
                 )
                 return content
 
-            logger.debug(
+            logger.info(
                 "content_cache_miss",
-                extra={"session_id": session_id, "url": url}
+                extra={
+                    "session_id": session_id,
+                    "requested_url": url,
+                    "reason": "no_website_content_in_metadata",
+                }
             )
             return None
 
@@ -187,6 +222,16 @@ class ContentResolver:
             updates = {"website_content": content}
             if url:
                 updates["website_url"] = url
+
+            logger.debug(
+                "content_cache_write_started",
+                extra={
+                    "session_id": session_id,
+                    "url": url,
+                    "content_length": len(content),
+                    "updates_keys": list(updates.keys()),
+                }
+            )
 
             await update_session_data(session_id, updates)
 
@@ -295,7 +340,7 @@ class ContentResolver:
         session_id: str,
         website_text: Optional[str] = None,
         website_url: Optional[str] = None,
-        search_method: SearchMethod = "scrape",
+        search_method: Optional[SearchMethod] = None,
         ai_model: Optional[str] = None,
     ) -> Tuple[str, dict]:
         """
@@ -305,14 +350,14 @@ class ContentResolver:
         1. Direct text from request (website_text)
         2. Cached content in Redis session
         3. Fetch from URL using specified search_method:
-           - "scrape": Traditional mock scraper (default)
+           - "scrape": Traditional mock scraper (default from settings)
            - "web_search": AI-powered web search using OpenAI
 
         Args:
             session_id: Session ID
             website_text: Optional direct website content
             website_url: Optional website URL to scrape/search
-            search_method: Content retrieval method ("scrape" or "web_search")
+            search_method: Content retrieval method ("scrape" or "web_search"). If None, uses WORKSHOPS_AI_WIZARD__DEFAULT_SEARCH_METHOD.
             ai_model: Optional AI model override for web_search
 
         Returns:
@@ -324,6 +369,12 @@ class ContentResolver:
             AIResponseError: If web search fails
             AITimeoutError: If web search times out
         """
+        # Apply default search_method from settings if not provided
+        if search_method is None:
+            from workshops_ai.settings import get_settings
+            settings = get_settings()
+            search_method = settings.wizard.default_search_method
+
         metadata = {}
 
         # Priority 1: Direct text from request

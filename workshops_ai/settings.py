@@ -296,9 +296,10 @@ class LangfuseSettings(BaseModel):
       WORKSHOPS_AI_LANGFUSE__SECRET_KEY=sk-lf-...
       WORKSHOPS_AI_LANGFUSE__BASE_URL=https://cloud.langfuse.com
       WORKSHOPS_AI_LANGFUSE__PROMPT_LABEL=production
+      WORKSHOPS_AI_LANGFUSE__ENVIRONMENT=production
 
     Legacy (flat) ENV handled in AppSettings.model_post_init():
-      LANGFUSE_ENABLED, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL, LANGFUSE_PROMPT_LABEL
+      LANGFUSE_ENABLED, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL, LANGFUSE_PROMPT_LABEL, LANGFUSE_ENVIRONMENT
     """
     enabled: bool = False
     public_key: Optional[str] = None
@@ -307,6 +308,10 @@ class LangfuseSettings(BaseModel):
     prompt_label: Optional[str] = Field(
         default=None,
         description="Label to use when fetching prompts from Langfuse (e.g., 'production', 'development'). If not set, uses latest production version."
+    )
+    environment: Optional[str] = Field(
+        default=None,
+        description="Environment to organize traces in Langfuse (e.g., 'production', 'staging', 'development'). Maps to LANGFUSE_TRACING_ENVIRONMENT."
     )
 
 
@@ -317,13 +322,19 @@ class ManagerSettings(BaseModel):
     Semantics:
       - agent_timeout_sec: default per-agent budget if a per-tab override is not set.
       - threats_timeout_sec: optional override specifically for the Threats tab.
+      - max_history_tokens: max tokens for conversation history sent to LLM (prevents context overflow).
 
     ENV mapping:
       WORKSHOPS_AI_MANAGER__AGENT_TIMEOUT_SEC=45
       WORKSHOPS_AI_MANAGER__THREATS_TIMEOUT_SEC=90
+      WORKSHOPS_AI_MANAGER__MAX_HISTORY_TOKENS=4000
     """
     agent_timeout_sec: int = 45
     threats_timeout_sec: Optional[int] = None  # None => use agent_timeout_sec
+    max_history_tokens: int = Field(
+        default=4000,
+        description="Max tokens for conversation history sent to LLM (trimmed by pre_model_hook)"
+    )
 
 
 class WizardSettings(BaseModel):
@@ -340,6 +351,12 @@ class WizardSettings(BaseModel):
 
       # Entity mapping
       WORKSHOPS_AI_WIZARD__USE_THREAT_MAPPING=true
+
+      # Content retrieval method
+      WORKSHOPS_AI_WIZARD__DEFAULT_SEARCH_METHOD=scrape
+
+      # Batch processing
+      WORKSHOPS_AI_WIZARD__MAX_BATCH_SIZE=20
 
       # Web search (AI-powered)
       WORKSHOPS_AI_WIZARD__WEB_SEARCH_ENABLED=true
@@ -408,6 +425,20 @@ class WizardSettings(BaseModel):
             },
         },
         description="OpenAI pricing per 1M tokens (January 2025). Can be overridden via ENV JSON."
+    )
+
+    # Content retrieval method
+    default_search_method: Literal["scrape", "web_search"] = Field(
+        default="scrape",
+        description="Default content retrieval method for wizard endpoints"
+    )
+
+    # Batch processing (internal chunking)
+    max_batch_size: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Max assets per LLM call for impacts/risks/controls generation. Assets are automatically split into batches of this size. Lower = safer/slower, higher = faster but may hit LLM context limits."
     )
 
     # Web search settings
@@ -664,6 +695,7 @@ class AppSettings(BaseSettings):
     langfuse_secret_key_flat: Optional[str] = Field(default=None, validation_alias="LANGFUSE_SECRET_KEY")
     langfuse_base_url_flat: Optional[str] = Field(default=None, validation_alias="LANGFUSE_BASE_URL")
     langfuse_prompt_label_flat: Optional[str] = Field(default=None, validation_alias="LANGFUSE_PROMPT_LABEL")
+    langfuse_environment_flat: Optional[str] = Field(default=None, validation_alias="LANGFUSE_ENVIRONMENT")
 
     # LLM legacy flat
     llm_model_flat: Optional[str] = Field(default=None, validation_alias="LLM_MODEL")
@@ -791,6 +823,8 @@ class AppSettings(BaseSettings):
             self.langfuse.base_url = self.langfuse_base_url_flat
         if self.langfuse_prompt_label_flat:
             self.langfuse.prompt_label = self.langfuse_prompt_label_flat
+        if self.langfuse_environment_flat:
+            self.langfuse.environment = self.langfuse_environment_flat
 
         # LLM flat env overrides
         if self.llm_model_flat:

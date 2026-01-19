@@ -34,14 +34,22 @@ def get_langfuse_client():
     try:
         from langfuse import Langfuse
 
-        _langfuse_client = Langfuse(
-            public_key=settings.langfuse.public_key,
-            secret_key=settings.langfuse.secret_key,
-            host=settings.langfuse.base_url,
-        )
+        # Build kwargs for Langfuse client
+        langfuse_kwargs = {
+            "public_key": settings.langfuse.public_key,
+            "secret_key": settings.langfuse.secret_key,
+            "host": settings.langfuse.base_url,
+        }
+
+        # Add environment if configured
+        if settings.langfuse.environment:
+            langfuse_kwargs["environment"] = settings.langfuse.environment
+
+        _langfuse_client = Langfuse(**langfuse_kwargs)
 
         logger.info(
             f"Langfuse client initialized: {settings.langfuse.base_url}"
+            + (f" (env: {settings.langfuse.environment})" if settings.langfuse.environment else "")
         )
         return _langfuse_client
 

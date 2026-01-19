@@ -213,68 +213,35 @@ async def demo_page() -> str:
       }
     }
 
-    // --- HTTP /api/chat -------------------------------------------------------
-    async function sendMessage() {
+    // --- Send message via WebSocket -------------------------------------------
+    function sendMessage() {
       const text = msg.value;
       if (!text.trim()) return;
 
-      const sid = getOrGenerateSessionId();
+      // Check if WebSocket is connected
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        line('sys', 'WebSocket not connected. Click "Connect WS" first.');
+        return;
+      }
 
+      // Send via WebSocket
       const payload = {
-        org_id: 'demo-org',  // Hardcoded for demo
-        active_tab: tab.value,
-        selection: {},
-        message: text,
-        staging: false,
-        user_id: 'demo-user',  // Hardcoded for demo
-        session_id: sid,  // NEW: session_id for agent
+        type: 'chat',
+        payload: {
+          message: text,
+          assets: [],
+          // No organization - agent will use scrape_company_info to get wizard_metadata.website_content
+          model: 'gpt-4o-mini'
+        }
       };
 
-      line('me', payload.message || '(empty)');
+      line('me', text);
       msg.value = '';
 
-      const headers = { 'Content-Type': 'application/json' };
-      const key = apiKey.value.trim();
-      if (key) headers['X-API-Key'] = key;
-      headers['Accept-Language'] = browserAcceptLanguage();
-
       try {
-        const chatUrl = new URL('/api/chat', window.location.origin);
-        if (key) chatUrl.searchParams.set('api_key', key);
-
-        const res = await fetch(chatUrl.toString(), {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(payload),
-        });
-
-        let data = null;
-        const ct = res.headers.get('content-type') || '';
-        if (ct.includes('application/json')) {
-          data = await res.json();
-        } else {
-          data = { message: await res.text() };
-        }
-
-        if (res.ok) {
-          (data.messages || []).forEach(function(item) {
-            if (typeof item === 'string') {
-              line('ai', item);
-            } else if (item && typeof item === 'object') {
-              renderMessageObject(item, 'http');
-            }
-          });
-
-          if (data.outbox_path) ev({ type: 'outbox', path: data.outbox_path });
-          if (data.proposals) { line('sys', '[proposals attached]'); ev({ type: 'proposals', proposals: data.proposals }); }
-          if (data.staging) ev({ type: 'staging', staging: data.staging });
-          if (data.agent_events) ev({ type: 'agent_events', events: data.agent_events });
-        } else {
-          line('sys', 'ERROR ' + res.status + ': ' + (data && data.message ? data.message : 'Request failed'));
-          ev({ type: 'error', data: data });
-        }
+        ws.send(JSON.stringify(payload));
       } catch (e) {
-        line('sys', 'Network error: ' + e);
+        line('sys', 'Failed to send message: ' + e);
       }
     }
 
@@ -290,8 +257,7 @@ async def demo_page() -> str:
       url.protocol = url.protocol.replace('http', 'ws'); // http → ws, https → wss
       url.pathname = '/ws';
       url.searchParams.set('session_id', sid);  // NEW: session_id instead of org_id/user_id
-      url.searchParams.set('active_tab', tab.value);
-      url.searchParams.set('accept_language', browserAcceptLanguage());
+      url.searchParams.set('workshop_id', tab.value);  // Fixed: workshop_id instead of active_tab
       const key = apiKey.value.trim();
       if (key) url.searchParams.set('api_key', key);
 
@@ -305,6 +271,29 @@ async def demo_page() -> str:
             if (data.type && data.payload !== undefined) {
               ev({ ws_type: data.type, payload: data.payload });
 
+              if (data.type === 'hello' && data.payload && data.payload.message) {
+                line('ai', data.payload.message);
+              }
+              if (data.type === 'message' && data.payload && data.payload.content) {
+                line('ai', data.payload.content);
+              }
+              if (data.type === 'assets_generated' && data.payload) {
+                if (data.payload.message) {
+                  line('ai', data.payload.message);
+                }
+                if (data.payload.assets && data.payload.assets.length > 0) {
+                  line('sys', 'Assets created: ' + data.payload.assets.length);
+                  data.payload.assets.forEach(function(asset) {
+                    line('sys', '  → ' + asset.name + ' (' + asset.confidentiality + '/' + asset.integrity + '/' + asset.availability + ')');
+                  });
+                }
+              }
+              if (data.type === 'progress' && data.payload) {
+                line('sys', 'Status: ' + data.payload.status);
+              }
+              if (data.type === 'error' && data.payload && data.payload.message) {
+                line('sys', 'ERROR: ' + data.payload.message);
+              }
               if (data.type === 'info' && data.payload && data.payload.message) {
                 line('sys', data.payload.message);
               }
