@@ -21,6 +21,7 @@ from workshops_ai.graph.assets.tools import (
 )
 from workshops_ai.llm.client import make_llm_client_from_settings
 from workshops_ai.settings import get_settings
+from workshops_ai.llm.langfuse_helper import get_langfuse_callback_handler
 
 logger = logging.getLogger(__name__)
 
@@ -163,14 +164,96 @@ async def invoke_asset_agent(
         "error": None,
     }
 
-    result = await agent.ainvoke(
-        initial_state,
-        config={
-            "configurable": {
-                "thread_id": f"{workshop_id}:{session_id}",
-            }
+    # Create unique trace for each message while preserving checkpointing
+    import uuid
+
+    # Generate unique IDs
+    message_id = str(uuid.uuid4())
+    run_id = str(uuid.uuid4())  # For Langfuse trace separation
+
+    metadata = {
+        "session_id": session_id,
+        "workshop_id": workshop_id,
+        "message_id": message_id,
+        "message_length": len(message),
+        "input_assets_count": len(input_assets or []),
+    }
+    if model:
+        metadata["model"] = model
+
+    # Keep same thread_id for checkpointing (conversation history)
+    # But use run_id for separate Langfuse traces
+    config = {
+        "configurable": {
+            "thread_id": f"{workshop_id}:{session_id}",  # Same for all messages in session
         },
-    )
+        "run_id": run_id,  # Unique for each message - creates separate traces
+        "metadata": metadata,
+        "tags": ["asset-agent", workshop_id],
+    }
+
+    # Create Langfuse handler for tracing (v3 API with explicit span)
+    from workshops_ai.llm.langfuse_helper import get_langfuse_client
+
+    langfuse_client = get_langfuse_client()
+
+    # Try to set up Langfuse tracing with explicit span for separate traces
+    if langfuse_client:
+        try:
+            # For langfuse 3.x with LangChain integration
+            from langfuse.langchain import CallbackHandler
+            from langfuse import propagate_attributes
+
+            # Use start_as_current_observation instead of start_as_current_span
+            with langfuse_client.start_as_current_observation(
+                as_type="span",
+                name="asset-agent"
+            ) as span:
+                # Propagate attributes for session_id, user_id, tags
+                with propagate_attributes(
+                    session_id=session_id,
+                    user_id=workshop_id,
+                    tags=["asset-agent", workshop_id]
+                ):
+                    # Create new handler for THIS specific message
+                    langfuse_handler = CallbackHandler()
+
+                    config["callbacks"] = [langfuse_handler]
+                    config["metadata"].update({
+                        "langfuse_run_name": "asset agent",
+                    })
+
+                    logger.info(
+                        "Langfuse tracing enabled for agent with explicit span",
+                        extra={
+                            "session_id": session_id,
+                            "workshop_id": workshop_id,
+                            "message_id": message_id,
+                        }
+                    )
+
+                    result = await agent.ainvoke(initial_state, config=config)
+
+                    # KĽÚČOVÉ: update_trace() PO invoke prepíše CallbackHandler hodnoty
+                    last_message = result.get("messages", [])[-1] if result.get("messages") else None
+                    agent_reply = last_message.content if last_message and hasattr(last_message, 'content') else str(last_message)
+
+                    span.update_trace(
+                        input={"message": message},
+                        output={
+                            "response": agent_reply,
+                            "generated_assets_count": len(result.get("generated_assets", [])),
+                            "tools_used": result.get("tools_used", []),
+                        },
+                        metadata=metadata,
+                    )
+
+                    logger.info("Updated trace with custom input/output")
+        except Exception as e:
+            logger.warning(f"Failed to create Langfuse handler: {e}")
+            result = await agent.ainvoke(initial_state, config=config)
+    else:
+        result = await agent.ainvoke(initial_state, config=config)
 
     logger.info(
         "Asset agent completed",
@@ -182,5 +265,9 @@ async def invoke_asset_agent(
             "needs_clarification": result.get("needs_clarification", False),
         }
     )
+
+    # Flush Langfuse to ensure trace is sent
+    if langfuse_client:
+        langfuse_client.flush()
 
     return result

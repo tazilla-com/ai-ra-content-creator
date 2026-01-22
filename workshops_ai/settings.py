@@ -232,7 +232,7 @@ class LLMSettings(BaseModel):
     """
     model: str = "gpt-4o-mini"
     temperature: float = 0.2
-    http_timeout_sec: int = 120
+    http_timeout_sec: int = 240
     openai_max_retries: int = 3
     api_key: Optional[str] = None
 
@@ -376,7 +376,7 @@ class WizardSettings(BaseModel):
       WORKSHOPS_AI_WIZARD__SCRAPE_MAX_SECURITY_WARNINGS=5
     """
     llm_timeout_sec: int = Field(
-        default=120,
+        default=240,
         description="Timeout per wizard step LLM call (seconds) - increased for complex operations"
     )
     llm_max_retries: int = Field(
@@ -435,7 +435,7 @@ class WizardSettings(BaseModel):
 
     # Batch processing (internal chunking)
     max_batch_size: int = Field(
-        default=20,
+        default=50,
         ge=1,
         le=100,
         description="Max assets per LLM call for impacts/risks/controls generation. Assets are automatically split into batches of this size. Lower = safer/slower, higher = faster but may hit LLM context limits."

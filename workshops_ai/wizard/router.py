@@ -301,12 +301,7 @@ async def generate_services(
     # Step 2: Build organization profile from request
     organization_profile = None
     if request.organization_profile:
-        organization_profile = {
-            "name": request.organization_profile.name,
-            "industry": request.organization_profile.industry,
-            "address": request.organization_profile.address,
-            "employees": request.organization_profile.employees,
-        }
+        organization_profile = request.organization_profile.model_dump()
 
     # Step 3: Load previous services from session (if refining)
     previous_services = None
@@ -531,12 +526,7 @@ async def generate_assets(
     # Step 3: Build organization profile from request
     organization_profile = None
     if request.organization_profile:
-        organization_profile = {
-            "name": request.organization_profile.name,
-            "industry": request.organization_profile.industry,
-            "address": request.organization_profile.address,
-            "employees": request.organization_profile.employees,
-        }
+        organization_profile = request.organization_profile.model_dump()
 
     # Step 4: Load previous assets from session (if refining)
     previous_assets = request.previous_assets
@@ -768,12 +758,7 @@ async def generate_impacts(
     # Step 3: Build organization profile from request
     organization_profile = None
     if request.organization_profile:
-        organization_profile = {
-            "name": request.organization_profile.name,
-            "industry": request.organization_profile.industry,
-            "address": request.organization_profile.address,
-            "employees": request.organization_profile.employees,
-        }
+        organization_profile = request.organization_profile.model_dump()
 
     # Step 4: Generate impact evaluations with LLM
     try:
@@ -1003,12 +988,7 @@ async def generate_risks(
     # Step 4: Build organization profile from request
     organization_profile = None
     if request.organization_profile:
-        organization_profile = {
-            "name": request.organization_profile.name,
-            "industry": request.organization_profile.industry,
-            "address": request.organization_profile.address,
-            "employees": request.organization_profile.employees,
-        }
+        organization_profile = request.organization_profile.model_dump()
 
     # Step 5: Generate risk evaluations with LLM
     try:
@@ -1204,12 +1184,7 @@ async def generate_controls(
     # Step 3: Build organization profile from request (optional)
     organization_profile = None
     if request.organization_profile:
-        organization_profile = {
-            "name": request.organization_profile.name,
-            "industry": request.organization_profile.industry,
-            "address": request.organization_profile.address,
-            "employees": request.organization_profile.employees,
-        }
+        organization_profile = request.organization_profile.model_dump()
 
     # Step 3.5: Resolve website content (scraping or AI search)
     redis = await get_redis()
@@ -1388,12 +1363,7 @@ async def generate_evaluation(
     # Build organization profile once
     organization_profile = None
     if request.organization_profile:
-        organization_profile = {
-            "name": request.organization_profile.name,
-            "industry": request.organization_profile.industry,
-            "address": request.organization_profile.address,
-            "employees": request.organization_profile.employees,
-        }
+        organization_profile = request.organization_profile.model_dump()
 
     # ==========================================================================
     # Step 1: Services

@@ -7,6 +7,8 @@ from uuid import UUID
 from pydantic import BaseModel, Field, StrictBool, StrictStr, HttpUrl, field_validator
 from pydantic.config import ConfigDict
 
+from workshops_ai.api.schema.organization import Organization, OrganizationalUnit, JobPosition
+
 
 WorkshopId = Literal["assets", "impacts", "threats", "controls"]
 JSONDict = Dict[str, Any]
@@ -46,32 +48,6 @@ class AssetOutput(BaseModel):
     availability: Optional[Literal["LOW", "MEDIUM", "HIGH"]] = None
     assetType: StrictStr
     reasoning: Optional[StrictStr] = Field(default=None, description="Agent's explanation for CIA levels")
-
-
-class OrganizationalUnit(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    name: StrictStr
-    description: Optional[StrictStr] = None
-
-
-class JobPosition(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    title: StrictStr
-    description: Optional[StrictStr] = None
-
-
-class Organization(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-
-    organizationName: StrictStr
-    legalForm: Optional[StrictStr] = None
-    registeredOffice: Optional[StrictStr] = None
-    country: Optional[StrictStr] = None
-    numberOfEmployees: Optional[int] = None
-    organizationalUnits: List[OrganizationalUnit] = Field(default_factory=list)
-    jobPositions: List[JobPosition] = Field(default_factory=list)
 
 
 class JsonPatch(BaseModel):

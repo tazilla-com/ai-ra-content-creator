@@ -13,6 +13,7 @@ from workshops_ai.api.schema.asset import Asset
 from workshops_ai.api.schema.impact import AssetImpact, ImpactEvaluation
 from workshops_ai.api.schema.threat import AssetRisk, Risk
 from workshops_ai.api.schema.control import AssetControls, PlannedControl
+from workshops_ai.api.schema.organization import Organization
 
 # ===================================================================================
 # Domain Models
@@ -205,16 +206,6 @@ class ScrapeWebsiteOutput(BaseModel):
 # Services
 # ===================================================================================
 
-class OrganizationProfile(BaseModel):
-    """Optional organization data for context."""
-    model_config = ConfigDict(extra="forbid")
-
-    name: Optional[str] = Field(None, description="Organization name")
-    address: Optional[str] = Field(None, description="Organization address")
-    employees: Optional[int] = Field(None, description="Number of employees")
-    industry: Optional[str] = Field(None, description="Industry/sector")
-
-
 class WebsiteContent(BaseModel):
     """Website content data when not using session.
 
@@ -273,7 +264,7 @@ class ServicesInput(WizardStepInput):
     )
 
     # Optional context for better generation
-    organization_profile: Optional[OrganizationProfile] = Field(
+    organization_profile: Optional[Organization] = Field(
         None,
         description="Optional organization data (name, address, employees, etc.)"
     )
@@ -351,7 +342,7 @@ class AssetsInput(WizardStepInput):
     )
 
     # Optional context for better generation
-    organization_profile: Optional[OrganizationProfile] = Field(
+    organization_profile: Optional[Organization] = Field(
         None,
         description="Optional organization data (name, address, employees, etc.)"
     )
@@ -435,7 +426,7 @@ class ImpactsInput(WizardStepInput):
     )
 
     # Optional context for better generation
-    organization_profile: Optional[OrganizationProfile] = Field(
+    organization_profile: Optional[Organization] = Field(
         None,
         description="Optional organization data (name, address, employees, etc.)"
     )
@@ -521,7 +512,7 @@ class RisksInput(WizardStepInput):
     )
 
     # Optional context for better generation
-    organization_profile: Optional[OrganizationProfile] = Field(
+    organization_profile: Optional[Organization] = Field(
         None,
         description="Optional organization data (name, address, employees, etc.)"
     )
@@ -601,7 +592,7 @@ class ControlsInput(WizardStepInput):
     )
 
     # Optional context for better generation
-    organization_profile: Optional[OrganizationProfile] = Field(
+    organization_profile: Optional[Organization] = Field(
         None,
         description="Optional organization data (name, address, employees, etc.)"
     )
@@ -672,7 +663,7 @@ class EvaluationInput(WizardStepInput):
     )
 
     # Common parameters
-    organization_profile: Optional[OrganizationProfile] = Field(
+    organization_profile: Optional[Organization] = Field(
         None,
         description="Optional organization metadata for all steps"
     )

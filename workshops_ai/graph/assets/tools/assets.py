@@ -137,9 +137,18 @@ def create_assets(
     """
     Create one or more assets with FULL CIA classification.
 
+    WHEN TO USE THIS TOOL:
+    - User confirms your proposed assets → create them as proposed
+    - User modifies your proposals BEFORE creation → create with modifications
+    - DO NOT use update_assets on proposals that don't exist yet!
+
+    Example: You propose A, B, C. User says "create A and B, change B integrity to HIGH, skip C"
+    → Call create_assets ONCE with A (as proposed) and B (with HIGH integrity)
+    → Do NOT call update_assets (B doesn't exist yet to update!)
+
     CRITICAL REQUIREMENTS:
-    - Every asset MUST have CIA levels (Confidentiality, Integrity, Availability)
-    - This is required by backend - assets without CIA will be rejected
+    - PRIMARY assets (databases, applications, data) MUST have CIA levels
+    - Supporting assets (servers, network, locations, staff) must NOT have CIA (leave as None)
     - Asset type MUST be from valid_asset_types in your state
 
     BEFORE CALLING THIS TOOL, ensure you have context for CIA classification:
@@ -324,8 +333,8 @@ def update_assets(
         "availability": {"LOW", "MEDIUM", "HIGH"}
     }
     for field, valid_values in cia_validation.items():
-        if field in updates and updates[field] not in valid_values:
-            error_msg = f"Invalid {field}: {updates[field]}. Must be one of: {valid_values}"
+        if field in updates and updates[field] is not None and updates[field] not in valid_values:
+            error_msg = f"Invalid {field}: {updates[field]}. Must be one of: {valid_values} or None (for supporting assets)"
             return Command(
                 update={
                     "error": error_msg,
