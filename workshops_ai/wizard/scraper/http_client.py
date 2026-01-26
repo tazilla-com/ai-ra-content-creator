@@ -5,6 +5,7 @@ HTTP client utilities for web scraping with retry logic and encoding detection.
 from __future__ import annotations
 
 import logging
+import ssl
 from typing import Optional, Tuple, AsyncIterator
 from urllib.parse import urlparse, urlunparse
 from contextlib import asynccontextmanager
@@ -141,6 +142,44 @@ def normalize_url(url: str) -> str:
     return urlunparse(normalized)
 
 
+def _create_ssl_context() -> ssl.SSLContext:
+    """
+    Create SSL context with compatibility for older TLS versions.
+
+    This allows scraping websites with older SSL/TLS configurations
+    while still maintaining certificate verification for security.
+
+    Returns:
+        Configured SSL context
+    """
+    # Create SSL context with maximum compatibility
+    context = ssl.create_default_context()
+
+    # Allow TLS 1.0+ for compatibility with older servers
+    # TLS 1.3 is preferred but we fall back to older versions if needed
+    context.minimum_version = ssl.TLSVersion.TLSv1
+    context.maximum_version = ssl.TLSVersion.TLSv1_3
+
+    # Set cipher suites to include broader compatibility
+    # This helps with servers that have limited cipher support
+    context.set_ciphers('DEFAULT:@SECLEVEL=1')
+
+    # Keep certificate verification enabled for security
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+
+    logger.debug(
+        "ssl_context_created",
+        extra={
+            "min_tls_version": "TLS 1.0",
+            "max_tls_version": "TLS 1.3",
+            "verify_mode": "REQUIRED"
+        }
+    )
+
+    return context
+
+
 def _build_http_client() -> httpx.AsyncClient:
     """
     Build configured HTTP client for scraping.
@@ -164,11 +203,15 @@ def _build_http_client() -> httpx.AsyncClient:
 
     headers = {"User-Agent": settings.wizard.scrape_user_agent}
 
+    # Create SSL context for better compatibility with older servers
+    ssl_context = _create_ssl_context()
+
     return httpx.AsyncClient(
         limits=limits,
         timeout=timeout,
         headers=headers,
-        follow_redirects=True
+        follow_redirects=True,
+        verify=ssl_context
     )
 
 
