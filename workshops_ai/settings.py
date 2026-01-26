@@ -427,6 +427,17 @@ class WizardSettings(BaseModel):
         description="OpenAI pricing per 1M tokens (January 2025). Can be overridden via ENV JSON."
     )
 
+    openai_per_request_limits: dict[str, int] = Field(
+        default_factory=lambda: {
+            "gpt-5": 500000,           # 500k TPM (Tier 1)
+            "gpt-5-mini": 500000,      # 500k TPM (Tier 1)
+            "gpt-4.1": 30000,          # 30k TPM (Tier 1)
+            "gpt-4o": 30000,           # 30k TPM (Tier 1)
+            "gpt-4o-mini": 200000,     # 200k TPM (Tier 1)
+        },
+        description="Per-request token limits for supported models (Tier 1 OpenAI rate limits)"
+    )
+
     # Content retrieval method
     default_search_method: Literal["scrape", "web_search"] = Field(
         default="scrape",

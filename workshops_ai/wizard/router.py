@@ -25,6 +25,7 @@ import secrets
 import time
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Header, Request
 from typing import Dict, Any, Optional
+from openai import RateLimitError
 
 from workshops_ai.app.security import require_auth
 from workshops_ai.app.services.redis_pool import get_redis
@@ -237,39 +238,19 @@ async def generate_services(
     service_generator = ServiceGenerator(model=request.ai_model)
 
     # Step 1: Resolve website content
-    # Check if web scraping is disabled:
-    # 1. Empty website_content object explicitly provided
-    # 2. No website information provided at all (both website_content and website_url are None)
-    scraping_disabled = (
-        (request.website_content is not None and
-         not request.website_content.url and
-         not request.website_content.content) or
-        (request.website_content is None and request.website_url is None)
-    )
-
-    if scraping_disabled:
-        # Web scraping disabled - use empty content (will generate generic services)
+    # Check if explicitly disabled with empty website_content object {}
+    if (request.website_content is not None and
+        not request.website_content.url and
+        not request.website_content.content):
+        # Explicitly disabled - do not use cache
         website_content = ""
-        content_metadata = {
-            "source": "disabled",
-            "content_length": 0,
-        }
-
-        # Determine reason for logging
-        if request.website_content is not None:
-            reason = "empty_website_content_object"
-        else:
-            reason = "no_website_information_provided"
-
+        content_metadata = {"source": "disabled", "content_length": 0}
         logger.info(
-            "web_scraping_disabled",
-            extra={
-                "session_id": session_id,
-                "reason": reason,
-            }
+            "web_scraping_explicitly_disabled",
+            extra={"session_id": session_id}
         )
     else:
-        # Normal flow - resolve content from cache or scraping
+        # Try to resolve content (from request text, cache, or URL)
         try:
             website_content, content_metadata = await content_resolver.resolve_content(
                 session_id=session_id,
@@ -278,7 +259,6 @@ async def generate_services(
                 search_method=request.search_method,
                 ai_model=request.ai_model,
             )
-
             logger.info(
                 "content_resolved",
                 extra={
@@ -287,26 +267,24 @@ async def generate_services(
                     "content_length": content_metadata.get("content_length"),
                 }
             )
-
-        except ContentNotFoundError as e:
-            logger.error(
-                "content_resolution_failed",
-                extra={
-                    "session_id": session_id,
-                    "error": str(e),
-                }
+        except ContentNotFoundError:
+            # No content available - continue with empty (generate generic services)
+            website_content = ""
+            content_metadata = {"source": "not_available", "content_length": 0}
+            logger.info(
+                "web_content_not_available_continuing",
+                extra={"session_id": session_id, "endpoint": "services"}
             )
-            raise
 
     # Step 2: Build organization profile from request
     organization_profile = None
     if request.organization_profile:
         organization_profile = request.organization_profile.model_dump()
 
-    # Step 3: Load previous services from session (if refining)
-    previous_services = None
-    if request.user_instructions:
-        # User is refining - load previous services
+    # Step 3: Load previous services from request or session (if refining)
+    previous_services = request.previous_services
+    if not previous_services and request.user_instructions:
+        # User is refining - load previous services from session
         previous_step = await get_wizard_step(session_id, "services")
         if previous_step and previous_step.get("services"):
             from workshops_ai.wizard.schemas import Service
@@ -344,6 +322,19 @@ async def generate_services(
             }
         )
 
+    except RateLimitError as e:
+        logger.error(
+            "openai_rate_limit_exceeded",
+            extra={
+                "session_id": session_id,
+                "error": str(e),
+                "endpoint": "services"
+            }
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
+        )
     except Exception as e:
         logger.error(
             "service_generation_failed",
@@ -476,28 +467,19 @@ async def generate_assets(
             )
 
     # Step 2: Resolve website content (optional additional context)
-    # Check if web scraping is disabled (empty website_content object)
-    scraping_disabled = (
-        request.website_content is not None and
+    # Check if explicitly disabled with empty website_content object {}
+    if (request.website_content is not None and
         not request.website_content.url and
-        not request.website_content.content
-    )
-
-    website_content = ""
-    content_metadata = {"source": "none"}
-
-    if scraping_disabled:
-        # Web scraping explicitly disabled - use empty content
+        not request.website_content.content):
+        # Explicitly disabled - do not use cache
+        website_content = ""
         content_metadata = {"source": "disabled", "content_length": 0}
         logger.info(
-            "web_scraping_disabled",
-            extra={
-                "session_id": session_id,
-                "reason": "empty_website_content_object",
-            }
+            "web_scraping_explicitly_disabled",
+            extra={"session_id": session_id}
         )
     else:
-        # Normal flow - try to resolve content
+        # Try to resolve content (from request text, cache, or URL)
         try:
             website_content, content_metadata = await content_resolver.resolve_content(
                 session_id=session_id,
@@ -506,7 +488,6 @@ async def generate_assets(
                 search_method=request.search_method,
                 ai_model=request.ai_model,
             )
-
             logger.info(
                 "content_resolved",
                 extra={
@@ -515,12 +496,13 @@ async def generate_assets(
                     "content_length": content_metadata.get("content_length"),
                 }
             )
-
         except ContentNotFoundError:
-            # Website content is optional for assets (services are primary input)
+            # No content available - continue with empty (assets based on services)
+            website_content = ""
+            content_metadata = {"source": "not_available", "content_length": 0}
             logger.info(
-                "no_website_content_available",
-                extra={"session_id": session_id}
+                "web_content_not_available_continuing",
+                extra={"session_id": session_id, "endpoint": "assets"}
             )
 
     # Step 3: Build organization profile from request
@@ -570,6 +552,19 @@ async def generate_assets(
             }
         )
 
+    except RateLimitError as e:
+        logger.error(
+            "openai_rate_limit_exceeded",
+            extra={
+                "session_id": session_id,
+                "error": str(e),
+                "endpoint": "assets"
+            }
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
+        )
     except Exception as e:
         logger.error(
             "asset_generation_failed",
@@ -724,36 +719,47 @@ async def generate_impacts(
                 }
             )
 
-    # Step 2.5: Resolve website content (scraping or AI search)
+    # Step 2.5: Resolve website content (optional for impacts)
     redis = await get_redis()
     content_resolver = ContentResolver(redis)
 
-    # Check if web scraping is disabled (empty website_content object)
-    scraping_disabled = (
-        request.website_content is not None and
+    # Check if explicitly disabled with empty website_content object {}
+    if (request.website_content is not None and
         not request.website_content.url and
-        not request.website_content.content
-    )
-
-    if scraping_disabled:
+        not request.website_content.content):
+        # Explicitly disabled - do not use cache
         website_content = ""
         content_metadata = {"source": "disabled", "content_length": 0}
         logger.info(
-            "web_scraping_disabled",
-            extra={
-                "session_id": session_id,
-                "reason": "empty_website_content_object",
-                "endpoint": "impacts"
-            }
+            "web_scraping_explicitly_disabled",
+            extra={"session_id": session_id, "endpoint": "impacts"}
         )
     else:
-        website_content, content_metadata = await content_resolver.resolve_content(
-            session_id=session_id,
-            website_text=request.website_content.content if request.website_content else None,
-            website_url=request.website_url,
-            search_method=request.search_method,
-            ai_model=request.ai_model,
-        )
+        # Try to resolve content (from request text, cache, or URL)
+        try:
+            website_content, content_metadata = await content_resolver.resolve_content(
+                session_id=session_id,
+                website_text=request.website_content.content if request.website_content else None,
+                website_url=request.website_url,
+                search_method=request.search_method,
+                ai_model=request.ai_model,
+            )
+            logger.info(
+                "content_resolved",
+                extra={
+                    "session_id": session_id,
+                    "source": content_metadata.get("source"),
+                    "endpoint": "impacts"
+                }
+            )
+        except ContentNotFoundError:
+            # No content available - continue with empty (impacts based on assets)
+            website_content = ""
+            content_metadata = {"source": "not_available", "content_length": 0}
+            logger.info(
+                "web_content_not_available_continuing",
+                extra={"session_id": session_id, "endpoint": "impacts"}
+            )
 
     # Step 3: Build organization profile from request
     organization_profile = None
@@ -785,6 +791,19 @@ async def generate_impacts(
             }
         )
 
+    except RateLimitError as e:
+        logger.error(
+            "openai_rate_limit_exceeded",
+            extra={
+                "session_id": session_id,
+                "error": str(e),
+                "endpoint": "impacts"
+            }
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
+        )
     except Exception as e:
         logger.error(
             "impact_generation_failed",
@@ -958,32 +977,43 @@ async def generate_risks(
     redis = await get_redis()
     content_resolver = ContentResolver(redis)
 
-    # Check if web scraping is disabled (empty website_content object)
-    scraping_disabled = (
-        request.website_content is not None and
+    # Check if explicitly disabled with empty website_content object {}
+    if (request.website_content is not None and
         not request.website_content.url and
-        not request.website_content.content
-    )
-
-    if scraping_disabled:
+        not request.website_content.content):
+        # Explicitly disabled - do not use cache
         website_content = ""
         content_metadata = {"source": "disabled", "content_length": 0}
         logger.info(
-            "web_scraping_disabled",
-            extra={
-                "session_id": session_id,
-                "reason": "empty_website_content_object",
-                "endpoint": "risks"
-            }
+            "web_scraping_explicitly_disabled",
+            extra={"session_id": session_id, "endpoint": "risks"}
         )
     else:
-        website_content, content_metadata = await content_resolver.resolve_content(
-            session_id=session_id,
-            website_text=request.website_content.content if request.website_content else None,
-            website_url=request.website_url,
-            search_method=request.search_method,
-            ai_model=request.ai_model,
-        )
+        # Try to resolve content (from request text, cache, or URL)
+        try:
+            website_content, content_metadata = await content_resolver.resolve_content(
+                session_id=session_id,
+                website_text=request.website_content.content if request.website_content else None,
+                website_url=request.website_url,
+                search_method=request.search_method,
+                ai_model=request.ai_model,
+            )
+            logger.info(
+                "content_resolved",
+                extra={
+                    "session_id": session_id,
+                    "source": content_metadata.get("source"),
+                    "endpoint": "risks"
+                }
+            )
+        except ContentNotFoundError:
+            # No content available - continue with empty
+            website_content = ""
+            content_metadata = {"source": "not_available", "content_length": 0}
+            logger.info(
+                "web_content_not_available_continuing",
+                extra={"session_id": session_id, "endpoint": "risks"}
+            )
 
     # Step 4: Build organization profile from request
     organization_profile = None
@@ -1016,6 +1046,19 @@ async def generate_risks(
             }
         )
 
+    except RateLimitError as e:
+        logger.error(
+            "openai_rate_limit_exceeded",
+            extra={
+                "session_id": session_id,
+                "error": str(e),
+                "endpoint": "risks"
+            }
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
+        )
     except Exception as e:
         logger.error(
             "risk_generation_failed",
@@ -1190,32 +1233,43 @@ async def generate_controls(
     redis = await get_redis()
     content_resolver = ContentResolver(redis)
 
-    # Check if web scraping is disabled (empty website_content object)
-    scraping_disabled = (
-        request.website_content is not None and
+    # Check if explicitly disabled with empty website_content object {}
+    if (request.website_content is not None and
         not request.website_content.url and
-        not request.website_content.content
-    )
-
-    if scraping_disabled:
+        not request.website_content.content):
+        # Explicitly disabled - do not use cache
         website_content = ""
         content_metadata = {"source": "disabled", "content_length": 0}
         logger.info(
-            "web_scraping_disabled",
-            extra={
-                "session_id": session_id,
-                "reason": "empty_website_content_object",
-                "endpoint": "controls"
-            }
+            "web_scraping_explicitly_disabled",
+            extra={"session_id": session_id, "endpoint": "controls"}
         )
     else:
-        website_content, content_metadata = await content_resolver.resolve_content(
-            session_id=session_id,
-            website_text=request.website_content.content if request.website_content else None,
-            website_url=request.website_url,
-            search_method=request.search_method,
-            ai_model=request.ai_model,
-        )
+        # Try to resolve content (from request text, cache, or URL)
+        try:
+            website_content, content_metadata = await content_resolver.resolve_content(
+                session_id=session_id,
+                website_text=request.website_content.content if request.website_content else None,
+                website_url=request.website_url,
+                search_method=request.search_method,
+                ai_model=request.ai_model,
+            )
+            logger.info(
+                "content_resolved",
+                extra={
+                    "session_id": session_id,
+                    "source": content_metadata.get("source"),
+                    "endpoint": "controls"
+                }
+            )
+        except ContentNotFoundError:
+            # No content available - continue with empty
+            website_content = ""
+            content_metadata = {"source": "not_available", "content_length": 0}
+            logger.info(
+                "web_content_not_available_continuing",
+                extra={"session_id": session_id, "endpoint": "controls"}
+            )
 
     # Step 4: Generate control recommendations with LLM
     try:
@@ -1241,6 +1295,19 @@ async def generate_controls(
             }
         )
 
+    except RateLimitError as e:
+        logger.error(
+            "openai_rate_limit_exceeded",
+            extra={
+                "session_id": session_id,
+                "error": str(e),
+                "endpoint": "controls"
+            }
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
+        )
     except Exception as e:
         logger.error(
             "control_generation_failed",
@@ -1389,40 +1456,43 @@ async def generate_evaluation(
                 )
 
         if results.services is None:
-            # Check if web scraping is disabled (empty website_content object)
-            scraping_disabled = (
-                request.website_content is not None and
+            # Check if explicitly disabled with empty website_content object {}
+            if (request.website_content is not None and
                 not request.website_content.url and
-                not request.website_content.content
-            )
-
-            # Resolve website content
-            if scraping_disabled:
-                # Web scraping explicitly disabled
+                not request.website_content.content):
+                # Explicitly disabled - do not use cache
                 website_content = ""
                 content_metadata = {"source": "disabled", "content_length": 0}
                 logger.info(
-                    "web_scraping_disabled",
-                    extra={
-                        "session_id": session_id,
-                        "reason": "empty_website_content_object",
-                        "step": "services",
-                    }
+                    "web_scraping_explicitly_disabled",
+                    extra={"session_id": session_id, "endpoint": "evaluation_services"}
                 )
             else:
-                website_content, content_metadata = await content_resolver.resolve_content(
-                    session_id=session_id,
-                    website_text=request.website_content.content if request.website_content else None,
-                    website_url=request.website_url,
-                    search_method=request.search_method,
-                    ai_model=request.ai_model,
-                )
-
-            if not website_content and not scraping_disabled:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No website content or URL provided"
-                )
+                # Try to resolve content (from request text, cache, or URL)
+                try:
+                    website_content, content_metadata = await content_resolver.resolve_content(
+                        session_id=session_id,
+                        website_text=request.website_content.content if request.website_content else None,
+                        website_url=request.website_url,
+                        search_method=request.search_method,
+                        ai_model=request.ai_model,
+                    )
+                    logger.info(
+                        "content_resolved",
+                        extra={
+                            "session_id": session_id,
+                            "source": content_metadata.get("source"),
+                            "endpoint": "evaluation_services"
+                        }
+                    )
+                except ContentNotFoundError:
+                    # No content available - continue with empty
+                    website_content = ""
+                    content_metadata = {"source": "not_available", "content_length": 0}
+                    logger.info(
+                        "web_content_not_available_continuing",
+                        extra={"session_id": session_id, "endpoint": "evaluation_services"}
+                    )
 
             # Generate services
             service_generator = ServiceGenerator(model=request.ai_model)
@@ -1461,6 +1531,20 @@ async def generate_evaluation(
                 extra={"session_id": session_id, "step": "services", "elapsed_ms": elapsed}
             )
 
+    except RateLimitError as e:
+        logger.error(
+            "openai_rate_limit_exceeded",
+            extra={
+                "session_id": session_id,
+                "error": str(e),
+                "endpoint": "evaluation",
+                "step": "services"
+            }
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
+        )
     except Exception as e:
         elapsed = int((time.time() - start) * 1000)
         error_msg = f"Services generation failed: {str(e)}"
@@ -1504,32 +1588,40 @@ async def generate_evaluation(
                     )
 
             if results.assets is None and results.services:
-                # Check if web scraping is disabled (empty website_content object)
-                scraping_disabled = (
-                    request.website_content is not None and
+                # Check if explicitly disabled with empty website_content object {}
+                if (request.website_content is not None and
                     not request.website_content.url and
-                    not request.website_content.content
-                )
-
-                # Get website content from session (or re-scrape if cache fails)
-                if scraping_disabled:
+                    not request.website_content.content):
+                    # Explicitly disabled - do not use cache
                     website_content = ""
                     logger.info(
-                        "web_scraping_disabled",
-                        extra={
-                            "session_id": session_id,
-                            "reason": "empty_website_content_object",
-                            "step": "assets",
-                        }
+                        "web_scraping_explicitly_disabled",
+                        extra={"session_id": session_id, "endpoint": "evaluation_assets"}
                     )
                 else:
-                    website_content, _ = await content_resolver.resolve_content(
-                        session_id=session_id,
-                        website_text=request.website_content.content if request.website_content else None,
-                        website_url=request.website_url,
-                        search_method=request.search_method,
-                        ai_model=request.ai_model,
-                    )
+                    # Try to resolve content (from request text, cache, or URL)
+                    try:
+                        website_content, _ = await content_resolver.resolve_content(
+                            session_id=session_id,
+                            website_text=request.website_content.content if request.website_content else None,
+                            website_url=request.website_url,
+                            search_method=request.search_method,
+                            ai_model=request.ai_model,
+                        )
+                        logger.info(
+                            "content_resolved",
+                            extra={
+                                "session_id": session_id,
+                                "endpoint": "evaluation_assets"
+                            }
+                        )
+                    except ContentNotFoundError:
+                        # No content available - continue with empty
+                        website_content = ""
+                        logger.info(
+                            "web_content_not_available_continuing",
+                            extra={"session_id": session_id, "endpoint": "evaluation_assets"}
+                        )
 
                 # Generate assets
                 asset_generator = AssetGenerator(model=request.ai_model)
@@ -1569,6 +1661,20 @@ async def generate_evaluation(
                     extra={"session_id": session_id, "step": "assets", "elapsed_ms": elapsed}
                 )
 
+        except RateLimitError as e:
+            logger.error(
+                "openai_rate_limit_exceeded",
+                extra={
+                    "session_id": session_id,
+                    "error": str(e),
+                    "endpoint": "evaluation",
+                    "step": "assets"
+                }
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
+            )
         except Exception as e:
             elapsed = int((time.time() - start) * 1000)
             error_msg = f"Assets generation failed: {str(e)}"
@@ -1649,6 +1755,20 @@ async def generate_evaluation(
                     extra={"session_id": session_id, "step": "impacts", "elapsed_ms": elapsed}
                 )
 
+        except RateLimitError as e:
+            logger.error(
+                "openai_rate_limit_exceeded",
+                extra={
+                    "session_id": session_id,
+                    "error": str(e),
+                    "endpoint": "evaluation",
+                    "step": "impacts"
+                }
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
+            )
         except Exception as e:
             elapsed = int((time.time() - start) * 1000)
             error_msg = f"Impacts generation failed: {str(e)}"
@@ -1730,6 +1850,20 @@ async def generate_evaluation(
                     extra={"session_id": session_id, "step": "risks", "elapsed_ms": elapsed}
                 )
 
+        except RateLimitError as e:
+            logger.error(
+                "openai_rate_limit_exceeded",
+                extra={
+                    "session_id": session_id,
+                    "error": str(e),
+                    "endpoint": "evaluation",
+                    "step": "risks"
+                }
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
+            )
         except Exception as e:
             elapsed = int((time.time() - start) * 1000)
             error_msg = f"Risks generation failed: {str(e)}"
@@ -1809,6 +1943,20 @@ async def generate_evaluation(
                     extra={"session_id": session_id, "step": "controls", "elapsed_ms": elapsed}
                 )
 
+        except RateLimitError as e:
+            logger.error(
+                "openai_rate_limit_exceeded",
+                extra={
+                    "session_id": session_id,
+                    "error": str(e),
+                    "endpoint": "evaluation",
+                    "step": "controls"
+                }
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
+            )
         except Exception as e:
             elapsed = int((time.time() - start) * 1000)
             error_msg = f"Controls generation failed: {str(e)}"

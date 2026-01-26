@@ -560,6 +560,7 @@ Core Principles:
 Selection Guidelines:
 - Source restriction: Use ONLY controls from the provided relevant_controls list (pre-filtered based on threat coverage)
 - Prioritization factors:
+  * Inherent risk (if provided): Primary indicator of risk severity, combining threat probability and impact (0-100 scale, higher = more critical)
   * Threat probability (higher probability threats need coverage first)
   * Threat impact (derived from asset CIA ratings)
   * Control effectiveness for the specific threats
@@ -589,8 +590,10 @@ Select the most effective security controls for these assets to mitigate their i
 Assets to protect:
 {asset_json}
 
-Asset risks (threats with evaluated probabilities):
+Asset risks (threats with evaluated probabilities and calculated risk values):
 {asset_risks_json}
+
+Note: Each risk may include inherentRisk (0-100), residualRiskCalculated (risk after implemented controls), and estimatedResidualRisk (risk after planned controls). Use inherentRisk as the primary indicator of risk severity when prioritizing controls.
 
 {website_content_section}
 
@@ -603,7 +606,7 @@ Pre-filtered relevant controls catalog (select from these):
 
 Critical Requirements:
 - Select controls that provide meaningful coverage for the asset's specific threats
-- Prioritize controls based on threat probability (higher probability = higher priority)
+- Prioritize controls based on inherentRisk (if provided) or threat probability (higher values = higher priority)
 - Return ONLY control names (no additional fields like description, category, costs, or threats)
 - Each control name must exactly match the catalog entry
 """

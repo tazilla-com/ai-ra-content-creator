@@ -1,4 +1,5 @@
 from typing import List, Literal, Optional
+from decimal import Decimal
 from pydantic import BaseModel, Field
 from uuid import UUID
 
@@ -77,6 +78,40 @@ class Risk(BaseModel):
             "3 = Medium (~80%),\n"
             "4 = High (~100%)."
         )
+    )
+    inherentRisk: Optional[Decimal] = Field(
+        None,
+        ge=0,
+        le=100,
+        description=(
+            "Calculated inherent risk value in the range 0-100.\n"
+            "Defined as: Inherent risk = (Maximum impact value x Probability).\n"
+            "Represents the baseline risk level before considering any controls."
+        ),
+        json_schema_extra={"example": 75.5}
+    )
+    residualRiskCalculated: Optional[Decimal] = Field(
+        None,
+        ge=0,
+        le=100,
+        description=(
+            "Calculated residual risk after applying implemented controls, in the range 0-100.\n"
+            "Derived from inherent risk and combined effectiveness of implemented controls.\n"
+            "Combined effectiveness is computed as product: 1 - Π(1 - e_i), where e_i are coverage values of implemented controls expressed as fractions.\n"
+            "Residual risk = Inherent risk × (1 - combined effectiveness)."
+        ),
+        json_schema_extra={"example": 45.2}
+    )
+    estimatedResidualRisk: Optional[Decimal] = Field(
+        None,
+        ge=0,
+        le=100,
+        description=(
+            "Estimated residual risk after applying both implemented and planned controls, in the range 0-100.\n"
+            "Uses the same combined effectiveness formula: 1 - Π(1 - e_i), where e_i are coverage values of all implemented and planned controls expressed as fractions.\n"
+            "Estimated residual risk = Inherent risk × (1 - combined effectiveness)."
+        ),
+        json_schema_extra={"example": 32.8}
     )
 
 class AssetRisk(BaseModel):

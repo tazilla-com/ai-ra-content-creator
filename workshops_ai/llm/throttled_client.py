@@ -29,17 +29,27 @@ class ThrottledChatOpenAI(ChatOpenAI):
 
         messages = self._convert_input_to_messages(input)
         model = kwargs.get("model") or self.model_name
+        batch_size = kwargs.pop("batch_size", None)  # Extract batch_size, don't pass to OpenAI
+        expected_output_tokens = kwargs.pop("expected_output_tokens", None)  # Extract expected output, don't pass to OpenAI
 
         try:
-            async with throttle.acquire(messages, model, kwargs.get("max_tokens")):
+            async with throttle.acquire(
+                messages, model, kwargs.get("max_tokens"),
+                batch_size=batch_size,
+                expected_output_tokens=expected_output_tokens
+            ):
+                logger.info(f"ThrottledChatOpenAI: Before super().ainvoke, model={model}")
                 response = await super().ainvoke(input, config, **kwargs)
+                logger.info(f"ThrottledChatOpenAI: After super().ainvoke, response type={type(response).__name__}")
                 throttle.update_from_response(response)
+                logger.info(f"ThrottledChatOpenAI: After update_from_response")
                 throttle.record_success()
                 return response
         except CircuitBreakerError:
             logger.error("Circuit breaker OPEN - OpenAI unavailable")
             raise
         except Exception as e:
+            logger.info(f"ThrottledChatOpenAI: Exception caught: {type(e).__name__}: {str(e)[:100]}")
             throttle.record_failure(e)
             raise
 
@@ -63,10 +73,16 @@ class ThrottledChatOpenAI(ChatOpenAI):
 
         messages = self._convert_input_to_messages(input)
         model = kwargs.get("model") or self.model_name
+        batch_size = kwargs.pop("batch_size", None)  # Extract batch_size, don't pass to OpenAI
+        expected_output_tokens = kwargs.pop("expected_output_tokens", None)  # Extract expected output, don't pass to OpenAI
 
         async def _throttled_call():
             try:
-                async with throttle.acquire(messages, model, kwargs.get("max_tokens")):
+                async with throttle.acquire(
+                    messages, model, kwargs.get("max_tokens"),
+                    batch_size=batch_size,
+                    expected_output_tokens=expected_output_tokens
+                ):
                     response = super(ThrottledChatOpenAI, self).invoke(input, config, **kwargs)
                     throttle.update_from_response(response)
                     throttle.record_success()

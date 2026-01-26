@@ -330,7 +330,8 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
             init_throttle(
                 rpm=settings.openai_throttle.rpm,
                 tpm=settings.openai_throttle.tpm,
-                max_concurrent=settings.openai_throttle.max_concurrent
+                max_concurrent=settings.openai_throttle.max_concurrent,
+                per_request_limits=settings.wizard.openai_per_request_limits
             )
         except Exception as e:
             logger.warning("openai_throttle.init_failed: %s", e)

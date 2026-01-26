@@ -36,7 +36,8 @@ def create_wizard_llm_client(
         "temperature": settings.llm.temperature,
         "openai_api_key": settings.llm.api_key,
         "timeout": settings.wizard.llm_timeout_sec,
-        "max_retries": 0
+        "max_retries": 0,
+        "include_response_headers": True  # Enable access to OpenAI rate limit headers
     }
 
     # Add response_format if provided (OpenAI structured outputs)

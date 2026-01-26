@@ -601,7 +601,7 @@ class ServiceGenerator:
                                 parse_span.update(
                                     output={
                                         "services_count": len(services),
-                                        "services": [s.model_dump() for s in services],
+                                        "services": [s.model_dump(mode='json') for s in services],
                                     }
                                 )
                             except (ValidationError, AIResponseError) as e:

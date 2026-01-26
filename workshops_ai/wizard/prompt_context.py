@@ -216,7 +216,7 @@ class PromptContextBuilder:
         # Services section
         if services:
             services_json = json.dumps(
-                [s.model_dump() for s in services],
+                [s.model_dump(mode='json') for s in services],
                 ensure_ascii=False,
                 indent=2
             )
@@ -245,7 +245,7 @@ class PromptContextBuilder:
         # Previous services section (for refinement)
         if previous_services:
             prev_json = json.dumps(
-                [s.model_dump() for s in previous_services],
+                [s.model_dump(mode='json') for s in previous_services],
                 ensure_ascii=False,
                 indent=2
             )

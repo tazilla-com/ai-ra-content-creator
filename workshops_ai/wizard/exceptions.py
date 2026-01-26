@@ -94,3 +94,33 @@ class ModelNotAllowedError(WizardException):
             status_code=400,
             details={"model": model, "allowed_models": allowed_models}
         )
+
+
+class RequestTooLargeError(WizardException):
+    """Raised when request exceeds per-request token limit for the model."""
+
+    def __init__(
+        self,
+        estimated_tokens: int,
+        model_limit: int,
+        model: str,
+        current_batch_size: int,
+        suggested_batch_size: Optional[int] = None
+    ):
+        super().__init__(
+            code="request_too_large",
+            message=f"Request estimated at {estimated_tokens} tokens exceeds model limit {model_limit} for {model}",
+            status_code=400,
+            details={
+                "estimated_tokens": estimated_tokens,
+                "model_limit": model_limit,
+                "model": model,
+                "current_batch_size": current_batch_size,
+                "suggested_batch_size": suggested_batch_size,
+            }
+        )
+        self.estimated_tokens = estimated_tokens
+        self.model_limit = model_limit
+        self.model = model
+        self.current_batch_size = current_batch_size
+        self.suggested_batch_size = suggested_batch_size

@@ -40,6 +40,7 @@ from workshops_ai.wizard.exceptions import (
     AIResponseError,
     AITimeoutError,
     ValidationRetriesExhausted,
+    RequestTooLargeError,
     ModelNotAllowedError,
 )
 from workshops_ai.llm.langfuse_helper import (
@@ -471,7 +472,7 @@ class RiskGenerator:
 
         # Create JSON for all assets in batch
         assets_json = json.dumps(
-            [a.model_dump() for a in assets],
+            [a.model_dump(mode='json') for a in assets],
             ensure_ascii=False
         )
 
@@ -485,8 +486,16 @@ class RiskGenerator:
             **sections
         )
 
+        # Calculate expected output tokens based on batch size and max threats per asset
+        # Each risk = ~88 tokens, plus overhead for JSON structure
+        items_per_asset = max_threats_per_asset or 10  # Conservative default if not specified
+        expected_output = len(assets) * items_per_asset * 88 + 500  # 500 for JSON wrapper
+
         # Prepare invocation kwargs with Langfuse tracing
-        invoke_kwargs = {}
+        invoke_kwargs = {
+            "batch_size": len(assets),  # Pass batch size for per-request token limit checks
+            "expected_output_tokens": expected_output,  # Precise output estimate
+        }
         langfuse_handler = get_langfuse_callback_handler()
         if langfuse_handler:
             invoke_kwargs["config"] = {"callbacks": [langfuse_handler]}
@@ -556,6 +565,14 @@ class RiskGenerator:
             # Validate with Pydantic
             batch_response = BatchRisksResponse.model_validate(response_data)
             asset_risks_data = batch_response.asset_risks
+
+            # Restore assetId from original assets if LLM returned null
+            asset_lookup = {asset.name: asset for asset in assets}
+            for asset_risk in asset_risks_data:
+                if not asset_risk.assetId:
+                    original_asset = asset_lookup.get(asset_risk.assetName)
+                    if original_asset and original_asset.id:
+                        asset_risk.assetId = original_asset.id
 
             logger.info(
                 "Batch response parsed successfully",
@@ -678,6 +695,121 @@ class RiskGenerator:
             )
 
             return batch_results, prompt_tokens, completion_tokens, response_text
+
+        except RequestTooLargeError as e:
+            # Request too large - use suggested batch size or split in half
+            if e.suggested_batch_size and e.suggested_batch_size < len(assets):
+                # Use suggested batch size from throttle (hybrid approach)
+                suggested = e.suggested_batch_size
+                logger.warning(
+                    f"Request too large, using suggested batch size {suggested} (from {len(assets)} assets)",
+                    extra={
+                        "recursion_level": recursion_level,
+                        "total_assets": len(assets),
+                        "suggested_batch_size": suggested,
+                        "estimated_tokens": e.estimated_tokens,
+                        "model_limit": e.model_limit,
+                        "reason": "request_too_large_suggested",
+                    }
+                )
+
+                # Split into batches of suggested size
+                results_list = []
+                total_prompt_tokens = 0
+                total_completion_tokens = 0
+                last_text = ""
+
+                for i in range(0, len(assets), suggested):
+                    batch = assets[i:i + suggested]
+                    batch_results, p_tokens, c_tokens, text = await self._process_batch_with_recursive_splitting(
+                        assets=batch,
+                        prompt=prompt,
+                        all_threat_names=all_threat_names,
+                        threat_mapping=threat_mapping,
+                        threats_constraint=threats_constraint,
+                        language=language,
+                        sections=sections,
+                        max_threats_per_asset=max_threats_per_asset,
+                        session_id=session_id,
+                        recursion_level=recursion_level + 1,
+                        max_recursion_level=max_recursion_level,
+                    )
+                    results_list.extend(batch_results)
+                    total_prompt_tokens += p_tokens
+                    total_completion_tokens += c_tokens
+                    last_text = text
+
+                return results_list, total_prompt_tokens, total_completion_tokens, last_text
+
+            elif recursion_level < max_recursion_level and len(assets) > 1:
+                # No suggested size or batch_size=1 - split in half (fallback)
+                mid = len(assets) // 2
+                first_half = assets[:mid]
+                second_half = assets[mid:]
+
+                logger.warning(
+                    f"Request too large, splitting {len(assets)} assets into {len(first_half)} + {len(second_half)}",
+                    extra={
+                        "recursion_level": recursion_level,
+                        "total_assets": len(assets),
+                        "first_half_size": len(first_half),
+                        "second_half_size": len(second_half),
+                        "estimated_tokens": e.estimated_tokens,
+                        "model_limit": e.model_limit,
+                        "reason": "request_too_large_split",
+                    }
+                )
+
+                # Recursively process each half
+                results1, tokens1_p, tokens1_c, text1 = await self._process_batch_with_recursive_splitting(
+                    assets=first_half,
+                    prompt=prompt,
+                    all_threat_names=all_threat_names,
+                    threat_mapping=threat_mapping,
+                    threats_constraint=threats_constraint,
+                    language=language,
+                    sections=sections,
+                    max_threats_per_asset=max_threats_per_asset,
+                    session_id=session_id,
+                    recursion_level=recursion_level + 1,
+                    max_recursion_level=max_recursion_level,
+                )
+
+                results2, tokens2_p, tokens2_c, text2 = await self._process_batch_with_recursive_splitting(
+                    assets=second_half,
+                    prompt=prompt,
+                    all_threat_names=all_threat_names,
+                    threat_mapping=threat_mapping,
+                    threats_constraint=threats_constraint,
+                    language=language,
+                    sections=sections,
+                    max_threats_per_asset=max_threats_per_asset,
+                    session_id=session_id,
+                    recursion_level=recursion_level + 1,
+                    max_recursion_level=max_recursion_level,
+                )
+
+                # Combine results
+                combined_results = results1 + results2
+                combined_prompt_tokens = tokens1_p + tokens2_p
+                combined_completion_tokens = tokens1_c + tokens2_c
+                last_text = text2
+
+                return combined_results, combined_prompt_tokens, combined_completion_tokens, last_text
+            else:
+                # Max recursion level reached or single asset - raise error
+                logger.error(
+                    f"Request too large and cannot split further",
+                    extra={
+                        "recursion_level": recursion_level,
+                        "max_recursion_level": max_recursion_level,
+                        "assets_count": len(assets),
+                        "estimated_tokens": e.estimated_tokens,
+                        "model_limit": e.model_limit,
+                        "reason": "request_too_large_cannot_split",
+                    }
+                )
+                raise
 
         except AITimeoutError as e:
             # Timeout - check if we can split or need sequential fallback
@@ -915,7 +1047,7 @@ class RiskGenerator:
         # Add asset_impacts section (specific to risk generator)
         if asset_impacts:
             impacts_json = json.dumps(
-                [ai.model_dump() for ai in asset_impacts],
+                [ai.model_dump(mode='json') for ai in asset_impacts],
                 indent=2,
                 ensure_ascii=False
             )
@@ -1143,7 +1275,7 @@ class RiskGenerator:
                                             )
 
                                             # Single-asset JSON
-                                            assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
+                                            assets_json = json.dumps([asset.model_dump(mode='json')], ensure_ascii=False)
 
                                             # Format prompt for debug preview
                                             messages = prompt.format_messages(
@@ -1288,7 +1420,7 @@ class RiskGenerator:
                                                 )
 
                                                 # Single-asset JSON
-                                                assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
+                                                assets_json = json.dumps([asset.model_dump(mode='json')], ensure_ascii=False)
 
                                                 # Format prompt for debug preview
                                                 messages = prompt.format_messages(
@@ -1532,7 +1664,7 @@ class RiskGenerator:
                             )
 
                             # Single-asset JSON
-                            assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
+                            assets_json = json.dumps([asset.model_dump(mode='json')], ensure_ascii=False)
 
                             # Format prompt for debug preview
                             messages = prompt.format_messages(
@@ -1635,7 +1767,7 @@ class RiskGenerator:
                                 )
 
                                 # Single-asset JSON
-                                assets_json = json.dumps([asset.model_dump()], ensure_ascii=False)
+                                assets_json = json.dumps([asset.model_dump(mode='json')], ensure_ascii=False)
 
                                 # Format prompt for debug preview
                                 messages = prompt.format_messages(

@@ -36,11 +36,13 @@ class OpenAIThrottle:
         self,
         rpm: int,
         tpm: int,
-        max_concurrent: int
+        max_concurrent: int,
+        per_request_limits: Optional[Dict[str, int]] = None
     ):
         self.rpm = rpm
         self.tpm = tpm
         self.max_concurrent = max_concurrent
+        self.per_request_limits = per_request_limits or {}
         self.metrics = ThrottleMetrics()
 
         self._encoder_cache: Dict[str, Any] = {}
@@ -90,24 +92,72 @@ class OpenAIThrottle:
         self,
         messages: list[dict],
         model: str,
-        max_completion_tokens: Optional[int] = None
+        max_completion_tokens: Optional[int] = None,
+        expected_output_tokens: Optional[int] = None
     ) -> int:
         input_tokens = self.count_tokens(messages, model)
 
         if max_completion_tokens:
             output_estimate = max_completion_tokens
+        elif expected_output_tokens:
+            # Use caller's precise output estimate (based on batch_size, max_items, etc.)
+            output_estimate = expected_output_tokens
         else:
-            output_estimate = max(500, int(input_tokens * 0.5))
+            # Fallback: conservative estimate for non-batch calls
+            output_estimate = max(500, int(input_tokens * 0.25))
 
-        return input_tokens + output_estimate
+        total = input_tokens + output_estimate
+
+        # Debug log for large requests
+        if total > 25000:
+            logger.warning(
+                f"Large request detected: {total} tokens (input: {input_tokens}, output estimate: {output_estimate})",
+                extra={
+                    "total_tokens": total,
+                    "input_tokens": input_tokens,
+                    "output_tokens_estimate": output_estimate,
+                    "model": model,
+                    "message_count": len(messages),
+                    "message_lengths": [len(str(m.get('content', ''))) for m in messages],
+                }
+            )
+
+        return total
 
     def update_from_response(self, response) -> None:
+        logger.info(f"update_from_response called with response type: {type(response).__name__}")
+
         try:
-            if hasattr(response, 'headers'):
+            headers = None
+
+            # Try LangChain response_metadata first (with include_response_headers=True)
+            if hasattr(response, 'response_metadata'):
+                metadata = response.response_metadata
+                logger.info(f"Response metadata keys: {list(metadata.keys())}")
+
+                # With include_response_headers=True, headers might be directly in metadata
+                # Check if any rate limit headers exist directly in metadata
+                if any(key.startswith('x-ratelimit') for key in metadata.keys()):
+                    headers = metadata
+                    logger.info(f"Found rate limit headers directly in response_metadata")
+                # Or they might be in a 'headers' sub-dict
+                elif 'headers' in metadata:
+                    headers = metadata['headers']
+                    logger.info(f"Found headers in response_metadata['headers'] with keys: {list(headers.keys())[:5]}")
+                else:
+                    logger.warning("No rate limit headers found in response_metadata")
+            elif hasattr(response, 'headers'):
                 headers = response.headers
+                logger.info(f"Found headers attribute directly")
             elif hasattr(response, '_headers'):
                 headers = response._headers
+                logger.info(f"Found _headers attribute")
             else:
+                logger.warning("Response has no headers, response_metadata, or _headers attribute")
+                return
+
+            if not headers:
+                logger.warning("Headers dict is empty")
                 return
 
             if "x-ratelimit-remaining-requests" in headers:
@@ -124,8 +174,8 @@ class OpenAIThrottle:
                 reset_str = headers["x-ratelimit-reset-tokens"]
                 self.reset_tokens_at = time.time() + self._parse_duration(reset_str)
 
-            logger.debug(
-                f"OpenAI limits: {self.remaining_requests} req, {self.remaining_tokens} tokens remaining"
+            logger.info(
+                f"OpenAI limits updated: {self.remaining_requests} req, {self.remaining_tokens} tokens remaining"
             )
 
         except Exception as e:
@@ -175,12 +225,47 @@ class OpenAIThrottle:
         self,
         messages: list[dict],
         model: str,
-        max_completion_tokens: Optional[int] = None
+        max_completion_tokens: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        expected_output_tokens: Optional[int] = None
     ):
         # Circuit breaker check disabled - pybreaker 1.x has different API
         # Rate limiting is handled by pyrate-limiter below
 
-        estimated_tokens = self.estimate_total_tokens(messages, model, max_completion_tokens)
+        estimated_tokens = self.estimate_total_tokens(
+            messages, model, max_completion_tokens, expected_output_tokens
+        )
+
+        # Check per-request limit for this model
+        if model in self.per_request_limits:
+            model_limit = self.per_request_limits[model]
+            if estimated_tokens > model_limit:
+                # Calculate suggested batch size (90% of optimal for safety margin)
+                suggested_batch_size = None
+                if batch_size and batch_size > 1:
+                    optimal_ratio = model_limit / estimated_tokens
+                    suggested_batch_size = max(1, int(batch_size * optimal_ratio * 0.9))
+
+                logger.warning(
+                    f"Request too large: {estimated_tokens} tokens > {model_limit} limit for {model}",
+                    extra={
+                        "estimated_tokens": estimated_tokens,
+                        "model_limit": model_limit,
+                        "model": model,
+                        "batch_size": batch_size,
+                        "suggested_batch_size": suggested_batch_size
+                    }
+                )
+
+                # Import here to avoid circular dependency
+                from workshops_ai.wizard.exceptions import RequestTooLargeError
+                raise RequestTooLargeError(
+                    estimated_tokens=estimated_tokens,
+                    model_limit=model_limit,
+                    model=model,
+                    current_batch_size=batch_size or 1,
+                    suggested_batch_size=suggested_batch_size
+                )
 
         self.metrics.reset_if_needed()
         self.metrics.total_requests += 1
@@ -244,10 +329,10 @@ class OpenAIThrottle:
 _throttle: Optional[OpenAIThrottle] = None
 
 
-def init_throttle(rpm: int, tpm: int, max_concurrent: int) -> None:
+def init_throttle(rpm: int, tpm: int, max_concurrent: int, per_request_limits: Optional[Dict[str, int]] = None) -> None:
     global _throttle
-    _throttle = OpenAIThrottle(rpm=rpm, tpm=tpm, max_concurrent=max_concurrent)
-    logger.info(f"OpenAI throttle initialized: {rpm} RPM, {tpm} TPM, {max_concurrent} concurrent")
+    _throttle = OpenAIThrottle(rpm=rpm, tpm=tpm, max_concurrent=max_concurrent, per_request_limits=per_request_limits)
+    logger.info(f"OpenAI throttle initialized: {rpm} RPM, {tpm} TPM, {max_concurrent} concurrent, per-request limits: {per_request_limits}")
 
 
 def get_throttle() -> OpenAIThrottle:

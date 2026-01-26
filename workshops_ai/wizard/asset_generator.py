@@ -171,7 +171,7 @@ class AssetGenerator:
         # Previous assets section (for refinement)
         if previous_assets:
             assets_json = json.dumps(
-                [a.model_dump() for a in previous_assets],
+                [a.model_dump(mode='json') for a in previous_assets],
                 indent=2,
                 ensure_ascii=False
             )
