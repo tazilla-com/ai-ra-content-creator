@@ -71,6 +71,59 @@ from workshops_ai.wizard.exceptions import ContentNotFoundError
 
 logger = logging.getLogger(__name__)
 
+
+# =============================================================================
+# Helper: Distinguish quota vs rate limit errors
+# =============================================================================
+
+def _handle_rate_limit_error(e: RateLimitError, session_id: str, endpoint: str) -> HTTPException:
+    """
+    Handle OpenAI RateLimitError by distinguishing between quota and rate limit issues.
+
+    OpenAI returns 429 RateLimitError for two distinct cases:
+    1. Rate limit (too many requests/tokens per minute) - temporary, retry helps
+    2. Quota exceeded (insufficient credits/billing issue) - requires adding credits
+
+    Args:
+        e: The RateLimitError exception from OpenAI
+        session_id: Current session ID for logging
+        endpoint: Endpoint name for logging (e.g., "services", "assets")
+
+    Returns:
+        HTTPException with appropriate status code and user-friendly message
+    """
+    error_msg = str(e).lower()
+
+    # Check if this is a quota/billing issue
+    if "quota" in error_msg or "billing" in error_msg or "current quota" in error_msg:
+        logger.error(
+            "openai_quota_exceeded",
+            extra={
+                "session_id": session_id,
+                "error": str(e),
+                "endpoint": endpoint
+            }
+        )
+        return HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="OpenAI account quota exceeded. Please add credits at https://platform.openai.com/settings/organization/billing"
+        )
+    else:
+        # This is a standard rate limit (too many requests/tokens per minute)
+        logger.error(
+            "openai_rate_limit_exceeded",
+            extra={
+                "session_id": session_id,
+                "error": str(e),
+                "endpoint": endpoint
+            }
+        )
+        return HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
+        )
+
+
 # Router (auth applied in main.py when mounting)
 router = APIRouter(
     prefix="/wizard",
@@ -323,18 +376,7 @@ async def generate_services(
         )
 
     except RateLimitError as e:
-        logger.error(
-            "openai_rate_limit_exceeded",
-            extra={
-                "session_id": session_id,
-                "error": str(e),
-                "endpoint": "services"
-            }
-        )
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
-        )
+        raise _handle_rate_limit_error(e, session_id, "services")
     except Exception as e:
         logger.error(
             "service_generation_failed",
@@ -553,18 +595,7 @@ async def generate_assets(
         )
 
     except RateLimitError as e:
-        logger.error(
-            "openai_rate_limit_exceeded",
-            extra={
-                "session_id": session_id,
-                "error": str(e),
-                "endpoint": "assets"
-            }
-        )
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
-        )
+        raise _handle_rate_limit_error(e, session_id, "assets")
     except Exception as e:
         logger.error(
             "asset_generation_failed",
@@ -792,18 +823,7 @@ async def generate_impacts(
         )
 
     except RateLimitError as e:
-        logger.error(
-            "openai_rate_limit_exceeded",
-            extra={
-                "session_id": session_id,
-                "error": str(e),
-                "endpoint": "impacts"
-            }
-        )
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
-        )
+        raise _handle_rate_limit_error(e, session_id, "impacts")
     except Exception as e:
         logger.error(
             "impact_generation_failed",
@@ -1047,18 +1067,7 @@ async def generate_risks(
         )
 
     except RateLimitError as e:
-        logger.error(
-            "openai_rate_limit_exceeded",
-            extra={
-                "session_id": session_id,
-                "error": str(e),
-                "endpoint": "risks"
-            }
-        )
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
-        )
+        raise _handle_rate_limit_error(e, session_id, "risks")
     except Exception as e:
         logger.error(
             "risk_generation_failed",
@@ -1296,18 +1305,7 @@ async def generate_controls(
         )
 
     except RateLimitError as e:
-        logger.error(
-            "openai_rate_limit_exceeded",
-            extra={
-                "session_id": session_id,
-                "error": str(e),
-                "endpoint": "controls"
-            }
-        )
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
-        )
+        raise _handle_rate_limit_error(e, session_id, "controls")
     except Exception as e:
         logger.error(
             "control_generation_failed",
@@ -1532,19 +1530,7 @@ async def generate_evaluation(
             )
 
     except RateLimitError as e:
-        logger.error(
-            "openai_rate_limit_exceeded",
-            extra={
-                "session_id": session_id,
-                "error": str(e),
-                "endpoint": "evaluation",
-                "step": "services"
-            }
-        )
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
-        )
+        raise _handle_rate_limit_error(e, session_id, "evaluation:services")
     except Exception as e:
         elapsed = int((time.time() - start) * 1000)
         error_msg = f"Services generation failed: {str(e)}"
@@ -1662,19 +1648,7 @@ async def generate_evaluation(
                 )
 
         except RateLimitError as e:
-            logger.error(
-                "openai_rate_limit_exceeded",
-                extra={
-                    "session_id": session_id,
-                    "error": str(e),
-                    "endpoint": "evaluation",
-                    "step": "assets"
-                }
-            )
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
-            )
+            raise _handle_rate_limit_error(e, session_id, "evaluation:assets")
         except Exception as e:
             elapsed = int((time.time() - start) * 1000)
             error_msg = f"Assets generation failed: {str(e)}"
@@ -1756,19 +1730,7 @@ async def generate_evaluation(
                 )
 
         except RateLimitError as e:
-            logger.error(
-                "openai_rate_limit_exceeded",
-                extra={
-                    "session_id": session_id,
-                    "error": str(e),
-                    "endpoint": "evaluation",
-                    "step": "impacts"
-                }
-            )
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
-            )
+            raise _handle_rate_limit_error(e, session_id, "evaluation:impacts")
         except Exception as e:
             elapsed = int((time.time() - start) * 1000)
             error_msg = f"Impacts generation failed: {str(e)}"
@@ -1851,19 +1813,7 @@ async def generate_evaluation(
                 )
 
         except RateLimitError as e:
-            logger.error(
-                "openai_rate_limit_exceeded",
-                extra={
-                    "session_id": session_id,
-                    "error": str(e),
-                    "endpoint": "evaluation",
-                    "step": "risks"
-                }
-            )
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
-            )
+            raise _handle_rate_limit_error(e, session_id, "evaluation:risks")
         except Exception as e:
             elapsed = int((time.time() - start) * 1000)
             error_msg = f"Risks generation failed: {str(e)}"
@@ -1944,19 +1894,7 @@ async def generate_evaluation(
                 )
 
         except RateLimitError as e:
-            logger.error(
-                "openai_rate_limit_exceeded",
-                extra={
-                    "session_id": session_id,
-                    "error": str(e),
-                    "endpoint": "evaluation",
-                    "step": "controls"
-                }
-            )
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
-            )
+            raise _handle_rate_limit_error(e, session_id, "evaluation:controls")
         except Exception as e:
             elapsed = int((time.time() - start) * 1000)
             error_msg = f"Controls generation failed: {str(e)}"
