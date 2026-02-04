@@ -358,6 +358,7 @@ class ImpactGenerator:
         self,
         assets: List[Asset],
         prompt: ChatPromptTemplate,
+        impacts_with_desc: List[Dict[str, str]],
         ordered_catalog_names: List[str],
         impacts_constraint: str,
         language: str,
@@ -371,6 +372,7 @@ class ImpactGenerator:
         Args:
             assets: List of assets to process (1 to max_batch_size)
             prompt: Prompt template
+            impacts_with_desc: Impact catalog with names and descriptions
             ordered_catalog_names: Catalog names for validation
             impacts_constraint: Impacts count constraint text
             language: Output language
@@ -396,10 +398,10 @@ class ImpactGenerator:
         # Create JSON for all assets in batch
         assets_json = json.dumps([a.model_dump(mode='json') for a in assets], ensure_ascii=False)
 
-        # Format messages
+        # Format messages with impact descriptions for better context
         messages = prompt.format_messages(
             assets_json=assets_json,
-            ordered_catalog_names_json=json.dumps(ordered_catalog_names, ensure_ascii=False),
+            ordered_catalog_names_json=json.dumps(impacts_with_desc, ensure_ascii=False, indent=2),
             impacts_constraint=impacts_constraint,
             impacts_json_schema=BATCH_IMPACTS_JSON_SCHEMA,
             language=language,
@@ -540,6 +542,7 @@ class ImpactGenerator:
         self,
         assets: List[Asset],
         prompt: ChatPromptTemplate,
+        impacts_with_desc: List[Dict[str, str]],
         ordered_catalog_names: List[str],
         impacts_constraint: str,
         language: str,
@@ -561,6 +564,7 @@ class ImpactGenerator:
         Args:
             assets: Assets to process in this batch
             prompt: Chat prompt template
+            impacts_with_desc: Impact catalog with names and descriptions
             ordered_catalog_names: Ordered impact catalog names
             impacts_constraint: Impacts constraint text
             language: Output language
@@ -580,6 +584,7 @@ class ImpactGenerator:
             batch_results, prompt_tokens, completion_tokens, response_text = await self._process_assets_batch(
                 assets=assets,
                 prompt=prompt,
+                impacts_with_desc=impacts_with_desc,
                 ordered_catalog_names=ordered_catalog_names,
                 impacts_constraint=impacts_constraint,
                 language=language,
@@ -618,6 +623,7 @@ class ImpactGenerator:
                     batch_results, p_tokens, c_tokens, text = await self._process_batch_with_recursive_splitting(
                         assets=batch,
                         prompt=prompt,
+                        impacts_with_desc=impacts_with_desc,
                         ordered_catalog_names=ordered_catalog_names,
                         impacts_constraint=impacts_constraint,
                         language=language,
@@ -657,6 +663,7 @@ class ImpactGenerator:
                 results1, tokens1_p, tokens1_c, text1 = await self._process_batch_with_recursive_splitting(
                     assets=first_half,
                     prompt=prompt,
+                    impacts_with_desc=impacts_with_desc,
                     ordered_catalog_names=ordered_catalog_names,
                     impacts_constraint=impacts_constraint,
                     language=language,
@@ -670,6 +677,7 @@ class ImpactGenerator:
                 results2, tokens2_p, tokens2_c, text2 = await self._process_batch_with_recursive_splitting(
                     assets=second_half,
                     prompt=prompt,
+                    impacts_with_desc=impacts_with_desc,
                     ordered_catalog_names=ordered_catalog_names,
                     impacts_constraint=impacts_constraint,
                     language=language,
@@ -725,6 +733,7 @@ class ImpactGenerator:
                 results1, tokens1_p, tokens1_c, text1 = await self._process_batch_with_recursive_splitting(
                     assets=first_half,
                     prompt=prompt,
+                    impacts_with_desc=impacts_with_desc,
                     ordered_catalog_names=ordered_catalog_names,
                     impacts_constraint=impacts_constraint,
                     language=language,
@@ -738,6 +747,7 @@ class ImpactGenerator:
                 results2, tokens2_p, tokens2_c, text2 = await self._process_batch_with_recursive_splitting(
                     assets=second_half,
                     prompt=prompt,
+                    impacts_with_desc=impacts_with_desc,
                     ordered_catalog_names=ordered_catalog_names,
                     impacts_constraint=impacts_constraint,
                     language=language,
@@ -866,6 +876,7 @@ class ImpactGenerator:
         user_instructions: Optional[str] = None,
         session_id: Optional[str] = None,
         include_catalogs: Optional[List[str]] = None,
+        org_metadata: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[AssetImpact], UsageMetrics, Dict[str, Any]]:
         """
         Generate impact evaluations for each asset.
@@ -907,8 +918,10 @@ class ImpactGenerator:
         # Initialize prompt context builder with session-based caching
         builder = PromptContextBuilder(session_id=session_id)
 
-        # Load impact catalog (already localized by Tazilla backend if using API)
-        ordered_catalog_names = await builder.get_catalog_names("impacts")
+        # Load impact catalog with descriptions (already localized by Tazilla backend if using API)
+        impacts_with_desc = await builder.get_catalog_with_descriptions("impacts")
+        # Extract names for validation
+        ordered_catalog_names = [imp["name"] for imp in impacts_with_desc]
         allowed_names_set = set(ordered_catalog_names)
 
         # Build shared prompt sections using centralized builder
@@ -945,12 +958,17 @@ class ImpactGenerator:
         if langfuse_client and session_id:
             from langfuse import propagate_attributes
 
+            # Merge org metadata into span metadata
+            span_metadata = {"endpoint": "impacts", "model": self.model_name}
+            if org_metadata:
+                span_metadata.update(org_metadata)
+
             with langfuse_client.start_as_current_span(
                 name="generate-impacts",
                 input=span_input,
-                metadata={"endpoint": "impacts", "model": self.model_name},
+                metadata=span_metadata,
             ) as main_span:
-                with propagate_attributes(session_id=session_id):
+                with propagate_attributes(session_id=session_id, metadata=org_metadata):
                     # Fetch prompt with child span
                     requested_label = self.settings.langfuse.prompt_label
                     with langfuse_client.start_as_current_span(
@@ -1063,6 +1081,7 @@ class ImpactGenerator:
                                 batch_results, batch_prompt_tokens, batch_completion_tokens, batch_response_text = await self._process_batch_with_recursive_splitting(
                                     assets=batch_assets,
                                     prompt=prompt,
+                                    impacts_with_desc=impacts_with_desc,
                                     ordered_catalog_names=ordered_catalog_names,
                                     impacts_constraint=impacts_constraint,
                                     language=language,
@@ -1465,6 +1484,7 @@ class ImpactGenerator:
                     batch_results, batch_prompt_tokens, batch_completion_tokens, batch_response_text = await self._process_assets_batch(
                         assets=batch_assets,
                         prompt=prompt,
+                        impacts_with_desc=impacts_with_desc,
                         ordered_catalog_names=ordered_catalog_names,
                         impacts_constraint=impacts_constraint,
                         language=language,

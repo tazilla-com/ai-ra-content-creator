@@ -617,8 +617,13 @@ def load_asset_type_threat_mapping() -> Dict[str, List[str]]:
     for r in rows:
         asset_type = (r.get("Asset type") or "").strip()
         threat = (r.get("Threat") or "").strip()
+        value = (r.get("Value") or "").strip().upper()
 
         if not asset_type or not threat:
+            continue
+
+        # Only include threats where Value = TRUE
+        if value != "TRUE":
             continue
 
         if asset_type not in threat_mapping:

@@ -354,46 +354,46 @@ class RiskGenerator:
         asset: Asset,
         all_threat_names: List[str],
         threat_mapping: Dict[str, List[str]],
-        max_threats: int = 20,
     ) -> List[str]:
         """
         Select relevant threats for an asset using AssetType→Threat mapping.
 
-        If mapping exists for the asset type, use it (limited to max_threats).
-        Otherwise, use all threats (but still limit to max_threats for performance).
+        If mapping exists for the asset type, use all mapped threats.
+        Otherwise, use all catalog threats.
 
         Args:
             asset: Asset to evaluate
             all_threat_names: All threat names from catalog
             threat_mapping: AssetType→Threat mapping
-            max_threats: Maximum number of threats to evaluate (default 20)
 
         Returns:
-            List of relevant threat names (subset of catalog)
+            List of relevant threat names
         """
         # Get relevant threats from mapping
         relevant = threat_mapping.get(asset.assetType, [])
 
         if relevant:
-            # Use threat mapping, limit to max_threats
-            selected = relevant[:max_threats]
+            # Use all mapped threats (no limit)
+            selected = relevant
             logger.info(
-                f"Using {len(selected)} mapped threats for asset type '{asset.assetType}'",
+                f"Using {len(selected)} mapped threats for asset type '{asset.assetType}' (from {len(relevant)} available)",
                 extra={
                     "asset_name": asset.name,
                     "asset_type": asset.assetType,
-                    "threats_count": len(selected),
+                    "threats_available": len(relevant),
+                    "threats_selected": len(selected),
                 }
             )
         else:
-            # No mapping found, use first max_threats from catalog
-            selected = all_threat_names[:max_threats]
+            # No mapping found, use all catalog threats
+            selected = all_threat_names
             logger.warning(
-                f"No threat mapping for asset type '{asset.assetType}', using first {len(selected)} catalog threats",
+                f"No threat mapping for asset type '{asset.assetType}', using all {len(selected)} catalog threats",
                 extra={
                     "asset_name": asset.name,
                     "asset_type": asset.assetType,
-                    "threats_count": len(selected),
+                    "threats_available": len(all_threat_names),
+                    "threats_selected": len(selected),
                 }
             )
 
@@ -455,7 +455,6 @@ class RiskGenerator:
                 asset=asset,
                 all_threat_names=all_threat_names,
                 threat_mapping=threat_mapping,
-                max_threats=max_threats_per_asset,
             )
             batch_threats_set.update(relevant_threats)
 
@@ -980,6 +979,7 @@ class RiskGenerator:
         user_instructions: Optional[str] = None,
         session_id: Optional[str] = None,
         include_catalogs: Optional[List[str]] = None,
+        org_metadata: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[AssetRisk], UsageMetrics, Dict[str, Any]]:
         """
         Generate risk evaluations for each asset.
@@ -1079,12 +1079,17 @@ class RiskGenerator:
         if langfuse_client and session_id:
             from langfuse import propagate_attributes
 
+            # Merge org metadata into span metadata
+            span_metadata = {"endpoint": "risks", "model": self.model_name}
+            if org_metadata:
+                span_metadata.update(org_metadata)
+
             with langfuse_client.start_as_current_span(
                 name="generate-risks",
                 input=span_input,
-                metadata={"endpoint": "risks", "model": self.model_name},
+                metadata=span_metadata,
             ) as main_span:
-                with propagate_attributes(session_id=session_id):
+                with propagate_attributes(session_id=session_id, metadata=org_metadata):
                     # Fetch prompt with child span
                     requested_label = self.settings.langfuse.prompt_label
                     with langfuse_client.start_as_current_span(
@@ -1271,7 +1276,6 @@ class RiskGenerator:
                                                 asset=asset,
                                                 all_threat_names=all_threat_names,
                                                 threat_mapping=threat_mapping,
-                                                max_threats=max_threats_per_asset,
                                             )
 
                                             # Single-asset JSON
@@ -1660,7 +1664,6 @@ class RiskGenerator:
                                 asset=asset,
                                 all_threat_names=all_threat_names,
                                 threat_mapping=threat_mapping,
-                                max_threats=max_threats_per_asset,
                             )
 
                             # Single-asset JSON
@@ -1763,7 +1766,6 @@ class RiskGenerator:
                                     asset=asset,
                                     all_threat_names=all_threat_names,
                                     threat_mapping=threat_mapping,
-                                    max_threats=max_threats_per_asset,
                                 )
 
                                 # Single-asset JSON

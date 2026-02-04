@@ -384,6 +384,7 @@ class ServiceGenerator:
         previous_services: Optional[List[Service]] = None,
         session_id: Optional[str] = None,
         include_catalogs: Optional[List[str]] = None,
+        org_metadata: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[Service], UsageMetrics, Dict[str, Any]]:
         """
         Generate services from website content.
@@ -467,15 +468,20 @@ class ServiceGenerator:
                 "website_content_length": len(website_content) if website_content else 0,
             }
 
+            # Merge org metadata into span metadata
+            span_metadata = {
+                "endpoint": "services",
+                "model": self.model_name,
+            }
+            if org_metadata:
+                span_metadata.update(org_metadata)
+
             with langfuse_client.start_as_current_span(
                 name="generate-services",
                 input=span_input,
-                metadata={
-                    "endpoint": "services",
-                    "model": self.model_name,
-                },
+                metadata=span_metadata,
             ) as main_span:
-                with propagate_attributes(session_id=session_id):
+                with propagate_attributes(session_id=session_id, metadata=org_metadata):
                     # Fetch prompt with child span
                     requested_label = self.settings.langfuse.prompt_label
                     with langfuse_client.start_as_current_span(

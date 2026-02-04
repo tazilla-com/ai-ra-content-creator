@@ -136,6 +136,10 @@ async def _get_website_via_search_impl(
         base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else url
         domain = parsed.netloc if parsed.netloc else parsed.path.split('/')[0]
 
+        # Normalize domain: remove www prefix for consistent filtering
+        if domain.startswith('www.'):
+            domain = domain[4:]
+
         if not domain:
             raise AIResponseError(
                 f"Could not extract domain from URL: {url}",

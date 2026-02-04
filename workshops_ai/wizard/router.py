@@ -58,6 +58,7 @@ from workshops_ai.wizard.session import (
     clear_wizard_state,
     validate_session_id,
 )
+from workshops_ai.session import get_session, update_session
 from workshops_ai.wizard.llm_helper import call_llm_with_structured_output
 # Note: Old placeholder prompts (SERVICES_PROMPT, etc.) are not used in new implementation
 # New implementation uses ServiceGenerator with prompts from prompts.py
@@ -122,6 +123,35 @@ def _handle_rate_limit_error(e: RateLimitError, session_id: str, endpoint: str) 
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="OpenAI rate limit exceeded. Please try again in a moment or use a smaller batch."
         )
+
+
+async def _get_org_metadata(session_id: str) -> dict:
+    """
+    Extract organization metadata from session for Langfuse traces.
+
+    Returns dict with:
+    - organization_name: Organization name if available
+    - organization_url: Website URL if available
+
+    Args:
+        session_id: Current session ID
+
+    Returns:
+        Dict with org metadata (empty if no org data available)
+    """
+    org_metadata = {}
+
+    session = await get_session(session_id)
+    if session:
+        # Add organization name if available
+        if session.organization and session.organization.organizationName:
+            org_metadata["organization_name"] = session.organization.organizationName
+
+        # Add website URL if available
+        if session.wizard_metadata.get("website_url"):
+            org_metadata["organization_url"] = session.wizard_metadata["website_url"]
+
+    return org_metadata
 
 
 # Router (auth applied in main.py when mounting)
@@ -329,10 +359,12 @@ async def generate_services(
                 extra={"session_id": session_id, "endpoint": "services"}
             )
 
-    # Step 2: Build organization profile from request
+    # Step 2: Build organization profile from request and save to session
     organization_profile = None
     if request.organization_profile:
         organization_profile = request.organization_profile.model_dump()
+        # Save organization to session for persistence across wizard steps
+        await update_session(session_id, {"organization": request.organization_profile})
 
     # Step 3: Load previous services from request or session (if refining)
     previous_services = request.previous_services
@@ -352,6 +384,9 @@ async def generate_services(
                 }
             )
 
+    # Step 3.5: Extract organization metadata for Langfuse traces
+    org_metadata = await _get_org_metadata(session_id)
+
     # Step 4: Generate services with LLM
     try:
         services, usage_metrics, debug_info = await service_generator.generate_services(
@@ -363,6 +398,7 @@ async def generate_services(
             user_instructions=request.user_instructions,
             previous_services=previous_services,
             session_id=session_id,
+            org_metadata=org_metadata,
         )
 
         logger.info(
@@ -547,10 +583,12 @@ async def generate_assets(
                 extra={"session_id": session_id, "endpoint": "assets"}
             )
 
-    # Step 3: Build organization profile from request
+    # Step 3: Build organization profile from request and save to session
     organization_profile = None
     if request.organization_profile:
         organization_profile = request.organization_profile.model_dump()
+        # Save organization to session for persistence across wizard steps
+        await update_session(session_id, {"organization": request.organization_profile})
 
     # Step 4: Load previous assets from session (if refining)
     previous_assets = request.previous_assets
@@ -570,6 +608,9 @@ async def generate_assets(
                 }
             )
 
+    # Step 4.5: Extract organization metadata for Langfuse traces
+    org_metadata = await _get_org_metadata(session_id)
+
     # Step 5: Generate assets with LLM
     try:
         assets, usage_metrics, debug_info = await asset_generator.generate_assets(
@@ -582,6 +623,7 @@ async def generate_assets(
             user_instructions=request.user_instructions,
             previous_assets=previous_assets,
             session_id=session_id,
+            org_metadata=org_metadata,
         )
 
         logger.info(
@@ -792,10 +834,15 @@ async def generate_impacts(
                 extra={"session_id": session_id, "endpoint": "impacts"}
             )
 
-    # Step 3: Build organization profile from request
+    # Step 3: Build organization profile from request and save to session
     organization_profile = None
     if request.organization_profile:
         organization_profile = request.organization_profile.model_dump()
+        # Save organization to session for persistence across wizard steps
+        await update_session(session_id, {"organization": request.organization_profile})
+
+    # Step 3.5: Extract organization metadata for Langfuse traces
+    org_metadata = await _get_org_metadata(session_id)
 
     # Step 4: Generate impact evaluations with LLM
     try:
@@ -809,6 +856,7 @@ async def generate_impacts(
             services=services,
             user_instructions=request.user_instructions,
             session_id=session_id,
+            org_metadata=org_metadata,
         )
 
         logger.info(
@@ -1035,10 +1083,15 @@ async def generate_risks(
                 extra={"session_id": session_id, "endpoint": "risks"}
             )
 
-    # Step 4: Build organization profile from request
+    # Step 4: Build organization profile from request and save to session
     organization_profile = None
     if request.organization_profile:
         organization_profile = request.organization_profile.model_dump()
+        # Save organization to session for persistence across wizard steps
+        await update_session(session_id, {"organization": request.organization_profile})
+
+    # Step 4.5: Extract organization metadata for Langfuse traces
+    org_metadata = await _get_org_metadata(session_id)
 
     # Step 5: Generate risk evaluations with LLM
     try:
@@ -1053,6 +1106,7 @@ async def generate_risks(
             asset_impacts=asset_impacts,
             user_instructions=request.user_instructions,
             session_id=session_id,
+            org_metadata=org_metadata,
         )
 
         logger.info(
@@ -1233,10 +1287,12 @@ async def generate_controls(
             detail="No asset risks provided and none found in session. Run /wizard/risks first."
         )
 
-    # Step 3: Build organization profile from request (optional)
+    # Step 3: Build organization profile from request and save to session (optional)
     organization_profile = None
     if request.organization_profile:
         organization_profile = request.organization_profile.model_dump()
+        # Save organization to session for persistence across wizard steps
+        await update_session(session_id, {"organization": request.organization_profile})
 
     # Step 3.5: Resolve website content (scraping or AI search)
     redis = await get_redis()
@@ -1280,6 +1336,9 @@ async def generate_controls(
                 extra={"session_id": session_id, "endpoint": "controls"}
             )
 
+    # Step 3.5: Extract organization metadata for Langfuse traces
+    org_metadata = await _get_org_metadata(session_id)
+
     # Step 4: Generate control recommendations with LLM
     try:
         asset_controls, usage_metrics, debug_info = await control_generator.generate_asset_controls(
@@ -1291,6 +1350,7 @@ async def generate_controls(
             website_content=website_content,
             user_instructions=request.user_instructions,
             session_id=session_id,
+            org_metadata=org_metadata,
         )
 
         logger.info(
@@ -1425,10 +1485,15 @@ async def generate_evaluation(
     redis = await get_redis()
     content_resolver = ContentResolver(redis)
 
-    # Build organization profile once
+    # Build organization profile once and save to session
     organization_profile = None
     if request.organization_profile:
         organization_profile = request.organization_profile.model_dump()
+        # Save organization to session for persistence across wizard steps
+        await update_session(session_id, {"organization": request.organization_profile})
+
+    # Extract organization metadata for Langfuse traces
+    org_metadata = await _get_org_metadata(session_id)
 
     # ==========================================================================
     # Step 1: Services
@@ -1503,6 +1568,7 @@ async def generate_evaluation(
                 user_instructions=None,  # Not exposed in evaluation mode
                 previous_services=None,
                 session_id=session_id,
+                org_metadata=org_metadata,
             )
 
             results.services = services
@@ -1621,6 +1687,7 @@ async def generate_evaluation(
                     user_instructions=None,
                     previous_assets=None,
                     session_id=session_id,
+                    org_metadata=org_metadata,
                 )
 
                 results.assets = assets
@@ -1703,6 +1770,7 @@ async def generate_evaluation(
                     services=results.services,
                     user_instructions=None,
                     session_id=session_id,
+                    org_metadata=org_metadata,
                 )
 
                 results.asset_impacts = asset_impacts
@@ -1786,6 +1854,7 @@ async def generate_evaluation(
                     asset_impacts=results.asset_impacts,
                     user_instructions=None,
                     session_id=session_id,
+                    org_metadata=org_metadata,
                 )
 
                 results.asset_risks = asset_risks
@@ -1867,6 +1936,7 @@ async def generate_evaluation(
                     max_controls_per_asset=request.max_controls_per_asset,
                     user_instructions=None,
                     session_id=session_id,
+                    org_metadata=org_metadata,
                 )
 
                 results.asset_controls = asset_controls

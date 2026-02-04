@@ -209,7 +209,9 @@ Analyze this organization and identify IT and business assets that support their
 {count_constraint}
 
 Language: Asset names and descriptions in {language} language.
-Asset types: Must be selected exactly as listed (in English): {asset_types}
+
+Available asset types (select type from "name" field exactly as listed; descriptions provided for context):
+{asset_types}
 
 {organization_profile_section}
 
@@ -335,7 +337,7 @@ Single asset to evaluate:
 
 {website_content_section}
 
-Available impacts catalog (select most relevant):
+Available impacts catalog (select impact name from "name" field; descriptions provided for context):
 {ordered_catalog_names_json}
 
 {impacts_constraint}

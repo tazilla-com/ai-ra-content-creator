@@ -1179,6 +1179,7 @@ class ControlGenerator:
         user_instructions: Optional[str] = None,
         session_id: Optional[str] = None,
         include_catalogs: Optional[List[str]] = None,
+        org_metadata: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[AssetControls], UsageMetrics, Dict[str, Any]]:
         """
         Generate control recommendations for each asset.
@@ -1264,12 +1265,17 @@ class ControlGenerator:
         if langfuse_client and session_id:
             from langfuse import propagate_attributes
 
+            # Merge org metadata into span metadata
+            span_metadata = {"endpoint": "controls", "model": self.model_name}
+            if org_metadata:
+                span_metadata.update(org_metadata)
+
             with langfuse_client.start_as_current_span(
                 name="generate-controls",
                 input=span_input,
-                metadata={"endpoint": "controls", "model": self.model_name},
+                metadata=span_metadata,
             ) as main_span:
-                with propagate_attributes(session_id=session_id):
+                with propagate_attributes(session_id=session_id, metadata=org_metadata):
                     # Fetch prompt with child span
                     requested_label = self.settings.langfuse.prompt_label
                     with langfuse_client.start_as_current_span(

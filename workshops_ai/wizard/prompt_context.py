@@ -385,6 +385,35 @@ class PromptContextBuilder:
             logger.warning(f"Unknown catalog type: {catalog_type}")
             return []
 
+    async def get_catalog_with_descriptions(self, catalog_type: str) -> List[Dict[str, str]]:
+        """
+        Get catalog items with names and descriptions.
+
+        Args:
+            catalog_type: Type of catalog ("impacts" or "asset_types")
+
+        Returns:
+            List of dicts with "name" and "description" keys
+        """
+        if catalog_type == "impacts":
+            impacts = await self._get_cached_catalog(
+                "impacts",
+                self.provider.load_impact_catalog
+            )
+            return [{"name": imp.name, "description": imp.description} for imp in impacts]
+
+        elif catalog_type == "asset_types":
+            asset_types_data = await self._get_cached_catalog(
+                "asset_types",
+                self.provider.load_asset_type_catalog
+            )
+            # asset_types_data is already a list of dicts with name, description, isDependent
+            return [{"name": at["name"], "description": at["description"]} for at in asset_types_data]
+
+        else:
+            logger.warning(f"Unknown catalog type for descriptions: {catalog_type}")
+            return []
+
     async def clear_catalog_cache(self):
         """Clear all cached catalogs for current session."""
         if not self.session_id:

@@ -526,6 +526,7 @@ class AssetGenerator:
         user_instructions: Optional[str] = None,
         previous_assets: Optional[List[Asset]] = None,
         session_id: Optional[str] = None,
+        org_metadata: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[Asset], UsageMetrics, Dict[str, Any]]:
         """
         Generate assets from website content and services.
@@ -550,10 +551,15 @@ class AssetGenerator:
             AIResponseError: If response cannot be parsed
         """
 
-        # Extract allowed asset types from Asset model
-        allowed_asset_types = self._allowed_asset_types_from_model()
-        if not allowed_asset_types:
+        # Extract allowed asset types from Asset model (for validation)
+        allowed_asset_type_names = self._allowed_asset_types_from_model()
+        if not allowed_asset_type_names:
             raise RuntimeError("Failed to extract asset types from Asset model")
+
+        # Load asset types with descriptions from catalog (for prompt context)
+        from workshops_ai.wizard.prompt_context import PromptContextBuilder
+        builder = PromptContextBuilder(session_id=session_id)
+        asset_types_with_desc = await builder.get_catalog_with_descriptions("asset_types")
 
         # Build prompt sections
         sections = self._build_prompt_sections(
@@ -579,7 +585,7 @@ class AssetGenerator:
             language=language,
             min_count=min_assets,
             max_count=max_assets,
-            asset_types=allowed_asset_types,
+            asset_types=allowed_asset_type_names,
             sections=sections
         )
 
@@ -595,7 +601,7 @@ class AssetGenerator:
                 "language": language,
                 "min_assets": min_assets,
                 "max_assets": max_assets,
-                "allowed_asset_types_count": len(allowed_asset_types),
+                "allowed_asset_types_count": len(allowed_asset_type_names),
                 "organization_profile": organization_profile,
                 "user_instructions_preview": user_instructions[:100] + "..." if user_instructions and len(user_instructions) > 100 else user_instructions,
                 "has_previous_assets": bool(previous_assets),
@@ -604,15 +610,20 @@ class AssetGenerator:
                 "website_content_length": len(website_content) if website_content else 0,
             }
 
+            # Merge org metadata into span metadata
+            span_metadata = {
+                "endpoint": "assets",
+                "model": self.model_name,
+            }
+            if org_metadata:
+                span_metadata.update(org_metadata)
+
             with langfuse_client.start_as_current_span(
                 name="generate-assets",
                 input=span_input,
-                metadata={
-                    "endpoint": "assets",
-                    "model": self.model_name,
-                },
+                metadata=span_metadata,
             ) as main_span:
-                with propagate_attributes(session_id=session_id):
+                with propagate_attributes(session_id=session_id, metadata=org_metadata):
                     # Fetch prompt with child span
                     with langfuse_client.start_as_current_span(
                         name="get-assets-prompts",
@@ -688,12 +699,15 @@ class AssetGenerator:
 
                     # Call LLM with retry logic
                     try:
+                        # Format asset types with descriptions as JSON for better LLM understanding
+                        asset_types_json = json.dumps(asset_types_with_desc, ensure_ascii=False, indent=2)
+
                         response_text, usage_metrics = await self._call_llm_with_retry(
                             prompt=prompt,
                             session_id=session_id,
                             count_constraint=count_constraint,
                             language=language,
-                            asset_types=", ".join(allowed_asset_types),
+                            asset_types=asset_types_json,
                             assets_json_schema=ASSETS_JSON_SCHEMA,
                             **sections
                         )
@@ -721,14 +735,14 @@ class AssetGenerator:
                             name="parse-and-validate-assets",
                             input={
                                 "response_json": response_json if isinstance(response_json, dict) else {"assets_count": len(response_json)},
-                                "allowed_asset_types_count": len(allowed_asset_types),
+                                "allowed_asset_types_count": len(allowed_asset_type_names),
                                 "raw_assets_count": raw_assets_count,
                             }
                         ) as parse_span:
                             try:
                                 assets = self._parse_and_validate_assets(
                                     response_text=response_text,
-                                    allowed_asset_types=allowed_asset_types
+                                    allowed_asset_types=allowed_asset_type_names
                                 )
 
                                 # Apply max limit if specified
@@ -773,7 +787,7 @@ class AssetGenerator:
                             "prompt_text": prompt_text,
                             "response_text": response_text[:500],  # Truncate for logging
                             "assets_count": len(assets),
-                            "allowed_asset_types": allowed_asset_types,
+                            "allowed_asset_types": allowed_asset_type_names,
                         }
 
                         logger.info(
@@ -815,12 +829,15 @@ class AssetGenerator:
 
             # Call LLM with retry logic
             try:
+                # Format asset types with descriptions as JSON for better LLM understanding
+                asset_types_json = json.dumps(asset_types_with_desc, ensure_ascii=False, indent=2)
+
                 response_text, usage_metrics = await self._call_llm_with_retry(
                     prompt=prompt,
                     session_id=session_id,
                     count_constraint=count_constraint,
                     language=language,
-                    asset_types=", ".join(allowed_asset_types),
+                    asset_types=asset_types_json,
                     assets_json_schema=ASSETS_JSON_SCHEMA,
                     **sections
                 )
@@ -828,7 +845,7 @@ class AssetGenerator:
                 # Parse and validate
                 assets = self._parse_and_validate_assets(
                     response_text=response_text,
-                    allowed_asset_types=allowed_asset_types
+                    allowed_asset_types=allowed_asset_type_names
                 )
 
                 # Apply max limit if specified
