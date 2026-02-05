@@ -114,6 +114,9 @@ async def _scrape_website_impl(
                 ai_model=None,  # Use default from settings.wizard.web_search_model
             )
 
+            # Extract sources from debug_info
+            sources = debug_info.get("sources", [])
+
             logger.info(
                 "scrape_website_success_web_search",
                 extra={
@@ -122,12 +125,14 @@ async def _scrape_website_impl(
                     "model": usage_metrics.model,
                     "tokens": usage_metrics.total_tokens,
                     "cost_usd": usage_metrics.cost_usd,
+                    "num_sources": len(sources),
                 }
             )
 
             return ScrapeWebsiteOutput(
                 url=request.url,
                 content=content,
+                sources=sources,
             )
 
         else:

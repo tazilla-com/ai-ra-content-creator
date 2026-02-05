@@ -30,7 +30,7 @@ class Organization(BaseModel):
     """
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    organizationName: str            = Field(...,  description="Official name of the organization.")
+    organizationName: Optional[str]  = Field(None, description="Official name of the organization.")
     legalForm: Optional[str]         = Field(None, description="Localized legal form of the organization (e.g., s.r.o., Inc.).")
     registeredOffice: Optional[str]  = Field(None, description="Official registered address of the organization.")
     country: Optional[str]           = Field(None, description="International country code of the registered office for regulatory context.")

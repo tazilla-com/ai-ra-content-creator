@@ -200,6 +200,7 @@ class ScrapeWebsiteOutput(BaseModel):
     """Output from website scraping - compatible with both scrape and web_search methods."""
     url: str = Field(..., description="Website URL (final URL after redirects)")
     content: str = Field(..., description="Combined scraped content from all pages")
+    sources: Optional[List[str]] = Field(None, description="List of source URLs consulted during web search (only available for web_search method)")
 
 
 # ===================================================================================

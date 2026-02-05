@@ -45,7 +45,7 @@ async def get_website_via_search(
         ai_model: Optional AI model to use for search (defaults to settings.wizard.web_search_model)
 
     Returns:
-        Tuple of (synthesized content, usage metrics, debug info dict)
+        Tuple of (synthesized content, usage metrics, debug info dict with sources)
 
     Raises:
         AITimeoutError: If web search times out
@@ -186,7 +186,7 @@ async def _get_website_via_search_impl(
         "web_search_calling_openai",
         extra={
             "model": model,
-            "domain_filter": domain,
+            "url": url,
             "timeout_sec": settings.wizard.web_search_timeout_sec,
             "prompt_source": prompt_source,
         }
@@ -198,13 +198,12 @@ async def _get_website_via_search_impl(
             model=model,
             tools=[
                 {
-                    "type": "web_search",
-                    "filters": {
-                        "allowed_domains": [domain]  # Restrict to target domain only
-                    }
+                    "type": "web_search"
+                    # No domain restrictions - search anywhere on the web
                 }
             ],
             input=task_prompt,
+            include=["web_search_call.action.sources"],  # Request sources field
         )
 
         logger.debug(
@@ -273,6 +272,30 @@ async def _get_website_via_search_impl(
 
     # Extract text content without citations using output_text
     message = response.output_text
+
+    # Extract sources from web_search_call output item
+    sources = []
+    if hasattr(response, 'output') and response.output:
+        for output_item in response.output:
+            if hasattr(output_item, 'type') and output_item.type == 'web_search_call':
+                if hasattr(output_item, 'action') and hasattr(output_item.action, 'sources'):
+                    raw_sources = output_item.action.sources or []
+                    # Extract URL from each ActionSearchSource object
+                    for source in raw_sources:
+                        if hasattr(source, 'url'):
+                            sources.append(source.url)
+                    break
+
+    if sources:
+        logger.info(
+            "web_search_sources_extracted",
+            extra={
+                "url": url,
+                "model": model,
+                "num_sources": len(sources),
+                "sources": sources[:10],  # Log first 10 sources
+            }
+        )
 
     if not message:
         logger.warning(
@@ -348,6 +371,8 @@ async def _get_website_via_search_impl(
         "content_length": len(limited_content),
         "original_content_length": len(clean_content),
         "response_preview": limited_content[:500],
+        "sources": sources,  # List of URLs consulted during web search
+        "num_sources": len(sources),
     }
 
     logger.info(
@@ -358,6 +383,7 @@ async def _get_website_via_search_impl(
             "content_length": len(limited_content),
             "tokens": usage_metrics.total_tokens,
             "cost_usd": usage_metrics.cost_usd,
+            "num_sources": len(sources),
         }
     )
 

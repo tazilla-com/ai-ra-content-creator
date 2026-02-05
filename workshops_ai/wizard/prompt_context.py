@@ -205,7 +205,7 @@ class PromptContextBuilder:
             logger.debug(f"Auto-loading all catalogs for session {self.session_id}")
 
         # Organization profile section
-        if organization_profile:
+        if organization_profile and organization_profile.get("organizationName"):
             profile_json = json.dumps(organization_profile, ensure_ascii=False, indent=2)
             sections["organization_profile_section"] = (
                 f"Organization profile (optional JSON):\n{profile_json}\n"
