@@ -461,6 +461,10 @@ class WizardSettings(BaseModel):
         default="gpt-4o",
         description="OpenAI model for web search (requires gpt-4o or newer)"
     )
+    web_search_reasoning_effort: Optional[str] = Field(
+        default=None,
+        description="Reasoning effort for web search with reasoning models (gpt-5, o1, etc): 'low', 'medium', 'high', or None for non-reasoning models"
+    )
     web_search_timeout_sec: int = Field(
         default=120,
         description="Timeout for web search API calls (seconds) - AI web search can take longer"

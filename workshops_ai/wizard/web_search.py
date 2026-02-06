@@ -8,9 +8,11 @@ alternative to traditional BeautifulSoup scraping.
 
 Key Features:
 - AI decides what to search for and synthesizes results
-- Domain-filtered to restrict search to target domain only
+- No domain restrictions - searches anywhere on the web
+- Supports agentic search with reasoning models (gpt-5, o1, etc)
 - Returns structured content compatible with ContentResolver
 - Single comprehensive call (no pagination)
+- Extracts and returns all source URLs consulted
 """
 from __future__ import annotations
 
@@ -132,6 +134,10 @@ async def _get_website_via_search_impl(
 
     # Parse URL and extract domain for filtering
     try:
+        # Add https:// if scheme is missing
+        if not url.startswith(('http://', 'https://')):
+            url = f"https://{url}"
+
         parsed = urlparse(url)
         base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else url
         domain = parsed.netloc if parsed.netloc else parsed.path.split('/')[0]
@@ -180,7 +186,8 @@ async def _get_website_via_search_impl(
     model = settings.wizard.web_search_model  # Always use configured model, ignore ai_model parameter
 
     # Construct search prompt from template (either Langfuse or local)
-    task_prompt = task_prompt_template.format(url=url)
+    # Use base_url (with scheme) for clarity to AI model
+    task_prompt = task_prompt_template.format(url=base_url)
 
     logger.debug(
         "web_search_calling_openai",
@@ -194,17 +201,31 @@ async def _get_website_via_search_impl(
 
     # Call OpenAI Responses API with web search tool
     try:
-        response = await client.responses.create(
-            model=model,
-            tools=[
+        # Build request parameters
+        request_params = {
+            "model": model,
+            "tools": [
                 {
                     "type": "web_search"
                     # No domain restrictions - search anywhere on the web
                 }
             ],
-            input=task_prompt,
-            include=["web_search_call.action.sources"],  # Request sources field
-        )
+            "input": task_prompt,
+            "include": ["web_search_call.action.sources"],  # Request sources field
+        }
+
+        # Add reasoning parameter for reasoning models (gpt-5, o1, etc)
+        if settings.wizard.web_search_reasoning_effort:
+            request_params["reasoning"] = {"effort": settings.wizard.web_search_reasoning_effort}
+            logger.info(
+                "web_search_using_reasoning",
+                extra={
+                    "model": model,
+                    "reasoning_effort": settings.wizard.web_search_reasoning_effort,
+                }
+            )
+
+        response = await client.responses.create(**request_params)
 
         logger.debug(
             "web_search_response_received",
