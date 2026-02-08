@@ -221,7 +221,7 @@ class LLMSettings(BaseModel):
     LLM client configuration used by agents.
 
     Canonical (nested) ENV:
-      WORKSHOPS_AI_LLM__MODEL=gpt-4o-mini
+      WORKSHOPS_AI_LLM__MODEL=gpt-5-mini
       WORKSHOPS_AI_LLM__TEMPERATURE=0.2
       WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC=60
       WORKSHOPS_AI_LLM__OPENAI_MAX_RETRIES=3
@@ -230,7 +230,7 @@ class LLMSettings(BaseModel):
     Legacy (flat) ENV handled in AppSettings.model_post_init():
       LLM_MODEL, LLM_TEMPERATURE, OPENAI_API_KEY
     """
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-5-mini"
     temperature: float = 0.2
     http_timeout_sec: int = 240
     openai_max_retries: int = 3
@@ -612,7 +612,7 @@ class AppSettings(BaseSettings):
       WORKSHOPS_AI_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
       WORKSHOPS_AI_SECURITY__API_KEYS=["dev-key"]
       WORKSHOPS_AI_PATHS__DATA_DIR=/mnt/data
-      WORKSHOPS_AI_LLM__MODEL=gpt-4o-mini
+      WORKSHOPS_AI_LLM__MODEL=gpt-5-mini
       ENABLE_DOCS=false  (legacy flat toggle; also supports WORKSHOPS_AI_ENABLE_DOCS)
     """
     model_config = SettingsConfigDict(

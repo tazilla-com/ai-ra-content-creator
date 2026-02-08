@@ -9,15 +9,14 @@ import logging
 from langgraph.prebuilt import create_react_agent
 
 from workshops_ai.graph.assets.state import AgentState
-from workshops_ai.graph.assets.context import AssetAgentContext
-from workshops_ai.graph.assets.prompts import build_system_prompt
-from workshops_ai.graph.assets.hooks import pre_model_hook
 from workshops_ai.graph.assets.tools import (
     lookup_knowledge,
     scrape_company_info,
     list_assets,
+    list_services,
     create_assets,
     update_assets,
+    delete_assets,
 )
 from workshops_ai.llm.client import make_llm_client_from_settings
 from workshops_ai.settings import get_settings
@@ -51,8 +50,10 @@ def create_asset_agent(
         lookup_knowledge,
         scrape_company_info,
         list_assets,
+        list_services,
         create_assets,
         update_assets,
+        delete_assets,
     ]
 
     if checkpointer is None:
@@ -61,16 +62,26 @@ def create_asset_agent(
         from langgraph.checkpoint.memory import MemorySaver
         checkpointer = MemorySaver()
 
-    from workshops_ai.graph.assets.prompts import ASSET_AGENT_SYSTEM_PROMPT
+    from workshops_ai.graph.assets.prompts import get_agent_system_prompt
+
+    prompt_data = get_agent_system_prompt()
 
     agent = create_react_agent(
         model=llm,
         tools=tools,
         state_schema=AgentState,
-        prompt=ASSET_AGENT_SYSTEM_PROMPT,  # Plain string, not callable!
-        # pre_model_hook=pre_model_hook,  # Temporarily disable to isolate issue
+        prompt=prompt_data["prompt_text"],
         checkpointer=checkpointer,
     )
+
+    # Attach prompt metadata for Langfuse tracing
+    agent.prompt_metadata = {
+        "prompt_name": "workshops/asset-agent-system",
+        "prompt_source": prompt_data["prompt_source"],
+        "prompt_version": prompt_data["version"],
+        "prompt_tags": prompt_data.get("tags", []),
+        "prompt_labels": prompt_data.get("labels", []),
+    }
 
     return agent
 
@@ -82,6 +93,7 @@ async def invoke_asset_agent(
     input_assets: list[dict] | None = None,
     selected_assets: list[dict] | None = None,
     valid_asset_types: list[str] | None = None,
+    services: list[dict] | None = None,
     recent_operations: list[dict] | None = None,
     conversation_history: list[dict] | None = None,
     model: str | None = None,
@@ -151,12 +163,14 @@ async def invoke_asset_agent(
         "input_assets": input_assets or [],
         "selected_assets": selected_assets or [],
         "valid_asset_types": valid_asset_types or [],
+        "services": services or [],
         "recent_operations": recent_operations or [],
         "user_message": message,
         "model": model or "gpt-4o",
         "session_id": session_id,
         "workshop_id": workshop_id,
         "generated_assets": [],
+        "deleted_asset_names": [],
         "tools_used": [],  # Will be extracted from messages in ws_router
         "remaining_steps": 25,
         "needs_clarification": False,
@@ -171,15 +185,29 @@ async def invoke_asset_agent(
     message_id = str(uuid.uuid4())
     run_id = str(uuid.uuid4())  # For Langfuse trace separation
 
+    # Include prompt metadata from Langfuse (source, version, tags)
+    prompt_meta = getattr(agent, "prompt_metadata", {})
+
     metadata = {
         "session_id": session_id,
         "workshop_id": workshop_id,
         "message_id": message_id,
         "message_length": len(message),
         "input_assets_count": len(input_assets or []),
+        "prompt_name": prompt_meta.get("prompt_name"),
+        "prompt_source": prompt_meta.get("prompt_source"),
+        "prompt_version": prompt_meta.get("prompt_version"),
     }
     if model:
         metadata["model"] = model
+
+    # Add prompt tags/labels if from Langfuse
+    prompt_tags = prompt_meta.get("prompt_tags", [])
+    prompt_labels = prompt_meta.get("prompt_labels", [])
+    if prompt_tags:
+        metadata["prompt_tags"] = ",".join(prompt_tags)
+    if prompt_labels:
+        metadata["prompt_labels"] = ",".join(prompt_labels)
 
     # Keep same thread_id for checkpointing (conversation history)
     # But use run_id for separate Langfuse traces

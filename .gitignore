@@ -48,6 +48,7 @@ logs/
 .DS_Store
 Thumbs.db
 desktop.ini
+__MACOSX/
 
 # ===== Env & secrets =====
 .env

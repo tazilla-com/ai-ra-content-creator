@@ -12,6 +12,7 @@ from typing_extensions import TypedDict
 from operator import add
 
 from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
 
 
 class RecentOperationDict(TypedDict):
@@ -39,8 +40,9 @@ class AgentState(TypedDict):
     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     ACCUMULATED (managed by LangGraph):
-    - messages: Annotated[list[BaseMessage], add]
-      → LangGraph appends new messages to existing list
+    - messages: Annotated[list[BaseMessage], add_messages]
+      → LangGraph's add_messages reducer handles ToolMessage↔tool_call pairing
+      → Required by create_react_agent for parallel tool calls and Command returns
       → Trimmed by pre_model_hook before LLM call to prevent token overflow
 
     REPLACED (from ChatPayload every message):
@@ -64,7 +66,7 @@ class AgentState(TypedDict):
     # ═══════════════════════════════════════════════════════════════════════
     # CONVERSATION (accumulated, trimmed by pre_model_hook)
     # ═══════════════════════════════════════════════════════════════════════
-    messages: Annotated[list[BaseMessage], add]
+    messages: Annotated[list[BaseMessage], add_messages]
 
     # ═══════════════════════════════════════════════════════════════════════
     # DYNAMIC CONTEXT (replaced every message from ChatPayload)
@@ -79,6 +81,9 @@ class AgentState(TypedDict):
 
     # Valid values (from Tazilla API catalog, can change)
     valid_asset_types: list[str]   # Asset type catalog
+
+    # Business services (from wizard step, for asset context)
+    services: list[dict]           # Services from wizard_steps["services"]["services"]
 
     # Recent operations for context (from SessionState)
     recent_operations: list[RecentOperationDict]  # Last 5 operations
@@ -95,6 +100,7 @@ class AgentState(TypedDict):
     # AGENT OUTPUT (reset each request)
     # ═══════════════════════════════════════════════════════════════════════
     generated_assets: Annotated[list[dict], add]   # New/updated assets from agent (accumulated)
+    deleted_asset_names: Annotated[list[str], add] # Asset names to remove (accumulated)
     tools_used: Annotated[list[str], add]          # Tools that were called (accumulated)
 
     # ═══════════════════════════════════════════════════════════════════════

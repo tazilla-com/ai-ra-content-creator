@@ -12,7 +12,7 @@ except Exception:  # pragma: no cover
     ChatOpenAI = None  # type: ignore
 
 
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "gpt-5-mini"
 
 
 @runtime_checkable

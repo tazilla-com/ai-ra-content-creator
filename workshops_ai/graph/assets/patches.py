@@ -1,7 +1,7 @@
 """
 JSON Patch computation for fire-and-forget workflow.
 
-Generates RFC 6902 patches for client to apply locally.
+Generates patches using asset UUIDs as stable identifiers (not array indices).
 """
 
 from __future__ import annotations
@@ -17,15 +17,15 @@ def compute_patches(
     operation_type: str = "create"
 ) -> list[dict]:
     """
-    Compute RFC 6902 JSON patches for asset changes.
+    Compute JSON patches for asset changes using UUID-based paths.
 
     Args:
         original_assets: Current assets from client
-        generated_assets: Assets created/updated by agent
-        operation_type: "create" or "update"
+        generated_assets: Assets created/updated by agent (or names for delete)
+        operation_type: "create", "update", or "delete"
 
     Returns:
-        List of JSON Patch operations
+        List of patch operations with UUID-based paths
 
     Examples:
         CREATE:
@@ -34,54 +34,73 @@ def compute_patches(
 
         UPDATE:
         >>> compute_patches(
-        ...     [{"id": "1", "name": "Server", "confidentiality": "LOW"}],
-        ...     [{"id": "1", "confidentiality": "HIGH"}],
+        ...     [{"id": "abc-123", "name": "Server", "confidentiality": "LOW"}],
+        ...     [{"id": "abc-123", "confidentiality": "HIGH"}],
         ...     "update"
         ... )
-        [{"op": "replace", "path": "/assets/0/confidentiality", "value": "HIGH"}]
+        [{"op": "replace", "path": "/assets/abc-123/confidentiality", "value": "HIGH"}]
+
+        DELETE:
+        >>> compute_patches(
+        ...     [{"id": "abc-123", "name": "Server"}],
+        ...     ["Server"],
+        ...     "delete"
+        ... )
+        [{"op": "remove", "path": "/assets/abc-123"}]
     """
     patches = []
 
     if operation_type == "create":
-        # Add new assets to the end of the list
         for asset in generated_assets:
             patches.append({
                 "op": "add",
-                "path": "/assets/-",  # Append to end
+                "path": "/assets/-",
                 "value": asset
             })
 
     elif operation_type == "update":
-        # Find and update existing assets
         for updated_asset in generated_assets:
             asset_id = updated_asset.get("id")
             if not asset_id:
                 logger.warning("Updated asset missing 'id', skipping patch generation")
                 continue
 
-            # Find index of original asset
-            asset_index = None
-            for i, orig in enumerate(original_assets):
-                if orig.get("id") == asset_id:
-                    asset_index = i
-                    break
-
-            if asset_index is None:
+            # Find original asset by ID
+            original = next(
+                (a for a in original_assets if a.get("id") == asset_id),
+                None
+            )
+            if original is None:
                 logger.warning(f"Asset with id={asset_id} not found in original assets, skipping")
                 continue
 
             # Generate replace patches for each changed field
             for field, new_value in updated_asset.items():
                 if field == "id":
-                    continue  # Don't patch the ID itself
-
-                original_value = original_assets[asset_index].get(field)
-                if original_value != new_value:
+                    continue
+                if original.get(field) != new_value:
                     patches.append({
                         "op": "replace",
-                        "path": f"/assets/{asset_index}/{field}",
+                        "path": f"/assets/{asset_id}/{field}",
                         "value": new_value
                     })
+
+    elif operation_type == "delete":
+        # generated_assets is list of names for delete
+        for name in generated_assets:
+            original = next(
+                (a for a in original_assets if a.get("name") == name),
+                None
+            )
+            if original is None:
+                logger.warning(f"Asset '{name}' not found in original assets, skipping remove patch")
+                continue
+
+            asset_id = original.get("id", name)
+            patches.append({
+                "op": "remove",
+                "path": f"/assets/{asset_id}",
+            })
 
     else:
         logger.error(f"Unknown operation_type: {operation_type}")
@@ -91,27 +110,41 @@ def compute_patches(
 
 def compute_patches_auto(
     original_assets: list[dict],
-    generated_assets: list[dict]
+    generated_assets: list[dict],
+    deleted_asset_names: list[str] | None = None,
 ) -> list[dict]:
     """
     Auto-detect operation type and compute patches.
 
     Args:
         original_assets: Current assets from client
-        generated_assets: Assets from agent
+        generated_assets: Assets from agent (created or updated)
+        deleted_asset_names: Asset names to remove
 
     Returns:
-        List of JSON Patch operations
+        List of patch operations (remove first, then add/replace)
     """
-    if not generated_assets:
-        return []
+    patches = []
 
-    # Check if generated assets have IDs
-    has_ids = all(asset.get("id") for asset in generated_assets)
+    # 1. Remove patches first
+    if deleted_asset_names:
+        patches.extend(
+            compute_patches(original_assets, deleted_asset_names, "delete")
+        )
 
-    if has_ids:
-        # Assets have IDs -> UPDATE
-        return compute_patches(original_assets, generated_assets, "update")
-    else:
-        # No IDs -> CREATE
-        return compute_patches(original_assets, generated_assets, "create")
+    # 2. Add/replace patches
+    if generated_assets:
+        # Check if generated assets match existing ones by ID → update
+        original_ids = {a.get("id") for a in original_assets if a.get("id")}
+        has_ids = all(asset.get("id") for asset in generated_assets)
+
+        if has_ids and any(a.get("id") in original_ids for a in generated_assets):
+            patches.extend(
+                compute_patches(original_assets, generated_assets, "update")
+            )
+        else:
+            patches.extend(
+                compute_patches(original_assets, generated_assets, "create")
+            )
+
+    return patches

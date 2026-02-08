@@ -79,6 +79,7 @@ def generate_assets_with_structured_output(
     organization: dict,
     existing_assets: list[dict],
     valid_types: list[str],
+    services: list[dict] | None = None,
 ) -> CreateAssetsOutput:
     """
     Use structured output to generate validated asset output.
@@ -97,6 +98,16 @@ def generate_assets_with_structured_output(
 
     llm_with_structure = llm.with_structured_output(CreateAssetsOutput)
 
+    # Build services context if available
+    services_text = ""
+    if services:
+        service_names = [s.get("name", "Unknown") for s in services]
+        services_text = (
+            "\nBusiness services this organization provides:\n"
+            + "\n".join(f"- {name}" for name in service_names)
+            + "\n\nUse these services as context when creating assets - assets should support these business services.\n"
+        )
+
     prompt = f"""
 Generate assets based on this description:
 {description}
@@ -105,18 +116,17 @@ Organization context:
 - Industry: {organization.get('industry', 'Unknown')}
 - Size: {organization.get('size', 'Unknown')}
 - Name: {organization.get('name', 'Unknown')}
-
+{services_text}
 Valid asset types (use ONLY these - always in English):
 {', '.join(valid_types)}
 
 Existing assets (avoid duplicates):
 {[a.get('name') for a in existing_assets]}
 
-CRITICAL: Create ONLY the assets EXPLICITLY mentioned in the description.
-- If description says "database", create 1 database
-- If description says "database and backup system", create 2 assets
-- Do NOT add related/supporting assets unless explicitly requested
-- Do NOT create infrastructure, backups, or servers unless asked
+CRITICAL: Create EXACTLY the assets mentioned in the description — no more, no less.
+- Include BOTH primary assets (with CIA) AND supporting assets (with CIA = null) if described
+- If description mentions "servers as supporting infrastructure", create them as isPrimary=false
+- Do NOT invent extra assets beyond what the description lists
 
 CIA Classification Rules:
 - **If description includes specific CIA values** (e.g., "with PROTECTED confidentiality, HIGH integrity"):
@@ -156,6 +166,38 @@ Requirements:
     )
 
     result: CreateAssetsOutput = llm_with_structure.invoke(prompt)
+
+    # Post-processing: enforce CIA rules
+    for asset in result.assets:
+        if asset.isPrimary:
+            # Primary assets MUST have all CIA fields
+            missing = []
+            if asset.confidentiality is None:
+                missing.append("confidentiality")
+            if asset.integrity is None:
+                missing.append("integrity")
+            if asset.availability is None:
+                missing.append("availability")
+            if missing:
+                logger.warning(
+                    f"Primary asset '{asset.name}' missing CIA fields: {missing}. "
+                    "Setting defaults (INTERNAL/MEDIUM/MEDIUM)."
+                )
+                if asset.confidentiality is None:
+                    asset.confidentiality = "INTERNAL"
+                if asset.integrity is None:
+                    asset.integrity = "MEDIUM"
+                if asset.availability is None:
+                    asset.availability = "MEDIUM"
+        else:
+            # Supporting assets MUST NOT have CIA (strip if LLM set them)
+            if asset.confidentiality or asset.integrity or asset.availability:
+                logger.warning(
+                    f"Supporting asset '{asset.name}' had CIA values set — clearing."
+                )
+                asset.confidentiality = None
+                asset.integrity = None
+                asset.availability = None
 
     logger.info(
         "Assets generated",

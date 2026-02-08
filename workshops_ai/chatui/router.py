@@ -231,7 +231,7 @@ async def demo_page() -> str:
           message: text,
           assets: [],
           // No organization - agent will use scrape_company_info to get wizard_metadata.website_content
-          model: 'gpt-4o-mini'
+          model: 'gpt-5-mini'
         }
       };
 
@@ -281,11 +281,19 @@ async def demo_page() -> str:
                 if (data.payload.message) {
                   line('ai', data.payload.message);
                 }
+                var action = data.payload.action || 'created';
                 if (data.payload.assets && data.payload.assets.length > 0) {
-                  line('sys', 'Assets created: ' + data.payload.assets.length);
+                  var label = action === 'updated' ? 'Assets updated: ' : 'Assets created: ';
+                  line('sys', label + data.payload.assets.length);
                   data.payload.assets.forEach(function(asset) {
-                    line('sys', '  → ' + asset.name + ' (' + asset.confidentiality + '/' + asset.integrity + '/' + asset.availability + ')');
+                    line('sys', '  → ' + asset.name + ' (' + (asset.confidentiality || 'null') + '/' + (asset.integrity || 'null') + '/' + (asset.availability || 'null') + ')');
                   });
+                }
+                if (action === 'deleted' && data.payload.patches && data.payload.patches.length > 0) {
+                  var removePatches = data.payload.patches.filter(function(p) { return p.op === 'remove'; });
+                  if (removePatches.length > 0) {
+                    line('sys', 'Assets deleted: ' + removePatches.length);
+                  }
                 }
               }
               if (data.type === 'progress' && data.payload) {

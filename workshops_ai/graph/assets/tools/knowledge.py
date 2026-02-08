@@ -64,14 +64,14 @@ def lookup_knowledge(
         content = f"No knowledge found for: {query}. Proceeding with general best practices."
         return Command(
             update={
-                "tools_used": state.get("tools_used", []) + ["lookup_knowledge"],
+                "tools_used": ["lookup_knowledge"],
                 "messages": [ToolMessage(content=content, tool_call_id=tool_call_id)]
             }
         )
 
     return Command(
         update={
-            "tools_used": state.get("tools_used", []) + ["lookup_knowledge"],
+            "tools_used": ["lookup_knowledge"],
             "messages": [ToolMessage(content=results, tool_call_id=tool_call_id)]
         }
     )

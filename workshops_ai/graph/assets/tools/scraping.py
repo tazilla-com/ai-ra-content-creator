@@ -65,7 +65,7 @@ async def scrape_company_info(
         error_msg = "Error: Session ID not found in state"
         return Command(
             update={
-                "tools_used": state.get("tools_used", []) + ["scrape_company_info"],
+                "tools_used": ["scrape_company_info"],
                 "messages": [ToolMessage(content=error_msg, tool_call_id=tool_call_id)]
             }
         )
@@ -76,7 +76,7 @@ async def scrape_company_info(
         error_msg = f"Error: Session not found: {session_id}"
         return Command(
             update={
-                "tools_used": state.get("tools_used", []) + ["scrape_company_info"],
+                "tools_used": ["scrape_company_info"],
                 "messages": [ToolMessage(content=error_msg, tool_call_id=tool_call_id)]
             }
         )
@@ -90,7 +90,7 @@ async def scrape_company_info(
         )
         return Command(
             update={
-                "tools_used": state.get("tools_used", []) + ["scrape_company_info"],
+                "tools_used": ["scrape_company_info"],
                 "messages": [ToolMessage(content=cached, tool_call_id=tool_call_id)]
             }
         )
@@ -106,7 +106,7 @@ async def scrape_company_info(
         )
         return Command(
             update={
-                "tools_used": state.get("tools_used", []) + ["scrape_company_info"],
+                "tools_used": ["scrape_company_info"],
                 "messages": [ToolMessage(content=error_msg, tool_call_id=tool_call_id)]
             }
         )
@@ -138,7 +138,7 @@ async def scrape_company_info(
 
         return Command(
             update={
-                "tools_used": state.get("tools_used", []) + ["scrape_company_info"],
+                "tools_used": ["scrape_company_info"],
                 "messages": [ToolMessage(content=combined_text, tool_call_id=tool_call_id)]
             }
         )
@@ -151,7 +151,7 @@ async def scrape_company_info(
         error_msg = f"Error scraping company website: {str(e)}"
         return Command(
             update={
-                "tools_used": state.get("tools_used", []) + ["scrape_company_info"],
+                "tools_used": ["scrape_company_info"],
                 "messages": [ToolMessage(content=error_msg, tool_call_id=tool_call_id)]
             }
         )

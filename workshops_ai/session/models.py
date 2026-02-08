@@ -16,10 +16,8 @@ from typing import Any, Optional, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from workshops_ai.schemas.ws_protocol import (
-    AssetInput,
     Organization,
     ConversationMessage,
-    WorkshopId,
 )
 
 __all__ = ["SessionState", "RecentOperation"]
@@ -60,11 +58,11 @@ class SessionState(BaseModel):
     - wizard_metadata: Scraped content, cached data, etc.
 
     AGENT FIELDS:
-    - workshop_id: Current workshop (assets, impacts, threats, controls)
-    - organization: Organization context
-    - assets: Current assets list
-    - conversation: Last 10 conversation messages (FIFO)
-    - busy: Agent execution lock
+    - organization: Organization context (set by wizard)
+    - conversation: Last 20 messages / 10 turns (FIFO)
+    - busy/busy_since: Agent execution lock
+
+    NOTE: Assets live in wizard_steps["assets"]["assets"] (single source of truth).
 
     Both wizard and agent share the SAME session!
     """
@@ -85,19 +83,16 @@ class SessionState(BaseModel):
     )
 
     # ─────────────────────────────────────────────────────────────
-    # AGENT FIELDS
+    # AGENT FIELDS (workshop_id comes from WS query param, not stored)
     # ─────────────────────────────────────────────────────────────
-    workshop_id: Optional[WorkshopId] = None
-
     busy: bool = False
     busy_since: Optional[datetime] = None
 
     organization: Optional[Organization] = None
-    assets: list[AssetInput] = Field(default_factory=list)
 
     conversation: list[ConversationMessage] = Field(
         default_factory=list,
-        description="Last 10 messages, FIFO (for UI display)"
+        description="Last 20 messages / 10 turns, FIFO (for UI display)"
     )
 
     recent_operations: list[RecentOperation] = Field(
@@ -110,6 +105,12 @@ class SessionState(BaseModel):
     # ─────────────────────────────────────────────────────────────
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    @field_validator("conversation")
+    @classmethod
+    def limit_conversation(cls, v: list[ConversationMessage]) -> list[ConversationMessage]:
+        """Keep only last 20 messages (10 turns = 10 user + 10 assistant), FIFO."""
+        return v[-20:] if len(v) > 20 else v
 
     @field_validator("recent_operations")
     @classmethod

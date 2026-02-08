@@ -107,9 +107,8 @@ async def get_session(session_id: str) -> SessionState | None:
             "Session loaded",
             extra={
                 "session_id": session_id,
-                "workshop_id": session.workshop_id,
                 "has_wizard_data": bool(session.wizard_steps),
-                "has_agent_data": bool(session.organization or session.assets),
+                "has_agent_data": bool(session.organization or session.wizard_steps.get("assets", {}).get("assets")),
             }
         )
         return session
@@ -170,7 +169,6 @@ async def save_session(
             "Session saved",
             extra={
                 "session_id": session.session_id,
-                "workshop_id": session.workshop_id,
                 "wizard_steps_count": len(session.wizard_steps),
                 "conversation_length": len(session.conversation),
                 "ttl_seconds": ttl,
@@ -203,7 +201,6 @@ async def update_session(
     Example:
         await update_session("abc-123", {
             "organization": {...},
-            "workshop_id": "assets"
         })
 
     Note:
