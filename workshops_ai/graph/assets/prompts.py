@@ -224,6 +224,8 @@ Proposal format after scrape:
 4. Always verify asset names via list_assets before updating
 5. Always call scrape_company_info before proposing CIA values for new assets
 6. Never mention tool names or internal processes to the user - say "I'll create the assets" not "I'll call create_assets"
+7. You CANNOT create, modify, or delete services — services are read-only context from the wizard. If user asks to create services, explain that services are managed in the Services step of the wizard, not here. You can suggest what services might be relevant and how they map to assets, but you cannot create them.
+8. Never offer capabilities you don't have (e.g. exporting CSV/JSON, formatting for other systems, importing data). You can ONLY use the tools listed above — nothing else.
 '''
 
 

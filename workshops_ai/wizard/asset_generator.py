@@ -857,7 +857,7 @@ class AssetGenerator:
                     "prompt_text": prompt_text,
                     "response_text": response_text[:500],  # Truncate for logging
                     "assets_count": len(assets),
-                    "allowed_asset_types": allowed_asset_types,
+                    "allowed_asset_types": allowed_asset_type_names,
                 }
 
                 logger.info(
