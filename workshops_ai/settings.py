@@ -121,29 +121,11 @@ class CatalogSettings(BaseModel):
     Catalog provider settings:
       - 'file': use local CSV files (dev/mockup mode)
       - 'http': fetch from Tazilla API (production mode)
-
-    ENV mapping (both forms work):
-      WORKSHOPS_AI_CATALOG__MODE=file|http  or  CATALOG__MODE=file|http
-      WORKSHOPS_AI_CATALOG__ENDPOINT=https://api.tazilla.com  or  CATALOG__ENDPOINT=...
-      WORKSHOPS_AI_CATALOG__AUTH_TOKEN=Bearer ...  or  CATALOG__AUTH_TOKEN=... (optional for cluster-internal calls)
-      WORKSHOPS_AI_CATALOG__TIMEOUT_SEC=30  or  CATALOG__TIMEOUT_SEC=30
     """
-    mode: Literal["file", "http"] = Field(
-        default="file",
-        validation_alias="CATALOG__MODE"
-    )
-    endpoint: Optional[str] = Field(
-        default=None,
-        validation_alias="CATALOG__ENDPOINT"
-    )
-    auth_token: Optional[str] = Field(
-        default=None,
-        validation_alias="CATALOG__AUTH_TOKEN"
-    )
-    timeout_sec: int = Field(
-        default=30,
-        validation_alias="CATALOG__TIMEOUT_SEC"
-    )
+    mode: Literal["file", "http"] = "file"
+    endpoint: Optional[str] = None
+    auth_token: Optional[str] = None
+    timeout_sec: int = 30
 
 
 class RedisSettings(BaseModel):
