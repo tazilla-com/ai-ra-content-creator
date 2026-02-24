@@ -1,5 +1,5 @@
 # api/models/schema/control.py
-from typing import List, Optional, Literal
+from typing import List, Optional
 from uuid import UUID
 from decimal import Decimal
 from pydantic import BaseModel, Field
@@ -43,26 +43,17 @@ class PlannedControl(BaseModel):
         json_schema_extra={"example": "Require multiple forms of authentication to access systems"}
     )
     # Code list; always in english; get via API from backend
-    category: Optional[Literal[
-        "Information security policies",
-        "Organization of information security",
-        "Human resource security",
-        "Threat intelligence",
-        "Asset management",
-        "Access control",
-        "Cryptography",
-        "Physical and environmental security",
-        "Business continuity management",
-        "Operations security",
-        "Vulnerability Management",
-        "Communications security",
-        "System acquisition, development and maintenance",
-        "Supplier relationships",
-        "Compliance",
-        "Logging and monitoring",
-        "Other"
-    ]] = Field(
-        None, description="Control category for classification. Fixed code list; must not be translated or localized."
+    category: Optional[str] = Field(
+        None,
+        description=(
+            "Control category for classification. Must not be translated or localized. "
+            "Typical values: 'Information security policies', 'Organization of information security', "
+            "'Human resource security', 'Threat intelligence', 'Asset management', 'Access control', "
+            "'Cryptography', 'Physical and environmental security', 'Business continuity management', "
+            "'Operations security', 'Vulnerability Management', 'Communications security', "
+            "'System acquisition, development and maintenance', 'Supplier relationships', "
+            "'Compliance', 'Logging and monitoring', 'Other'."
+        )
     )
     implementationCost: Optional[Decimal] = Field(
         None,

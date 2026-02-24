@@ -21,21 +21,15 @@ class Threat(BaseModel):
         )
     )
     # Code list; always in english; get via API from backend
-    category: Literal[
-        "Physical threats",
-        "Natural threats",
-        "Compromise of functions or services",
-        "Human actions",
-        "Technical failures and infrastructure disruptions",
-        "Organizational threats",
-        "Legal and regulatory threats",
-        "Violation of privacy",
-        "Other"
-    ] = Field(
+    category: str = Field(
         ...,
         description=(
-            "Category of the threat for classification and filtering in risk analysis. " \
-            "Must match one of the predefined categories."
+            "Category of the threat for classification and filtering in risk analysis. "
+            "Must not be translated or localized. "
+            "Typical values: 'Physical threats', 'Natural threats', "
+            "'Compromise of functions or services', 'Human actions', "
+            "'Technical failures and infrastructure disruptions', 'Organizational threats', "
+            "'Legal and regulatory threats', 'Violation of privacy', 'Other'."
         )
     )
 

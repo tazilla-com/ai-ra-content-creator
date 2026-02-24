@@ -100,6 +100,17 @@ if not logger.handlers:
     logger.addHandler(_handler)
 
 
+# Suppress noisy health-probe access logs (/livez, /readyz)
+class _HealthProbeFilter(logging.Filter):
+    _PROBE_PATHS = {"/livez", "/readyz"}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(f"GET {p} " in msg for p in self._PROBE_PATHS)
+
+logging.getLogger("uvicorn.access").addFilter(_HealthProbeFilter())
+
+
 # ------------------------------------------------------------------------------
 # Request context (request-id)
 # ------------------------------------------------------------------------------

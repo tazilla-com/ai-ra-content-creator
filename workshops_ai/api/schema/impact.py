@@ -14,18 +14,13 @@ class Impact(BaseModel):
         ..., description="Explanation of the impact's relevance in the security or business context; already localized."
     )
     # Code list; always in english; get via API from backend
-    impactCategory: Literal[
-        "Availability",
-        "Clients",
-        "Confidentiality",
-        "Finance",
-        "Integrity",
-        "Legislation",
-        "Reputation",
-        "People",
-        "Other"
-    ] = Field(
-        ..., description="Higher-level category grouping the impact (e.g., 'Confidentiality', 'Finance'). Must not be translated or localized."
+    impactCategory: str = Field(
+        ...,
+        description=(
+            "Higher-level category grouping the impact. Must not be translated or localized. "
+            "Typical values: 'Availability', 'Clients', 'Confidentiality', 'Finance', "
+            "'Integrity', 'Legislation', 'Reputation', 'People', 'Other'."
+        )
     )
 
 class ImpactEvaluation(BaseModel):
