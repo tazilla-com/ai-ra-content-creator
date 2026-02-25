@@ -1545,7 +1545,7 @@ class ControlGenerator:
 
                                             # Format prompt for debug preview
                                             messages = prompt.format_messages(
-                                                asset_json=asset_json,
+                                                assets_json=asset_json,
                                                 asset_risks_json=asset_risks_json,
                                                 relevant_controls_json=relevant_controls_json,
                                                 controls_constraint=controls_constraint,
@@ -1559,7 +1559,7 @@ class ControlGenerator:
                                             response_text, usage_metrics = await self._call_llm_with_retry(
                                                 prompt=prompt,
                                                 session_id=session_id,
-                                                asset_json=asset_json,
+                                                assets_json=asset_json,
                                                 asset_risks_json=asset_risks_json,
                                                 relevant_controls_json=relevant_controls_json,
                                                 controls_constraint=controls_constraint,
@@ -1759,7 +1759,7 @@ class ControlGenerator:
 
                                                 # Format prompt for debug preview
                                                 messages = prompt.format_messages(
-                                                    asset_json=asset_json,
+                                                    assets_json=asset_json,
                                                     asset_risks_json=asset_risks_json,
                                                     relevant_controls_json=relevant_controls_json,
                                                     controls_constraint=controls_constraint,
@@ -1773,7 +1773,7 @@ class ControlGenerator:
                                                 response_text, usage_metrics = await self._call_llm_with_retry(
                                                     prompt=prompt,
                                                     session_id=session_id,
-                                                    asset_json=asset_json,
+                                                    assets_json=asset_json,
                                                     asset_risks_json=asset_risks_json,
                                                     relevant_controls_json=relevant_controls_json,
                                                     controls_constraint=controls_constraint,
@@ -1953,8 +1953,8 @@ class ControlGenerator:
                 batch_assets = assets[start_idx:end_idx]
 
                 try:
-                    # Process batch
-                    batch_results, batch_prompt_tokens, batch_completion_tokens, batch_response_text = await self._process_assets_batch(
+                    # Process batch with recursive splitting on context/limit errors
+                    batch_results, batch_prompt_tokens, batch_completion_tokens, batch_response_text = await self._process_batch_with_recursive_splitting(
                         assets=batch_assets,
                         prompt=prompt,
                         asset_risks_dict=risk_lookup,
@@ -1965,6 +1965,8 @@ class ControlGenerator:
                         sections=sections,
                         max_controls_per_asset=max_controls_per_asset,
                         session_id=None,
+                        recursion_level=0,
+                        max_recursion_level=3,
                     )
 
                     # Accumulate results
@@ -2062,7 +2064,7 @@ class ControlGenerator:
 
                             # Format prompt for debug preview
                             messages = prompt.format_messages(
-                                asset_json=asset_json,
+                                assets_json=asset_json,
                                 asset_risks_json=asset_risks_json,
                                 relevant_controls_json=relevant_controls_json,
                                 controls_constraint=controls_constraint,
@@ -2076,7 +2078,7 @@ class ControlGenerator:
                             response_text, usage_metrics = await self._call_llm_with_retry(
                                 prompt=prompt,
                                 session_id=None,
-                                asset_json=asset_json,
+                                assets_json=asset_json,
                                 asset_risks_json=asset_risks_json,
                                 relevant_controls_json=relevant_controls_json,
                                 controls_constraint=controls_constraint,
@@ -2225,7 +2227,7 @@ class ControlGenerator:
 
                                 # Format prompt for debug preview
                                 messages = prompt.format_messages(
-                                    asset_json=asset_json,
+                                    assets_json=asset_json,
                                     asset_risks_json=asset_risks_json,
                                     relevant_controls_json=relevant_controls_json,
                                     controls_constraint=controls_constraint,
@@ -2239,7 +2241,7 @@ class ControlGenerator:
                                 response_text, usage_metrics = await self._call_llm_with_retry(
                                     prompt=prompt,
                                     session_id=None,
-                                    asset_json=asset_json,
+                                    assets_json=asset_json,
                                     asset_risks_json=asset_risks_json,
                                     relevant_controls_json=relevant_controls_json,
                                     controls_constraint=controls_constraint,

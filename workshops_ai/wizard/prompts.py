@@ -285,7 +285,7 @@ BATCH_IMPACTS_JSON_SCHEMA = """{{
 # Production prompt (catalog-based evaluation)
 IMPACTS_SYSTEM_PROMPT = """
 You are an expert risk analyst specializing in business impact assessment.
-Your task: Identify and evaluate the most relevant impacts from the official impact catalog for a SINGLE asset. Return only applicable impacts with their severity levels (1-4). This assessment will be used to prioritize security controls and risk mitigation strategies.
+Your task: Identify and evaluate the most relevant impacts from the official impact catalog for MULTIPLE assets (batch processing). Return impacts for EACH asset in the batch. This assessment will be used to prioritize security controls and risk mitigation strategies.
 
 Core Principles:
 1. User instructions first: If user provides specific guidance, follow it closely
@@ -318,15 +318,16 @@ Output Rules:
 - Return ONLY impacts with level 1-4 (do NOT include level 0 / not applicable)
 - Return impacts in order of relevance (most critical first)
 - Respect the quantity constraint if provided (e.g., "up to 3 impacts" means max 3)
+- You must return impacts for ALL assets provided. The response must include exactly the same number of assets as the input. Missing assets will cause an error.
 
 Return JSON array with format (only applicable impacts, level 1-4):
 {impacts_json_schema}
 """
 
 IMPACTS_HUMAN_PROMPT_TEMPLATE = """
-Identify the most relevant impacts for this asset and evaluate their severity levels.
+Identify the most relevant impacts for these assets and evaluate their severity levels. Return impacts for EACH asset.
 
-Single asset to evaluate:
+Assets to evaluate:
 {assets_json}
 
 {organization_profile_section}
@@ -341,6 +342,9 @@ Available impacts catalog (select impact name from "name" field; descriptions pr
 {ordered_catalog_names_json}
 
 {impacts_constraint}
+
+Return JSON array with format (only applicable impacts, level 1-4):
+{impacts_json_schema}
 
 Language: {language}
 """
@@ -590,7 +594,7 @@ CONTROLS_HUMAN_PROMPT_TEMPLATE = """
 Select the most effective security controls for these assets to mitigate their identified threats. Return controls for EACH asset.
 
 Assets to protect:
-{asset_json}
+{assets_json}
 
 Asset risks (threats with evaluated probabilities and calculated risk values):
 {asset_risks_json}

@@ -608,30 +608,28 @@ def load_asset_type_threat_mapping() -> Dict[str, List[str]]:
     """
     Load AssetType -> Threat mapping from CSV (optional for smart threat selection).
 
+    The CSV maps which threats are relevant for each asset type.
+    The 'Value' column is metadata (not a relevance filter) - all rows
+    represent valid asset-type-to-threat associations.
+
     Returns:
         Dict mapping asset type to list of relevant threat names
     """
     rows = _read_csv(CATALOG_BASE / "Asset type x Threat.csv")
-    threat_mapping: Dict[str, List[str]] = {}
+    threat_sets: Dict[str, set] = {}
 
     for r in rows:
         asset_type = (r.get("Asset type") or "").strip()
         threat = (r.get("Threat") or "").strip()
-        value = (r.get("Value") or "").strip().upper()
 
         if not asset_type or not threat:
             continue
 
-        # Only include threats where Value = TRUE
-        if value != "TRUE":
-            continue
+        threat_sets.setdefault(asset_type, set()).add(threat)
 
-        if asset_type not in threat_mapping:
-            threat_mapping[asset_type] = []
+    threat_mapping = {k: sorted(v) for k, v in threat_sets.items()}
 
-        threat_mapping[asset_type].append(threat)
-
-    logger.info(f"Loaded threat mapping for {len(threat_mapping)} asset types")
+    logger.info(f"Loaded threat-to-asset-types mappings for {len(threat_mapping)} asset types")
     return threat_mapping
 
 
