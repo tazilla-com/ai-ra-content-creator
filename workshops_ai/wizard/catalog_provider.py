@@ -94,6 +94,22 @@ class CatalogProvider(ABC):
         """Load sector catalog with localization."""
         pass
 
+    @abstractmethod
+    async def load_control_threat_coverage(
+        self,
+        session_id: Optional[str] = None
+    ) -> Dict[str, Dict[str, int]]:
+        """Load control→threat coverage mapping. Returns {control_name: {threat_name: coverage_%}}."""
+        pass
+
+    @abstractmethod
+    async def load_asset_type_threat_mapping(
+        self,
+        session_id: Optional[str] = None
+    ) -> Dict[str, List[str]]:
+        """Load asset_type→threat mapping. Returns {asset_type: [threat_names]}."""
+        pass
+
 
 # =============================================================================
 # CSV Provider (Dev/Mockup)
@@ -179,6 +195,24 @@ class CSVCatalogProvider(CatalogProvider):
         from workshops_ai.wizard.catalog_loader import load_sector_catalog as _load
 
         return _load(language="en", session_id=None)
+
+    async def load_control_threat_coverage(
+        self,
+        session_id: Optional[str] = None
+    ) -> Dict[str, Dict[str, int]]:
+        """Load control→threat coverage from CSV file."""
+        from workshops_ai.wizard.catalog_loader import load_control_threat_coverage as _load
+
+        return _load()
+
+    async def load_asset_type_threat_mapping(
+        self,
+        session_id: Optional[str] = None
+    ) -> Dict[str, List[str]]:
+        """Load asset_type→threat mapping from CSV file."""
+        from workshops_ai.wizard.catalog_loader import load_asset_type_threat_mapping as _load
+
+        return _load()
 
 
 # =============================================================================
@@ -524,7 +558,8 @@ class TazillaAPICatalogProvider(CatalogProvider):
         """Fetch sector catalog from Tazilla API (already localized)."""
         data = await self._fetch_catalog("sectors", session_id)
 
-        sectors = data.get("sectors", [])
+        # Try "sectors" first, fall back to "categories" (our own endpoint uses CategoryCatalogResponse)
+        sectors = data.get("sectors") or data.get("categories", [])
 
         for idx, item in enumerate(sectors):
             if not isinstance(item, dict):
@@ -535,6 +570,36 @@ class TazillaAPICatalogProvider(CatalogProvider):
                 raise ValueError(f"Sector at index {idx} missing fields: {missing}")
 
         return sectors
+
+    async def load_control_threat_coverage(
+        self,
+        session_id: Optional[str] = None
+    ) -> Dict[str, Dict[str, int]]:
+        """Fetch control→threat coverage mapping from Tazilla API."""
+        data = await self._fetch_catalog("control-threat-coverage", session_id)
+
+        # Expected format: {"coverage": {"Control Name": {"Threat Name": 50, ...}, ...}}
+        coverage = data.get("coverage", {})
+
+        if not isinstance(coverage, dict):
+            raise ValueError("Invalid control-threat-coverage response: expected dict")
+
+        return coverage
+
+    async def load_asset_type_threat_mapping(
+        self,
+        session_id: Optional[str] = None
+    ) -> Dict[str, List[str]]:
+        """Fetch asset_type→threat mapping from Tazilla API."""
+        data = await self._fetch_catalog("asset-type-threat-mapping", session_id)
+
+        # Expected format: {"mapping": {"Asset Type": ["Threat1", "Threat2", ...], ...}}
+        mapping = data.get("mapping", {})
+
+        if not isinstance(mapping, dict):
+            raise ValueError("Invalid asset-type-threat-mapping response: expected dict")
+
+        return mapping
 
     async def close(self):
         """Close HTTP client connection."""

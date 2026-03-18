@@ -551,15 +551,15 @@ class AssetGenerator:
             AIResponseError: If response cannot be parsed
         """
 
-        # Extract allowed asset types from Asset model (for validation)
-        allowed_asset_type_names = self._allowed_asset_types_from_model()
-        if not allowed_asset_type_names:
-            raise RuntimeError("Failed to extract asset types from Asset model")
-
-        # Load asset types with descriptions from catalog (for prompt context)
+        # Load asset types with descriptions from catalog (for prompt context and validation)
         from workshops_ai.wizard.prompt_context import PromptContextBuilder
         builder = PromptContextBuilder(session_id=session_id)
         asset_types_with_desc = await builder.get_catalog_with_descriptions("asset_types")
+
+        # Use catalog as source of truth for allowed asset types
+        allowed_asset_type_names = [at["name"] for at in asset_types_with_desc]
+        if not allowed_asset_type_names:
+            raise RuntimeError("Failed to load asset types from catalog")
 
         # Build prompt sections
         sections = self._build_prompt_sections(

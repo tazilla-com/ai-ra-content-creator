@@ -41,7 +41,6 @@ from workshops_ai.wizard.prompts import (
     CONTROLS_JSON_SCHEMA,
     BATCH_CONTROLS_JSON_SCHEMA,
 )
-from workshops_ai.wizard.catalog_loader import load_control_threat_coverage
 from workshops_ai.wizard.catalog_provider import get_catalog_provider
 from workshops_ai.wizard.prompt_context import PromptContextBuilder
 from workshops_ai.wizard.cost_calculator import create_usage_metrics, UsageMetrics
@@ -1221,12 +1220,10 @@ class ControlGenerator:
         # Initialize prompt context builder with session-based caching
         builder = PromptContextBuilder(session_id=session_id)
 
-        # Load control catalog (already localized by Tazilla backend if using API)
+        # Load control catalog and threat coverage from provider (CSV or API)
         provider = get_catalog_provider()
         control_catalog = await provider.load_control_catalog(session_id=session_id)
-
-        # Load control→threat coverage mapping (from old catalog_loader for now)
-        threat_coverage = load_control_threat_coverage()
+        threat_coverage = await provider.load_control_threat_coverage(session_id=session_id)
 
         # Build asset-risk lookup
         risk_lookup: Dict[str, AssetRisk] = {}

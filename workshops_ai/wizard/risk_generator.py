@@ -33,7 +33,7 @@ from workshops_ai.wizard.prompts import (
     RISKS_JSON_SCHEMA,
     BATCH_RISKS_JSON_SCHEMA,
 )
-from workshops_ai.wizard.catalog_loader import load_asset_type_threat_mapping
+from workshops_ai.wizard.catalog_provider import get_catalog_provider
 from workshops_ai.wizard.prompt_context import PromptContextBuilder
 from workshops_ai.wizard.cost_calculator import create_usage_metrics, UsageMetrics
 from workshops_ai.wizard.exceptions import (
@@ -1027,10 +1027,11 @@ class RiskGenerator:
         all_threat_names = await builder.get_catalog_names("threats")
         allowed_names_set = set(all_threat_names)
 
-        # Load AssetType→Threat mapping (always required for smart threat selection)
+        # Load AssetType→Threat mapping from provider (CSV or API)
         threat_mapping: Dict[str, List[str]] = {}
         try:
-            threat_mapping = load_asset_type_threat_mapping()
+            provider = get_catalog_provider()
+            threat_mapping = await provider.load_asset_type_threat_mapping(session_id=session_id)
             logger.info(f"Loaded threat mapping for {len(threat_mapping)} asset types")
         except Exception as e:
             logger.warning(f"Failed to load threat mapping, using all threats: {e}")

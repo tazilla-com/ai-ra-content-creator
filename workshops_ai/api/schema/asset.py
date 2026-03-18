@@ -29,11 +29,14 @@ class Asset(BaseModel):
     ] = Field(None, description="Availability level based on ISO 27001. Must not be translated or localized.")
 
     # Code list; always in english; get via API from backend
-    assetType: Literal[
-        "Application software", "Cloud services", "Data storage",
-        "Electronic data/Business process", "Other", "Information system",
-        "IoT", "Location", "Mobile devices", "Laptop", "Operating system",
-        "Paper data", "PC", "Staff", "Portable data media",
-        "Server infrastructure", "Network infrastructure",
-        "Virtualization platform", "Equipment, machines"
-    ] = Field(..., description="Asset type from a fixed code list. Must not be translated or localized.")
+    assetType: str = Field(
+        ...,
+        description=(
+            "Asset type from catalog. Must not be translated or localized. "
+            "Typical values: 'Application software', 'Cloud services', 'Data storage', "
+            "'Electronic data/Business process', 'Information system', 'IoT', 'Location', "
+            "'Mobile devices', 'Laptop', 'Operating system', 'Paper data', 'PC', 'Staff', "
+            "'Portable data media', 'Server infrastructure', 'Network infrastructure', "
+            "'Virtualization platform', 'Equipment, machines', 'Other'."
+        )
+    )
