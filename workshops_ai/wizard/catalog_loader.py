@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 
 from workshops_ai.api.schema.impact import Impact
 from workshops_ai.api.schema.threat import Threat
-from workshops_ai.api.schema.control import PlannedControl
+from workshops_ai.api.schema.control import PlannedControl, ThreatCoverage
 
 logger = logging.getLogger(__name__)
 
@@ -668,15 +668,15 @@ def load_control_catalog(language: str = "en", session_id: Optional[str] = None)
     """
     Load control catalog from CSV file with localization.
 
-    Note: Returns controls WITHOUT threat coverage or costs.
-    Those are populated by the AI generator based on context.
+    Populates each control's threats field with coverage data from
+    Control x Threat.csv so the structure matches HTTP API responses.
 
     Args:
         language: Output language (en/sk/cs)
         session_id: Session ID for client-specific catalogs (CSV provider ignores this)
 
     Returns:
-        List of PlannedControl objects with empty threats list
+        List of PlannedControl objects with threats populated from CSV
     """
     global _control_cache
 
@@ -688,6 +688,7 @@ def load_control_catalog(language: str = "en", session_id: Optional[str] = None)
 
     rows = _read_csv(CATALOG_BASE / "Control.csv")
     mapping = load_control_to_category()
+    coverage = load_control_threat_coverage()
 
     # Allowed categories (from PlannedControl model)
     allowed_categories = {
@@ -745,14 +746,22 @@ def load_control_catalog(language: str = "en", session_id: Optional[str] = None)
                 logger.warning(f"Invalid category '{category}' for control '{name}', using 'Other'")
                 category = "Other"
 
+        # Build threats list from coverage CSV (use base_name for lookup)
+        ctrl_coverage = coverage.get(base_name, {})
+        ctrl_threats = [
+            ThreatCoverage(threatName=t_name, riskCoverage=t_val)
+            for t_name, t_val in ctrl_coverage.items()
+            if t_val > 0
+        ]
+
         controls.append(PlannedControl(
-            id=None,  # No ID from catalog
+            id=None,
             name=name,
             description=desc if desc else None,
             category=category,
-            implementationCost=None,  # AI estimates these
+            implementationCost=None,
             estimatedAnnualCost=None,
-            threats=[]  # AI populates based on context
+            threats=ctrl_threats,
         ))
 
     # Cache only EN version

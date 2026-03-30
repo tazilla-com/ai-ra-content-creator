@@ -50,12 +50,17 @@ class LLMConfig(BaseModel):
     """Strict config built from Settings (no os.getenv)."""
     model_config = ConfigDict(extra="forbid")
 
-    provider: Literal["openai"] = Field("openai", description="LLM provider identifier.")
+    provider: Literal["openai", "azure"] = Field("openai", description="LLM provider identifier.")
     model: StrictStr = Field(DEFAULT_MODEL, description="Model name (e.g., gpt-4o-mini).")
     temperature: StrictFloat = Field(0.2, ge=0.0, le=2.0, description="Sampling temperature.")
     http_timeout_sec: StrictInt = Field(30, ge=1, le=300, description="HTTP timeout in seconds.")
     max_retries: StrictInt = Field(3, ge=0, le=10, description="HTTP retry attempts.")
     api_key: Optional[StrictStr] = Field(default=None, description="Provider API key.")
+
+    # Azure OpenAI settings
+    azure_endpoint: Optional[StrictStr] = Field(default=None, description="Azure OpenAI endpoint URL.")
+    azure_api_version: StrictStr = Field("2025-01-01-preview", description="Azure OpenAI API version.")
+    azure_deployment: Optional[StrictStr] = Field(default=None, description="Azure deployment name (defaults to model).")
 
     # Tracing (LangSmith / LangChain v2)
     tracing_v2_enabled: StrictBool = Field(False, description="Enable LangSmith tracing v2.")
@@ -92,12 +97,15 @@ class LLMConfig(BaseModel):
         temperature = override_temperature if override_temperature is not None else float(getattr(llm, "temperature", 0.2))
 
         cfg = cls(
-            provider="openai",
+            provider=getattr(llm, "provider", "openai") or "openai",
             model=model,
             temperature=temperature,
             http_timeout_sec=int(getattr(llm, "http_timeout_sec", 30)),
             max_retries=int(getattr(llm, "openai_max_retries", 3)),
             api_key=getattr(llm, "api_key", None),
+            azure_endpoint=getattr(llm, "azure_endpoint", None),
+            azure_api_version=getattr(llm, "azure_api_version", "2025-01-01-preview") or "2025-01-01-preview",
+            azure_deployment=getattr(llm, "azure_deployment", None),
             tracing_v2_enabled=bool(getattr(lc, "tracing_v2", False)) if lc else False,
             tracing_api_key=(getattr(lc, "api_key", None) if lc else None),
             tracing_endpoint=(getattr(lc, "endpoint", None) if lc else None),
@@ -137,6 +145,25 @@ def make_llm_client(cfg: LLMConfig) -> Any:
     """
     _assert_openai_available()
     _apply_tracing(cfg)
+
+    if cfg.provider == "azure":
+        if not cfg.api_key:
+            raise RuntimeError("Azure OpenAI API key is missing in Settings.llm.api_key.")
+        if not cfg.azure_endpoint:
+            raise RuntimeError("Azure OpenAI endpoint is missing in Settings.llm.azure_endpoint.")
+        try:
+            from langchain_openai import AzureChatOpenAI  # type: ignore
+        except ImportError:
+            raise RuntimeError("langchain_openai AzureChatOpenAI not available. Install langchain-openai.")
+        return AzureChatOpenAI(  # type: ignore[call-arg]
+            azure_deployment=cfg.azure_deployment or cfg.model,
+            azure_endpoint=cfg.azure_endpoint,
+            api_key=cfg.api_key,
+            api_version=cfg.azure_api_version,
+            temperature=cfg.temperature,
+            timeout=cfg.http_timeout_sec,
+            max_retries=cfg.max_retries,
+        )
 
     if cfg.provider == "openai":
         if not cfg.api_key:

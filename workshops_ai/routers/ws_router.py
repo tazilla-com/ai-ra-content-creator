@@ -17,6 +17,8 @@ from workshops_ai.schemas.ws_protocol import (
     HelloPayload,
     ErrorPayload,
     HistorySyncPayload,
+    UIResponsePayload,
+    UsagePayload,
     WorkshopId,
     ConversationMessage,
 )
@@ -52,6 +54,9 @@ logger = logging.getLogger(__name__)
 _settings = get_settings()
 WS_TIMEOUT_SEC = _settings.ws.timeout_sec
 
+# Track running agent tasks per session for cancel support
+_running_tasks: dict[str, asyncio.Task] = {}
+
 
 def _uuid7_str() -> str:
     """Generate a UUID v7 string (timestamp-based, per RFC 9562)."""
@@ -79,7 +84,9 @@ def _ensure_asset_ids(assets: list[dict]) -> list[dict]:
 async def _ws_send(ws: WebSocket, event_type: str, payload: dict[str, Any] | None = None) -> None:
     """Send message to client with error handling"""
     try:
-        await ws.send_json({"type": event_type, "payload": payload or {}})
+        import json
+        data = {"type": event_type, "payload": payload or {}}
+        await ws.send_text(json.dumps(data, default=str))
     except WebSocketDisconnect:
         return
     except RuntimeError as e:
@@ -264,11 +271,10 @@ async def handle_chat(
         input_assets = initial_state.get("input_assets", [])
         logger.info(f"Invoking agent: {len(input_assets)} assets, {len(conversation_history)} history msgs")
 
-        result = await invoke_asset_agent(
+        task = asyncio.create_task(invoke_asset_agent(
             message=chat_payload.message,
             session_id=session.session_id,
             workshop_id=workshop_id,
-            # No organization - agent will call scrape_company_info to get wizard_metadata.website_content
             input_assets=initial_state.get("input_assets"),
             selected_assets=initial_state.get("selected_assets"),
             valid_asset_types=initial_state.get("valid_asset_types"),
@@ -276,7 +282,12 @@ async def handle_chat(
             recent_operations=initial_state.get("recent_operations"),
             conversation_history=conversation_history,
             model=chat_payload.model,
-        )
+        ))
+        _running_tasks[session.session_id] = task
+        try:
+            result = await task
+        finally:
+            _running_tasks.pop(session.session_id, None)
 
         # Extract tools used from agent messages
         from langchain_core.messages import ToolMessage
@@ -410,45 +421,47 @@ async def handle_chat(
                 session_id=session.session_id,
                 details=error
             )
-        elif needs_clarification:
-            await _ws_send(ws, "clarification", {
-                "question": clarification_question,
-                "session_id": session.session_id
-            })
-        elif generated_assets or deleted_asset_names:
-            # Determine action for frontend display
-            has_creates = generated_assets and not any(
-                a.get("id") in {o.get("id") for o in original_assets_snapshot if o.get("id")}
-                for a in generated_assets if a.get("id")
-            )
-            has_updates = generated_assets and not has_creates
-            has_deletes = bool(deleted_asset_names)
-
-            if has_deletes and not generated_assets:
-                action = "deleted"
-            elif has_updates:
-                action = "updated"
-            elif has_creates:
-                action = "created"
-            else:
-                action = "created"
-
-            await _ws_send(ws, "assets_generated", {
-                "action": action,
-                "assets": generated_assets,
-                "patches": patches,
-                "tools_used": tools_used,
-                "message": final_message,
-                "session_id": session.session_id
-            })
         else:
-            await _ws_send(ws, "message", {
-                "content": final_message,
-                "session_id": session.session_id
-            })
+            # Determine action
+            action = None
+            if generated_assets or deleted_asset_names:
+                has_creates = generated_assets and not any(
+                    a.get("id") in {o.get("id") for o in original_assets_snapshot if o.get("id")}
+                    for a in generated_assets if a.get("id")
+                )
+                has_updates = generated_assets and not has_creates
+                has_deletes = bool(deleted_asset_names)
+
+                if has_deletes and not generated_assets:
+                    action = "deleted"
+                elif has_updates:
+                    action = "updated"
+                elif has_creates:
+                    action = "created"
+                else:
+                    action = "created"
+
+            # Extract usage from agent result
+            usage = _extract_usage(result)
+
+            # Unified ui_response for all non-error cases
+            response_message = clarification_question if needs_clarification else final_message
+            payload = UIResponsePayload(
+                message=response_message or "No response",
+                patches=patches if patches else None,
+                assets=generated_assets if generated_assets else None,
+                tools_used=tools_used,
+                usage=usage,
+                action=action,
+            )
+            await _ws_send(ws, "ui_response", payload.model_dump())
 
         await _ws_send(ws, "progress", {"status": "done", "session_id": session.session_id})
 
+    except asyncio.CancelledError:
+        logger.info(f"Agent task cancelled for session {session.session_id}")
+        # busy flag cleared by cancel handler
+        return
     except asyncio.TimeoutError:
         await _ws_error(
             ws,
@@ -587,6 +600,18 @@ async def ws_endpoint(
                 await handle_sync_history(ws, session)
                 continue
 
+            if client_msg.type == "cancel":
+                task = _running_tasks.pop(session_id, None)
+                if task and not task.done():
+                    task.cancel()
+                session = await get_session(session_id) or session
+                if session.busy:
+                    session.busy = False
+                    session.busy_since = None
+                    await save_session(session)
+                logger.info(f"Cancel received", extra={"session_id": session_id})
+                continue
+
             if client_msg.type == "chat":
                 if not client_msg.payload:
                     await _ws_error(
@@ -621,6 +646,10 @@ async def ws_endpoint(
     except Exception as e:
         logger.exception(f"Unexpected error in WebSocket handler: {e}", extra={"session_id": session_id})
     finally:
+        # Cancel running task on disconnect
+        task = _running_tasks.pop(session_id, None)
+        if task and not task.done():
+            task.cancel()
         try:
             await WsHub.unregister(ws)
         except Exception:
@@ -659,3 +688,42 @@ def _extract_final_message(agent_result: dict) -> str:
             exc_info=True
         )
         return "Error extracting response"
+
+
+def _extract_usage(agent_result: dict) -> UsagePayload | None:
+    """
+    Sum token usage from all AIMessage objects in agent result.
+
+    LangChain AIMessage.usage_metadata contains input_tokens, output_tokens, total_tokens.
+    Falls back to response_metadata.token_usage (OpenAI-specific).
+    """
+    try:
+        from langchain_core.messages import AIMessage
+
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        for msg in agent_result.get("messages", []):
+            if not isinstance(msg, AIMessage):
+                continue
+
+            if msg.usage_metadata:
+                prompt_tokens += msg.usage_metadata.get("input_tokens", 0)
+                completion_tokens += msg.usage_metadata.get("output_tokens", 0)
+            elif hasattr(msg, "response_metadata"):
+                tu = msg.response_metadata.get("token_usage", {})
+                prompt_tokens += tu.get("prompt_tokens", 0)
+                completion_tokens += tu.get("completion_tokens", 0)
+
+        if prompt_tokens == 0 and completion_tokens == 0:
+            return None
+
+        return UsagePayload(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        )
+
+    except Exception as e:
+        logger.warning(f"Failed to extract usage: {e}")
+        return None

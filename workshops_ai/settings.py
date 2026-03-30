@@ -218,6 +218,12 @@ class LLMSettings(BaseModel):
     openai_max_retries: int = 3
     api_key: Optional[str] = None
 
+    # Azure OpenAI settings (used when provider=azure)
+    provider: str = "openai"  # "openai" or "azure"
+    azure_endpoint: Optional[str] = None  # e.g. https://myresource.openai.azure.com/
+    azure_api_version: str = "2025-01-01-preview"
+    azure_deployment: Optional[str] = None  # if None, uses model name as deployment name
+
 
 class ChatSettings(BaseModel):
     """

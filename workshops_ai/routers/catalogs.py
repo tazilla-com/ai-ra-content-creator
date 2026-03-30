@@ -15,6 +15,7 @@ Endpoints:
 - GET /api/catalogs/impact-categories - Impact category catalog
 - GET /api/catalogs/threat-categories - Threat category catalog
 - GET /api/catalogs/control-categories - Control category catalog
+- GET /api/catalogs/scraped-content - Scraped website content for a session
 
 All endpoints support:
 - language parameter (en/sk/cs) for localized names
@@ -28,6 +29,7 @@ from fastapi import APIRouter, Query, HTTPException, status, Header
 from pydantic import BaseModel, Field, ConfigDict
 
 from workshops_ai.wizard.catalog_provider import get_catalog_provider
+from workshops_ai.wizard.session import get_wizard_metadata
 from workshops_ai.api.schema.impact import Impact
 from workshops_ai.api.schema.threat import Threat
 from workshops_ai.api.schema.control import PlannedControl
@@ -87,6 +89,18 @@ class AssetTypeCatalogResponse(BaseModel):
 
     total: int = Field(..., description="Total number of asset types")
     assetTypes: List[AssetTypeItem] = Field(..., description="List of asset types")
+
+
+class ScrapedContentResponse(BaseModel):
+    """Response for scraped website content endpoint.
+
+    In production, the Tazilla backend should implement an equivalent endpoint
+    that returns scraped content in this format for a given session.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    url: Optional[str] = Field(None, description="Website URL (final URL after redirects)")
+    content: Optional[str] = Field(None, description="Combined scraped content from all pages")
 
 
 class CategoryItem(BaseModel):
@@ -609,4 +623,94 @@ async def get_sector_catalog(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to load sector catalog: {str(e)}"
+        )
+
+
+# =============================================================================
+# Scraped Content Endpoint (reference implementation for Tazilla backend)
+# =============================================================================
+
+@router.get(
+    "/scraped-content",
+    response_model=ScrapedContentResponse,
+    summary="Get scraped website content for session",
+    description=(
+        "Returns scraped website content stored for a given session. "
+        "If no content has been scraped yet, returns null fields.\n\n"
+        "**Reference implementation:** The Tazilla backend should implement "
+        "an equivalent endpoint that returns the same ScrapedContentResponse format. "
+        "The AI service will call that endpoint to retrieve pre-scraped content "
+        "instead of scraping websites directly."
+    )
+)
+async def get_scraped_content(
+    x_session_id: str = Header(
+        ...,
+        alias="X-Session-Id",
+        description="Session ID (required — identifies which session's scraped data to return)"
+    )
+) -> ScrapedContentResponse:
+    """
+    Get scraped website content for a session.
+
+    Returns the content that was previously scraped via POST /scrape/website
+    or via wizard endpoints (services, assets, etc.) and cached in the session.
+
+    This endpoint serves as a **reference implementation** for the Tazilla backend.
+    In production, the AI service will call the Tazilla backend's equivalent endpoint
+    to retrieve pre-scraped website content for a given session.
+
+    Expected contract:
+    - Input: X-Session-Id header
+    - Output: ScrapedContentResponse with url, content, sources
+    - If no data available: return 200 with null fields (not 404)
+
+    Args:
+        x_session_id: Session ID
+
+    Returns:
+        ScrapedContentResponse with scraped content or null fields if not available
+    """
+    try:
+        metadata = await get_wizard_metadata(x_session_id)
+
+        content = metadata.get("website_content")
+        url = metadata.get("website_url")
+
+        if not content:
+            logger.info(
+                "scraped_content_not_found",
+                extra={"session_id": x_session_id}
+            )
+            return ScrapedContentResponse(
+                url=None,
+                content=None,
+            )
+
+        logger.info(
+            "scraped_content_retrieved",
+            extra={
+                "session_id": x_session_id,
+                "url": url,
+                "content_length": len(content) if content else 0,
+            }
+        )
+
+        return ScrapedContentResponse(
+            url=url,
+            content=content,
+        )
+
+    except Exception as e:
+        logger.error(
+            "scraped_content_load_failed",
+            extra={
+                "session_id": x_session_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            }
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load scraped content: {str(e)}"
         )

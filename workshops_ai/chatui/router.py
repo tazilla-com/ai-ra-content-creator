@@ -274,16 +274,13 @@ async def demo_page() -> str:
               if (data.type === 'hello' && data.payload && data.payload.message) {
                 line('ai', data.payload.message);
               }
-              if (data.type === 'message' && data.payload && data.payload.content) {
-                line('ai', data.payload.content);
-              }
-              if (data.type === 'assets_generated' && data.payload) {
+              if (data.type === 'ui_response' && data.payload) {
                 if (data.payload.message) {
                   line('ai', data.payload.message);
                 }
-                var action = data.payload.action || 'created';
-                if (data.payload.assets && data.payload.assets.length > 0) {
-                  var label = action === 'updated' ? 'Assets updated: ' : 'Assets created: ';
+                var action = data.payload.action;
+                if (action && data.payload.assets && data.payload.assets.length > 0) {
+                  var label = action === 'updated' ? 'Assets updated: ' : action === 'deleted' ? 'Assets deleted: ' : 'Assets created: ';
                   line('sys', label + data.payload.assets.length);
                   data.payload.assets.forEach(function(asset) {
                     line('sys', '  → ' + asset.name + ' (' + (asset.confidentiality || 'null') + '/' + (asset.integrity || 'null') + '/' + (asset.availability || 'null') + ')');
@@ -295,6 +292,14 @@ async def demo_page() -> str:
                     line('sys', 'Assets deleted: ' + removePatches.length);
                   }
                 }
+                // Usage is visible in the events panel (JSON), not in chat
+              }
+              // Legacy support for old event types
+              if (data.type === 'message' && data.payload && data.payload.content) {
+                line('ai', data.payload.content);
+              }
+              if (data.type === 'assets_generated' && data.payload && data.payload.message) {
+                line('ai', data.payload.message);
               }
               if (data.type === 'progress' && data.payload) {
                 line('sys', 'Status: ' + data.payload.status);

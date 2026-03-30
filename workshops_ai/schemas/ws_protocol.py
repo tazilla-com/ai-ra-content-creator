@@ -78,7 +78,7 @@ class ChatPayload(BaseModel):
 class ClientMessage(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    type: Literal["chat", "ping", "sync_history"]
+    type: Literal["chat", "ping", "sync_history", "cancel"]
     payload: Optional[JSONDict] = None
 
 
@@ -99,6 +99,15 @@ class ToolStatusPayload(BaseModel):
     message: Optional[StrictStr] = None
 
 
+class UsagePayload(BaseModel):
+    """Token usage and cost metrics for a single agent turn."""
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
 class UIResponsePayload(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -106,6 +115,8 @@ class UIResponsePayload(BaseModel):
     patches: Optional[List[JsonPatch]] = None
     assets: Optional[List[AssetOutput]] = None
     tools_used: List[StrictStr] = Field(default_factory=list)
+    usage: Optional[UsagePayload] = None
+    action: Optional[Literal["created", "updated", "deleted"]] = None
 
 
 class ConversationMessage(BaseModel):
@@ -144,7 +155,7 @@ class ErrorPayload(BaseModel):
 class AgentMessage(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    type: Literal["hello", "pong", "tool_status", "ui_response", "history_sync", "error"]
+    type: Literal["hello", "pong", "tool_status", "ui_response", "history_sync", "error", "progress"]
     payload: JSONDict = Field(default_factory=dict)
 
 
@@ -166,4 +177,5 @@ __all__ = [
     "ConversationMessage",
     "HistorySyncPayload",
     "ErrorPayload",
+    "UsagePayload",
 ]

@@ -1027,11 +1027,14 @@ class RiskGenerator:
         all_threat_names = await builder.get_catalog_names("threats")
         allowed_names_set = set(all_threat_names)
 
-        # Load AssetType→Threat mapping from provider (CSV or API)
+        # Build AssetType→Threat mapping from threat catalog's assetTypes field
         threat_mapping: Dict[str, List[str]] = {}
         try:
             provider = get_catalog_provider()
-            threat_mapping = await provider.load_asset_type_threat_mapping(session_id=session_id)
+            threat_catalog = await provider.load_threat_catalog(session_id=session_id)
+            for threat in threat_catalog:
+                for asset_type in threat.assetTypes:
+                    threat_mapping.setdefault(asset_type, []).append(threat.name)
             logger.info(f"Loaded threat mapping for {len(threat_mapping)} asset types")
         except Exception as e:
             logger.warning(f"Failed to load threat mapping, using all threats: {e}")

@@ -1220,10 +1220,23 @@ class ControlGenerator:
         # Initialize prompt context builder with session-based caching
         builder = PromptContextBuilder(session_id=session_id)
 
-        # Load control catalog and threat coverage from provider (CSV or API)
+        # Load control catalog from provider (CSV or API)
+        # Coverage is already embedded in each control's threats field
         provider = get_catalog_provider()
         control_catalog = await provider.load_control_catalog(session_id=session_id)
-        threat_coverage = await provider.load_control_threat_coverage(session_id=session_id)
+
+        # Build threat_coverage dict from control catalog's embedded threats
+        threat_coverage: Dict[str, Dict[str, int]] = {}
+        for ctrl in control_catalog:
+            if ctrl.threats:
+                ctrl_cov = {}
+                for tc in ctrl.threats:
+                    try:
+                        ctrl_cov[tc.threatName] = int(tc.riskCoverage)
+                    except (ValueError, TypeError):
+                        continue
+                if ctrl_cov:
+                    threat_coverage[ctrl.name] = ctrl_cov
 
         # Build asset-risk lookup
         risk_lookup: Dict[str, AssetRisk] = {}

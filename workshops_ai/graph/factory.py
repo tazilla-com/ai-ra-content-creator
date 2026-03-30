@@ -40,7 +40,7 @@ from workshops_ai.graph.checkpointer import make_checkpointer as _central_make_c
 from workshops_ai.rag.retriever import make_retriever as _rag_make_retriever
 
 # LangChain OpenAI chat model with throttling
-from workshops_ai.llm.throttled_client import ThrottledChatOpenAI as ChatOpenAI
+from workshops_ai.llm.throttled_client import ThrottledChatOpenAI as ChatOpenAI, ThrottledAzureChatOpenAI
 
 # Unified submit wrapper (online → OUTBOX fallback)
 from workshops_ai.app.services.outbox_writer import (  # type: ignore
@@ -150,12 +150,34 @@ def _get_llm_client_cached(
     max_retries: Optional[int],
     api_key: str,
     base_url: Optional[str],
+    provider: str = "openai",
+    azure_endpoint: Optional[str] = None,
+    azure_api_version: Optional[str] = None,
+    azure_deployment: Optional[str] = None,
 ) -> Any:
     """
-    Build a LangChain ChatOpenAI client and cache it by its immutable config.
+    Build a LangChain ChatOpenAI/AzureChatOpenAI client and cache it by its immutable config.
     This avoids re-instantiation per request/graph build.
     """
-    kwargs: dict[str, Any] = {
+    if provider == "azure":
+        if ThrottledAzureChatOpenAI is None:
+            raise RuntimeError("langchain_openai AzureChatOpenAI is not available.")
+        kwargs: dict[str, Any] = {
+            "azure_deployment": azure_deployment or model,
+            "azure_endpoint": azure_endpoint,
+            "api_key": api_key,
+            "api_version": azure_api_version or "2025-01-01-preview",
+            "temperature": float(temperature),
+        }
+        if http_timeout_sec is not None:
+            kwargs["timeout"] = int(http_timeout_sec)
+            kwargs["request_timeout"] = int(http_timeout_sec)
+        if max_retries is not None:
+            kwargs["max_retries"] = int(max_retries)
+        return ThrottledAzureChatOpenAI(**kwargs)  # type: ignore[call-arg]
+
+    # Default: OpenAI
+    kwargs = {
         "model": model,
         "api_key": api_key,
         "openai_api_key": api_key,
@@ -165,7 +187,6 @@ def _get_llm_client_cached(
         kwargs["base_url"] = base_url
         kwargs["openai_api_base"] = base_url
     if http_timeout_sec is not None:
-        # NOTE: ChatOpenAI param name varies across versions; our env uses 'timeout'.
         kwargs["timeout"] = int(http_timeout_sec)
         kwargs["request_timeout"] = int(http_timeout_sec)
     if max_retries is not None:
@@ -694,14 +715,19 @@ def make_default_deps(
     if llm_temperature is None:
         llm_temperature = float(getattr(getattr(s, "llm", object()), "temperature", 0.2))
 
-    model = getattr(getattr(s, "llm", object()), "model", None)
-    api_key = getattr(getattr(s, "llm", object()), "api_key", None) or getattr(s, "openai_api_key", None)
-    base_url = getattr(getattr(s, "llm", object()), "base_url", None) or getattr(s, "openai_base_url", None)
-    http_timeout = getattr(getattr(s, "llm", object()), "http_timeout_sec", None)
-    max_retries = getattr(getattr(s, "llm", object()), "openai_max_retries", None)
+    llm_settings = getattr(s, "llm", object())
+    model = getattr(llm_settings, "model", None)
+    api_key = getattr(llm_settings, "api_key", None) or getattr(s, "openai_api_key", None)
+    base_url = getattr(llm_settings, "base_url", None) or getattr(s, "openai_base_url", None)
+    http_timeout = getattr(llm_settings, "http_timeout_sec", None)
+    max_retries = getattr(llm_settings, "openai_max_retries", None)
+    provider = getattr(llm_settings, "provider", "openai") or "openai"
+    azure_endpoint = getattr(llm_settings, "azure_endpoint", None)
+    azure_api_version = getattr(llm_settings, "azure_api_version", None)
+    azure_deployment = getattr(llm_settings, "azure_deployment", None)
 
     if not model or not api_key:
-        raise RuntimeError("ChatOpenAI cannot be constructed: missing llm.model or API key in settings.")
+        raise RuntimeError("LLM client cannot be constructed: missing llm.model or API key in settings.")
 
     llm_client = _get_llm_client_cached(
         model=model,
@@ -710,6 +736,10 @@ def make_default_deps(
         http_timeout_sec=http_timeout,
         max_retries=max_retries,
         base_url=base_url,
+        provider=provider,
+        azure_endpoint=azure_endpoint,
+        azure_api_version=azure_api_version,
+        azure_deployment=azure_deployment,
     )
 
     try:

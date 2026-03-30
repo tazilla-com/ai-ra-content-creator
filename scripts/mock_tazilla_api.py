@@ -144,6 +144,25 @@ def load_controls() -> List[Dict[str, Any]]:
         if ctrl_name and cat_name:
             ctrl_cat[ctrl_name] = cat_name
 
+    # Load control-to-threat coverage
+    cov_rows = _read_csv(CATALOG_BASE / "Control x Threat.csv")
+    ctrl_threats: Dict[str, List[Dict[str, Any]]] = {}
+    for r in cov_rows:
+        ctrl_name = (r.get("Control") or "").strip()
+        threat_name = (r.get("Threat") or "").strip()
+        value_str = (r.get("Value") or "0").strip()
+        if not ctrl_name or not threat_name:
+            continue
+        try:
+            value = int(value_str)
+        except ValueError:
+            continue
+        if value > 0:
+            ctrl_threats.setdefault(ctrl_name, []).append({
+                "threatName": threat_name,
+                "riskCoverage": value,
+            })
+
     controls = []
     for r in rows:
         name = (r.get("EN Name") or r.get("Name") or "").strip()
@@ -158,7 +177,7 @@ def load_controls() -> List[Dict[str, Any]]:
             "category": category,
             "implementationCost": None,
             "estimatedAnnualCost": None,
-            "threats": [],
+            "threats": ctrl_threats.get(name, []),
         })
     return controls
 
@@ -270,43 +289,6 @@ async def get_control_categories(x_session_id: str = Header(None, alias="X-Sessi
     data = load_categories("Control category.csv")
     logger.info(f"[control-categories] session={x_session_id} count={len(data)}")
     return {"categories": data}
-
-
-@app.get("/catalogs/control-threat-coverage")
-async def get_control_threat_coverage(x_session_id: str = Header(None, alias="X-Session-Id")):
-    """Returns {"coverage": {"Control Name": {"Threat Name": 50, ...}, ...}}"""
-    rows = _read_csv(CATALOG_BASE / "Control x Threat.csv")
-    coverage: Dict[str, Dict[str, int]] = {}
-    for r in rows:
-        control = (r.get("Control") or "").strip()
-        threat = (r.get("Threat") or "").strip()
-        value_str = (r.get("Value") or "0").strip()
-        if not control or not threat:
-            continue
-        try:
-            value = int(value_str)
-        except ValueError:
-            continue
-        if control not in coverage:
-            coverage[control] = {}
-        coverage[control][threat] = value
-    logger.info(f"[control-threat-coverage] session={x_session_id} controls={len(coverage)}")
-    return {"coverage": coverage}
-
-
-@app.get("/catalogs/asset-type-threat-mapping")
-async def get_asset_type_threat_mapping(x_session_id: str = Header(None, alias="X-Session-Id")):
-    """Returns {"mapping": {"Asset Type": ["Threat1", ...], ...}}"""
-    rows = _read_csv(CATALOG_BASE / "Asset type x Threat.csv")
-    mapping: Dict[str, List[str]] = {}
-    for r in rows:
-        asset_type = (r.get("Asset type") or "").strip()
-        threat = (r.get("Threat") or "").strip()
-        if not asset_type or not threat:
-            continue
-        mapping.setdefault(asset_type, []).append(threat)
-    logger.info(f"[asset-type-threat-mapping] session={x_session_id} types={len(mapping)}")
-    return {"mapping": mapping}
 
 
 @app.get("/health")
