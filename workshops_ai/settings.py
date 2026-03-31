@@ -834,7 +834,7 @@ class AppSettings(BaseSettings):
             self.llm.model = self.llm_model_flat
         if self.llm_temperature_flat is not None:
             self.llm.temperature = float(self.llm_temperature_flat)
-        if self.openai_api_key_flat:
+        if self.openai_api_key_flat and not self.llm.api_key:
             self.llm.api_key = self.openai_api_key_flat
 
         # RAG back-compat: prefer chroma_dir if provided
