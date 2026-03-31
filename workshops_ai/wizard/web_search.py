@@ -21,7 +21,7 @@ import asyncio
 from urllib.parse import urlparse
 from typing import Optional, Tuple
 
-from openai import AsyncOpenAI, RateLimitError, APIConnectionError
+from openai import AsyncOpenAI, AsyncAzureOpenAI, RateLimitError, APIConnectionError
 
 from workshops_ai.settings import get_settings
 from workshops_ai.wizard.exceptions import AIResponseError, AITimeoutError
@@ -172,17 +172,25 @@ async def _get_website_via_search_impl(
             details={"error": str(e)}
         ) from e
 
-    # Initialize OpenAI client
+    # Initialize OpenAI client (Azure or direct OpenAI)
     if not settings.llm.api_key:
         raise AIResponseError(
-            "OpenAI API key not configured",
+            "API key not configured",
             model=settings.wizard.web_search_model
         )
 
-    client = AsyncOpenAI(
-        api_key=settings.llm.api_key,
-        timeout=settings.wizard.web_search_timeout_sec,
-    )
+    if settings.llm.provider == "azure":
+        client = AsyncAzureOpenAI(
+            api_key=settings.llm.api_key,
+            azure_endpoint=settings.llm.azure_endpoint,
+            api_version="2025-03-01-preview",  # Responses API requires 2025-03-01-preview+
+            timeout=settings.wizard.web_search_timeout_sec,
+        )
+    else:
+        client = AsyncOpenAI(
+            api_key=settings.llm.api_key,
+            timeout=settings.wizard.web_search_timeout_sec,
+        )
     model = settings.wizard.web_search_model  # Always use configured model, ignore ai_model parameter
 
     # Construct search prompt from template (either Langfuse or local)

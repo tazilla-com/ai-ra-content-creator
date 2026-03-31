@@ -31,21 +31,27 @@ def create_wizard_llm_client(
     if resolved_model not in settings.wizard.allowed_models:
         raise ModelNotAllowedError(resolved_model, settings.wizard.allowed_models)
 
+    # Reasoning models (gpt-5*, o1*, o3*, o4*) don't support temperature parameter
+    _REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+    is_reasoning = any(resolved_model.startswith(p) for p in _REASONING_PREFIXES)
+
     # Azure OpenAI provider
     if settings.llm.provider == "azure":
         if ThrottledAzureChatOpenAI is None:
             raise RuntimeError("langchain_openai AzureChatOpenAI is not available. Install langchain-openai.")
 
         client_kwargs = {
-            "azure_deployment": settings.llm.azure_deployment or resolved_model,
+            "azure_deployment": resolved_model,
             "azure_endpoint": settings.llm.azure_endpoint,
             "api_key": settings.llm.api_key,
             "api_version": settings.llm.azure_api_version,
-            "temperature": settings.llm.temperature,
             "timeout": settings.wizard.llm_timeout_sec,
             "max_retries": 0,
             "include_response_headers": True,
         }
+
+        if not is_reasoning:
+            client_kwargs["temperature"] = settings.llm.temperature
 
         if response_format is not None:
             client_kwargs["model_kwargs"] = {"response_format": response_format}
@@ -55,12 +61,14 @@ def create_wizard_llm_client(
     # Default: OpenAI provider
     client_kwargs = {
         "model": resolved_model,
-        "temperature": settings.llm.temperature,
         "openai_api_key": settings.llm.api_key,
         "timeout": settings.wizard.llm_timeout_sec,
         "max_retries": 0,
         "include_response_headers": True,
     }
+
+    if not is_reasoning:
+        client_kwargs["temperature"] = settings.llm.temperature
 
     if response_format is not None:
         client_kwargs["model_kwargs"] = {"response_format": response_format}

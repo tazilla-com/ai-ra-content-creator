@@ -138,6 +138,11 @@ def _apply_tracing(cfg: LLMConfig) -> None:
         os.environ["LANGCHAIN_ENDPOINT"] = cfg.tracing_endpoint
 
 
+def _is_reasoning_model(model: str) -> bool:
+    """Reasoning models (gpt-5*, o1*, o3*, o4*) don't support temperature parameter."""
+    return any(model.startswith(p) for p in ("gpt-5", "o1", "o3", "o4"))
+
+
 def make_llm_client(cfg: LLMConfig) -> Any:
     """
     Create and return a LangChain chat model instance according to config.
@@ -155,15 +160,17 @@ def make_llm_client(cfg: LLMConfig) -> Any:
             from langchain_openai import AzureChatOpenAI  # type: ignore
         except ImportError:
             raise RuntimeError("langchain_openai AzureChatOpenAI not available. Install langchain-openai.")
-        return AzureChatOpenAI(  # type: ignore[call-arg]
-            azure_deployment=cfg.azure_deployment or cfg.model,
-            azure_endpoint=cfg.azure_endpoint,
-            api_key=cfg.api_key,
-            api_version=cfg.azure_api_version,
-            temperature=cfg.temperature,
-            timeout=cfg.http_timeout_sec,
-            max_retries=cfg.max_retries,
-        )
+        kwargs = {
+            "azure_deployment": cfg.azure_deployment or cfg.model,
+            "azure_endpoint": cfg.azure_endpoint,
+            "api_key": cfg.api_key,
+            "api_version": cfg.azure_api_version,
+            "timeout": cfg.http_timeout_sec,
+            "max_retries": cfg.max_retries,
+        }
+        if not _is_reasoning_model(cfg.model):
+            kwargs["temperature"] = cfg.temperature
+        return AzureChatOpenAI(**kwargs)  # type: ignore[call-arg]
 
     if cfg.provider == "openai":
         if not cfg.api_key:
@@ -171,13 +178,15 @@ def make_llm_client(cfg: LLMConfig) -> Any:
                 "OpenAI API key is missing in Settings.llm.api_key. "
                 "Provide it via your Settings loader (e.g., Pydantic BaseSettings)."
             )
-        return ChatOpenAI(  # type: ignore[call-arg]
-            model=cfg.model,
-            temperature=cfg.temperature,
-            timeout=cfg.http_timeout_sec,
-            max_retries=cfg.max_retries,
-            api_key=cfg.api_key,
-        )
+        kwargs = {
+            "model": cfg.model,
+            "timeout": cfg.http_timeout_sec,
+            "max_retries": cfg.max_retries,
+            "api_key": cfg.api_key,
+        }
+        if not _is_reasoning_model(cfg.model):
+            kwargs["temperature"] = cfg.temperature
+        return ChatOpenAI(**kwargs)  # type: ignore[call-arg]
 
     raise ValueError(f"Unsupported LLM provider: {cfg.provider!r}")
 

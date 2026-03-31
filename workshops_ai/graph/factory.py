@@ -159,6 +159,9 @@ def _get_llm_client_cached(
     Build a LangChain ChatOpenAI/AzureChatOpenAI client and cache it by its immutable config.
     This avoids re-instantiation per request/graph build.
     """
+    # Reasoning models (gpt-5*, o1*, o3*, o4*) don't support temperature parameter
+    is_reasoning = any(model.startswith(p) for p in ("gpt-5", "o1", "o3", "o4"))
+
     if provider == "azure":
         if ThrottledAzureChatOpenAI is None:
             raise RuntimeError("langchain_openai AzureChatOpenAI is not available.")
@@ -167,8 +170,9 @@ def _get_llm_client_cached(
             "azure_endpoint": azure_endpoint,
             "api_key": api_key,
             "api_version": azure_api_version or "2025-01-01-preview",
-            "temperature": float(temperature),
         }
+        if not is_reasoning:
+            kwargs["temperature"] = float(temperature)
         if http_timeout_sec is not None:
             kwargs["timeout"] = int(http_timeout_sec)
             kwargs["request_timeout"] = int(http_timeout_sec)
@@ -181,8 +185,9 @@ def _get_llm_client_cached(
         "model": model,
         "api_key": api_key,
         "openai_api_key": api_key,
-        "temperature": float(temperature),
     }
+    if not is_reasoning:
+        kwargs["temperature"] = float(temperature)
     if base_url:
         kwargs["base_url"] = base_url
         kwargs["openai_api_base"] = base_url

@@ -411,11 +411,12 @@ class ContentResolver:
             lock_key = f"wizard:lock:{search_method}:{website_url}"
 
             try:
+                lock_timeout = 120 if search_method == "web_search" else 30
                 async with redis_lock(
                     redis_client=self.redis,
                     lock_key=lock_key,
-                    timeout=30,  # Lock expires after 30s
-                    blocking_timeout=10,  # Wait up to 10s for lock
+                    timeout=lock_timeout,  # Lock expires after timeout (longer for web_search)
+                    blocking_timeout=lock_timeout,  # Wait same duration for lock
                 ):
                     # Double-check cache (another request might have fetched while we waited)
                     cached_content = await self._get_cached_content(session_id, website_url)
