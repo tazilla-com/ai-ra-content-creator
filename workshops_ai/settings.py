@@ -332,6 +332,8 @@ class WizardSettings(BaseModel):
     ENV mapping:
       WORKSHOPS_AI_WIZARD__LLM_TIMEOUT_SEC=60
       WORKSHOPS_AI_WIZARD__LLM_MAX_RETRIES=3
+      WORKSHOPS_AI_WIZARD__DEFAULT_MODEL=gpt-5-mini
+      WORKSHOPS_AI_WIZARD__TEMPERATURE=0.2
       WORKSHOPS_AI_WIZARD__ALLOWED_MODELS=["gpt-5","gpt-5-mini","gpt-4.1","gpt-4o","gpt-4o-mini"]
       WORKSHOPS_AI_WIZARD__EXPOSE_DEBUG_INFO=true
       WORKSHOPS_AI_WIZARD__MAX_CONTENT_LENGTH=20000
@@ -370,6 +372,14 @@ class WizardSettings(BaseModel):
     llm_max_retries: int = Field(
         default=3,
         description="Max retries for LLM validation errors"
+    )
+    default_model: str = Field(
+        default="gpt-5-mini",
+        description="Default LLM model for wizard steps (used when request body has no ai_model)"
+    )
+    temperature: float = Field(
+        default=0.2,
+        description="Temperature for non-reasoning models in wizard (reasoning models ignore this)"
     )
     allowed_models: list[str] = Field(
         default_factory=lambda: [
@@ -446,7 +456,7 @@ class WizardSettings(BaseModel):
         description="Enable AI web search as alternative to scraping"
     )
     web_search_model: str = Field(
-        default="gpt-4o",
+        default="gpt-5-nano",
         description="OpenAI model for web search (requires gpt-4o or newer)"
     )
     web_search_reasoning_effort: Optional[str] = Field(

@@ -95,7 +95,7 @@ class ControlGenerator:
             "ControlGenerator initialized",
             extra={
                 "model": self.model_name,
-                "temperature": settings.llm.temperature,
+                "temperature": settings.wizard.temperature,
                 "timeout_sec": settings.wizard.llm_timeout_sec,
             }
         )
@@ -216,7 +216,7 @@ class ControlGenerator:
                     input={
                         "model": self.model_name,
                         "messages_count": len(messages),
-                        "temperature": self.settings.llm.temperature,
+                        "temperature": self.settings.wizard.temperature,
                         "timeout_sec": self.settings.wizard.llm_timeout_sec,
                         "attempt_number": getattr(self, '_current_retry_attempt', 1),
                     },

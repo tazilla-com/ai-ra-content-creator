@@ -26,7 +26,7 @@ def create_wizard_llm_client(
     """
     settings = get_settings()
 
-    resolved_model = model or settings.llm.model
+    resolved_model = model or settings.wizard.default_model
 
     if resolved_model not in settings.wizard.allowed_models:
         raise ModelNotAllowedError(resolved_model, settings.wizard.allowed_models)
@@ -51,7 +51,7 @@ def create_wizard_llm_client(
         }
 
         if not is_reasoning:
-            client_kwargs["temperature"] = settings.llm.temperature
+            client_kwargs["temperature"] = settings.wizard.temperature
 
         if response_format is not None:
             client_kwargs["model_kwargs"] = {"response_format": response_format}
@@ -68,7 +68,7 @@ def create_wizard_llm_client(
     }
 
     if not is_reasoning:
-        client_kwargs["temperature"] = settings.llm.temperature
+        client_kwargs["temperature"] = settings.wizard.temperature
 
     if response_format is not None:
         client_kwargs["model_kwargs"] = {"response_format": response_format}
