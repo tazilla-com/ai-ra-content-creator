@@ -212,7 +212,7 @@ class LLMSettings(BaseModel):
     Legacy (flat) ENV handled in AppSettings.model_post_init():
       LLM_MODEL, LLM_TEMPERATURE, OPENAI_API_KEY
     """
-    model: str = "gpt-5-mini"
+    model: str = "gpt-5.1-chat"
     temperature: float = 0.2
     http_timeout_sec: int = 240
     openai_max_retries: int = 3
@@ -385,6 +385,10 @@ class WizardSettings(BaseModel):
         default_factory=lambda: [
             "gpt-5",
             "gpt-5-mini",
+            "gpt-5-nano",
+            "gpt-5.1-chat",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
             "gpt-4.1",
             "gpt-4o",
             "gpt-4o-mini"
