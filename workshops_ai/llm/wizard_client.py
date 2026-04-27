@@ -50,7 +50,10 @@ def create_wizard_llm_client(
             "include_response_headers": True,
         }
 
-        if not is_reasoning:
+        if is_reasoning:
+            if settings.wizard.reasoning_effort:
+                client_kwargs["reasoning_effort"] = settings.wizard.reasoning_effort
+        else:
             client_kwargs["temperature"] = settings.wizard.temperature
 
         if response_format is not None:
@@ -67,7 +70,10 @@ def create_wizard_llm_client(
         "include_response_headers": True,
     }
 
-    if not is_reasoning:
+    if is_reasoning:
+        if settings.wizard.reasoning_effort:
+            client_kwargs["reasoning_effort"] = settings.wizard.reasoning_effort
+    else:
         client_kwargs["temperature"] = settings.wizard.temperature
 
     if response_format is not None:

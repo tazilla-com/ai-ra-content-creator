@@ -381,6 +381,10 @@ class WizardSettings(BaseModel):
         default=0.2,
         description="Temperature for non-reasoning models in wizard (reasoning models ignore this)"
     )
+    reasoning_effort: Optional[str] = Field(
+        default="medium",
+        description="Reasoning effort for reasoning models: none, low, medium, high, xhigh (None = model default)"
+    )
     allowed_models: list[str] = Field(
         default_factory=lambda: [
             "gpt-5",

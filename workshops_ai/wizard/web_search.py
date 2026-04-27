@@ -61,8 +61,8 @@ async def get_website_via_search(
     if langfuse_client:
         with langfuse_client.start_as_current_span(
             name="web_search",
-            input={"url": url, "ai_model": ai_model},
-            metadata={"method": "web_search"}
+            input={"url": url, "ai_model": ai_model, "resolved_model": settings.wizard.web_search_model},
+            metadata={"method": "web_search", "model": settings.wizard.web_search_model}
         ) as search_span:
             try:
                 result = await _get_website_via_search_impl(url, ai_model, settings, search_span)
