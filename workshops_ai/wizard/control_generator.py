@@ -70,12 +70,13 @@ class ControlGenerator:
     - Per-asset processing
     """
 
-    def __init__(self, model: Optional[str] = None):
+    def __init__(self, model: Optional[str] = None, reasoning_effort: Optional[str] = None):
         """
         Initialize ControlGenerator with specified model.
 
         Args:
             model: OpenAI model name (defaults to settings if not provided)
+            reasoning_effort: Override reasoning effort (cascade: body > env > default)
 
         Raises:
             ModelNotAllowedError: If model not in allowed list
@@ -84,10 +85,12 @@ class ControlGenerator:
 
         settings = get_settings()
         self.settings = settings
+        self.reasoning_effort = reasoning_effort
 
         self.llm = create_wizard_llm_client(
             model=model,
-            response_format=ControlsResponse
+            response_format=ControlsResponse,
+            reasoning_effort=reasoning_effort,
         )
         self.model_name = self.llm.model_name
 
@@ -120,7 +123,7 @@ class ControlGenerator:
         Returns:
             List of relevant controls with catalog coverage hints
             Format: [{"name": "...", "description": "...", "category": "...",
-                     "catalog_coverage": {"threat1": 50, "threat2": 30}}]
+                     "risk_coverage": {"threat1": 50, "threat2": 30}}]
         """
         # Extract applicable threats (probability > 0)
         applicable_threats = {
@@ -154,7 +157,7 @@ class ControlGenerator:
                     "name": control_name,
                     "description": control.description or "",
                     "category": control.category,
-                    "catalog_coverage": covered_threats,
+                    "risk_coverage": covered_threats,
                 })
 
         logger.info(
@@ -339,7 +342,7 @@ class ControlGenerator:
             response_text: Raw LLM response (expects only control names)
             allowed_control_names: List of allowed control names from pre-filtered list
             asset_risk_threats: List of threat names from asset risks
-            relevant_controls: Pre-filtered controls with catalog_coverage mapping
+            relevant_controls: Pre-filtered controls with risk_coverage mapping
 
         Returns:
             List of validated PlannedControl objects with auto-populated threats
@@ -422,11 +425,11 @@ class ControlGenerator:
                                 f"Invalid estimatedAnnualCost for control '{name}', using None"
                             )
 
-                    # Auto-populate threats from catalog_coverage (not from LLM response)
-                    catalog_coverage = catalog_control.get("catalog_coverage", {})
+                    # Auto-populate threats from risk_coverage (not from LLM response)
+                    coverage_map = catalog_control.get("risk_coverage", {})
                     threats: List[ThreatCoverage] = []
 
-                    for threat_name, coverage_pct in catalog_coverage.items():
+                    for threat_name, coverage_pct in coverage_map.items():
                         try:
                             # Convert coverage to Decimal
                             risk_coverage = Decimal(str(coverage_pct))
@@ -515,13 +518,15 @@ class ControlGenerator:
         # Create batch LLM client with BatchControlsResponse format
         batch_llm = create_wizard_llm_client(
             model=self.model_name,
-            response_format=BatchControlsResponse
+            response_format=BatchControlsResponse,
+            reasoning_effort=self.reasoning_effort,
         )
 
         # Build batch data structures
         batch_assets_json_list = []
         batch_asset_risks_json_list = []
-        batch_relevant_controls_json_list = []
+        # Track per-asset relevant controls (used to build name-only mapping below).
+        asset_relevant_map: Dict[str, List[Dict[str, Any]]] = {}
         skipped_count = 0
 
         for asset in assets:
@@ -588,33 +593,64 @@ class ControlGenerator:
                 "assetName": asset.name,
                 "risks": risk_dicts
             })
-            batch_relevant_controls_json_list.append({
-                "assetName": asset.name,
-                "controls": relevant_controls
-            })
+            asset_relevant_map[asset.name] = relevant_controls
 
         if skipped_count == len(assets):
             logger.warning("All assets in batch skipped, returning empty results")
             return [], 0, 0, ""
 
+        # Build deduplicated catalog from the original catalog using union of threat names across
+        # the batch. Each control's risk_coverage is filtered to only the union — irrelevant
+        # threatNames are dropped, and coverage info is preserved across assets that share controls.
+        union_threat_names: set = set()
+        for asset_risks_entry in batch_asset_risks_json_list:
+            for risk in asset_risks_entry["risks"]:
+                union_threat_names.add(risk["threatName"])
+
+        deduplicated_catalog: List[Dict[str, Any]] = []
+        for control in control_catalog:
+            full_coverage = control_threat_coverage.get(control.name, {})
+            filtered_coverage = {
+                tn: pct for tn, pct in full_coverage.items()
+                if tn in union_threat_names and pct > 0
+            }
+            if filtered_coverage:
+                deduplicated_catalog.append({
+                    "name": control.name,
+                    "description": control.description or "",
+                    "category": control.category,
+                    "risk_coverage": filtered_coverage,
+                })
+
+        # Optional per-asset control name listing. Current prompt template doesn't reference it —
+        # LLM is expected to match controls→assets via risk_coverage in the deduplicated catalog.
+        controls_per_asset_list = [
+            {"assetName": asset_name, "controls": [c["name"] for c in relevant_list]}
+            for asset_name, relevant_list in asset_relevant_map.items()
+        ]
+
         logger.info(
-            f"Prepared batch with {len(batch_assets_json_list)} assets ({skipped_count} skipped)",
+            f"Prepared batch with {len(batch_assets_json_list)} assets ({skipped_count} skipped); "
+            f"deduplicated catalog has {len(deduplicated_catalog)} controls",
             extra={
                 "batch_size": len(batch_assets_json_list),
                 "skipped": skipped_count,
+                "deduplicated_controls": len(deduplicated_catalog),
             }
         )
 
         # Create JSON for batch
         assets_json = json.dumps(batch_assets_json_list, ensure_ascii=False)
         asset_risks_json = json.dumps(batch_asset_risks_json_list, ensure_ascii=False)
-        relevant_controls_json = json.dumps(batch_relevant_controls_json_list, ensure_ascii=False)
+        relevant_controls_json = json.dumps(deduplicated_catalog, ensure_ascii=False)
+        controls_per_asset_json = json.dumps(controls_per_asset_list, ensure_ascii=False)
 
         # Format messages with batch schema
         messages = prompt.format_messages(
             assets_json=assets_json,
             asset_risks_json=asset_risks_json,
             relevant_controls_json=relevant_controls_json,
+            controls_per_asset_json=controls_per_asset_json,
             controls_constraint=controls_constraint,
             controls_json_schema=BATCH_CONTROLS_JSON_SCHEMA,  # Use batch schema
             language=language,
@@ -1551,13 +1587,19 @@ class ControlGenerator:
                                                  for r in asset_risk.risks if r.probability > 0],
                                                 ensure_ascii=False
                                             )
+                                            # Single-asset path: deduplicated catalog == relevant_controls (no duplication possible)
                                             relevant_controls_json = json.dumps(relevant_controls, ensure_ascii=False)
+                                            controls_per_asset_json = json.dumps(
+                                                [{"assetName": asset.name, "controls": [c["name"] for c in relevant_controls]}],
+                                                ensure_ascii=False
+                                            )
 
                                             # Format prompt for debug preview
                                             messages = prompt.format_messages(
                                                 assets_json=asset_json,
                                                 asset_risks_json=asset_risks_json,
                                                 relevant_controls_json=relevant_controls_json,
+                                                controls_per_asset_json=controls_per_asset_json,
                                                 controls_constraint=controls_constraint,
                                                 controls_json_schema=CONTROLS_JSON_SCHEMA,
                                                 language=language,
@@ -1572,6 +1614,7 @@ class ControlGenerator:
                                                 assets_json=asset_json,
                                                 asset_risks_json=asset_risks_json,
                                                 relevant_controls_json=relevant_controls_json,
+                                                controls_per_asset_json=controls_per_asset_json,
                                                 controls_constraint=controls_constraint,
                                                 controls_json_schema=CONTROLS_JSON_SCHEMA,
                                                 language=language,

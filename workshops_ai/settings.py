@@ -383,7 +383,10 @@ class WizardSettings(BaseModel):
     )
     reasoning_effort: Optional[str] = Field(
         default="medium",
-        description="Reasoning effort for reasoning models: none, low, medium, high, xhigh (None = model default)"
+        description=(
+            "Reasoning effort for reasoning models. Accepts 'minimal' (gpt-5/-mini/-nano only), "
+            "'low', 'medium', 'high' (universal). Set to None to omit parameter (model default)."
+        )
     )
     allowed_models: list[str] = Field(
         default_factory=lambda: [
@@ -632,7 +635,7 @@ class AppSettings(BaseSettings):
     # App meta / server
     env: str = "dev"
     service_name: str = "AI Risk Analysis API"
-    version: str = "1.0.0"
+    version: str = "0.1.0"
     log_level: str = "INFO"
     app_host: str = "0.0.0.0"
     app_port: int = 8000

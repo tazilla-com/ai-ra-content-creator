@@ -63,12 +63,13 @@ class RiskGenerator:
     - Preserves catalog order
     """
 
-    def __init__(self, model: Optional[str] = None):
+    def __init__(self, model: Optional[str] = None, reasoning_effort: Optional[str] = None):
         """
         Initialize RiskGenerator with specified model.
 
         Args:
             model: OpenAI model name (defaults to settings if not provided)
+            reasoning_effort: Override reasoning effort (cascade: body > env > default)
 
         Raises:
             ModelNotAllowedError: If model not in allowed list
@@ -77,10 +78,12 @@ class RiskGenerator:
 
         settings = get_settings()
         self.settings = settings
+        self.reasoning_effort = reasoning_effort
 
         self.llm = create_wizard_llm_client(
             model=model,
-            response_format=RisksResponse
+            response_format=RisksResponse,
+            reasoning_effort=reasoning_effort,
         )
         self.model_name = self.llm.model_name
 
@@ -444,7 +447,8 @@ class RiskGenerator:
         # Create batch LLM client with BatchRisksResponse format
         batch_llm = create_wizard_llm_client(
             model=self.model_name,
-            response_format=BatchRisksResponse
+            response_format=BatchRisksResponse,
+            reasoning_effort=self.reasoning_effort,
         )
 
         # Select union of relevant threats for all assets in batch

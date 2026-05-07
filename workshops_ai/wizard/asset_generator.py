@@ -55,12 +55,13 @@ class AssetGenerator:
     - Supporting assets: Infrastructure/systems (CIA must be null)
     """
 
-    def __init__(self, model: Optional[str] = None):
+    def __init__(self, model: Optional[str] = None, reasoning_effort: Optional[str] = None):
         """
         Initialize AssetGenerator with specified model.
 
         Args:
             model: OpenAI model name (defaults to settings if not provided)
+            reasoning_effort: Override reasoning effort (cascade: body > env > default)
 
         Raises:
             ModelNotAllowedError: If model not in allowed list
@@ -70,11 +71,13 @@ class AssetGenerator:
 
         settings = get_settings()
         self.settings = settings
+        self.reasoning_effort = reasoning_effort
 
         # Create LLM client with structured outputs (Pydantic model)
         self.llm = create_wizard_llm_client(
             model=model,
-            response_format=AssetsResponse
+            response_format=AssetsResponse,
+            reasoning_effort=reasoning_effort,
         )
         self.model_name = self.llm.model_name
         self._current_retry_attempt = 1  # Track current retry attempt

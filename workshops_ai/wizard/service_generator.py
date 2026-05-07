@@ -45,12 +45,13 @@ class ServiceGenerator:
     Generates core business services from website content using LangChain + OpenAI.
     """
 
-    def __init__(self, model: Optional[str] = None):
+    def __init__(self, model: Optional[str] = None, reasoning_effort: Optional[str] = None):
         """
         Initialize ServiceGenerator with specified model.
 
         Args:
             model: OpenAI model name (defaults to settings if not provided)
+            reasoning_effort: Override reasoning effort (cascade: body > env > default)
 
         Raises:
             ModelNotAllowedError: If model not in allowed list
@@ -60,11 +61,13 @@ class ServiceGenerator:
 
         settings = get_settings()
         self.settings = settings
+        self.reasoning_effort = reasoning_effort
 
         # Create LLM client with structured outputs (Pydantic model)
         self.llm = create_wizard_llm_client(
             model=model,
-            response_format=ServicesResponse
+            response_format=ServicesResponse,
+            reasoning_effort=reasoning_effort,
         )
         self.model_name = self.llm.model_name
         self._current_retry_attempt = 1  # Track current retry attempt

@@ -318,7 +318,7 @@ async def generate_services(
     # Initialize components
     redis = await get_redis()
     content_resolver = ContentResolver(redis)
-    service_generator = ServiceGenerator(model=request.ai_model)
+    service_generator = ServiceGenerator(model=request.ai_model, reasoning_effort=request.reasoning_effort)
 
     # Step 1: Resolve website content
     # Check if explicitly disabled with empty website_content object {}
@@ -525,11 +525,11 @@ async def generate_assets(
     # Initialize components
     redis = await get_redis()
     content_resolver = ContentResolver(redis)
-    asset_generator = AssetGenerator(model=request.ai_model)
+    asset_generator = AssetGenerator(model=request.ai_model, reasoning_effort=request.reasoning_effort)
 
     # Step 1: Resolve services (from request or previous step)
     services = request.services
-    if not services:
+    if services is None:
         services_step = await get_wizard_step(session_id, "services")
         if services_step and services_step.get("services"):
             from workshops_ai.wizard.schemas import Service
@@ -749,7 +749,7 @@ async def generate_impacts(
     )
 
     # Initialize components
-    impact_generator = ImpactGenerator(model=request.ai_model)
+    impact_generator = ImpactGenerator(model=request.ai_model, reasoning_effort=request.reasoning_effort)
 
     # Step 1: Resolve assets (from request or previous step)
     assets = request.assets
@@ -777,7 +777,7 @@ async def generate_impacts(
 
     # Step 2: Resolve services (optional, for context)
     services = request.services
-    if not services:
+    if services is None:
         services_step = await get_wizard_step(session_id, "services")
         if services_step and services_step.get("services"):
             from workshops_ai.wizard.schemas import Service
@@ -981,7 +981,7 @@ async def generate_risks(
     )
 
     # Initialize components
-    risk_generator = RiskGenerator(model=request.ai_model)
+    risk_generator = RiskGenerator(model=request.ai_model, reasoning_effort=request.reasoning_effort)
 
     # Step 1: Resolve assets (from request or previous step)
     assets = request.assets
@@ -1026,7 +1026,7 @@ async def generate_risks(
 
     # Step 3: Resolve services (optional, for context)
     services = request.services
-    if not services:
+    if services is None:
         services_step = await get_wizard_step(session_id, "services")
         if services_step and services_step.get("services"):
             from workshops_ai.wizard.schemas import Service
@@ -1237,7 +1237,7 @@ async def generate_controls(
     )
 
     # Initialize components
-    control_generator = ControlGenerator(model=request.ai_model)
+    control_generator = ControlGenerator(model=request.ai_model, reasoning_effort=request.reasoning_effort)
 
     # Step 1: Resolve assets (from request or previous step)
     assets = request.assets
@@ -1558,7 +1558,7 @@ async def generate_evaluation(
                     )
 
             # Generate services
-            service_generator = ServiceGenerator(model=request.ai_model)
+            service_generator = ServiceGenerator(model=request.ai_model, reasoning_effort=request.reasoning_effort)
             services, usage_metrics, debug_info = await service_generator.generate_services(
                 website_content=website_content,
                 language=request.language,
@@ -1676,7 +1676,7 @@ async def generate_evaluation(
                         )
 
                 # Generate assets
-                asset_generator = AssetGenerator(model=request.ai_model)
+                asset_generator = AssetGenerator(model=request.ai_model, reasoning_effort=request.reasoning_effort)
                 assets, usage_metrics, debug_info = await asset_generator.generate_assets(
                     website_content=website_content or "",
                     language=request.language,
@@ -1760,7 +1760,7 @@ async def generate_evaluation(
 
             if results.asset_impacts is None and results.assets:
                 # Generate impacts
-                impact_generator = ImpactGenerator(model=request.ai_model)
+                impact_generator = ImpactGenerator(model=request.ai_model, reasoning_effort=request.reasoning_effort)
                 asset_impacts, usage_metrics, debug_info = await impact_generator.generate_asset_impacts(
                     assets=results.assets,
                     language=request.language,
@@ -1843,7 +1843,7 @@ async def generate_evaluation(
 
             if results.asset_risks is None and results.assets:
                 # Generate risks
-                risk_generator = RiskGenerator(model=request.ai_model)
+                risk_generator = RiskGenerator(model=request.ai_model, reasoning_effort=request.reasoning_effort)
                 asset_risks, usage_metrics, debug_info = await risk_generator.generate_asset_risks(
                     assets=results.assets,
                     language=request.language,
@@ -1927,7 +1927,7 @@ async def generate_evaluation(
 
             if results.asset_controls is None and results.assets and results.asset_risks:
                 # Generate controls
-                control_generator = ControlGenerator(model=request.ai_model)
+                control_generator = ControlGenerator(model=request.ai_model, reasoning_effort=request.reasoning_effort)
                 asset_controls, usage_metrics, debug_info = await control_generator.generate_asset_controls(
                     assets=results.assets,
                     asset_risks=results.asset_risks,

@@ -61,12 +61,13 @@ class ImpactGenerator:
     - Preserves catalog order
     """
 
-    def __init__(self, model: Optional[str] = None):
+    def __init__(self, model: Optional[str] = None, reasoning_effort: Optional[str] = None):
         """
         Initialize ImpactGenerator with specified model.
 
         Args:
             model: OpenAI model name (defaults to settings if not provided)
+            reasoning_effort: Override reasoning effort (cascade: body > env > default)
 
         Raises:
             ModelNotAllowedError: If model not in allowed list
@@ -75,10 +76,12 @@ class ImpactGenerator:
 
         settings = get_settings()
         self.settings = settings
+        self.reasoning_effort = reasoning_effort
 
         self.llm = create_wizard_llm_client(
             model=model,
-            response_format=ImpactsResponse
+            response_format=ImpactsResponse,
+            reasoning_effort=reasoning_effort,
         )
         self.model_name = self.llm.model_name
 
@@ -392,7 +395,8 @@ class ImpactGenerator:
         # Create batch LLM client with BatchImpactsResponse format
         batch_llm = create_wizard_llm_client(
             model=self.model_name,
-            response_format=BatchImpactsResponse
+            response_format=BatchImpactsResponse,
+            reasoning_effort=self.reasoning_effort,
         )
 
         # Create JSON for all assets in batch
