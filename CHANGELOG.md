@@ -10,7 +10,10 @@ Pre-`0.1.0` history is available in `git log`.
 
 ## [Unreleased]
 
-(no changes since 0.1.0)
+### Fixed
+- **`/wizard/controls` 500 errors ("The model produced invalid content")** — the batch controls call used the full `PlannedControl` / `AssetControls` models as the OpenAI Structured Outputs `response_format`. Their `Optional[Decimal]` cost fields and nested threat-coverage objects generate `anyOf` + regex `pattern` schemas that the system prompt simultaneously forbids; under gpt-5.4-mini (medium reasoning) the contradiction drove the model off-schema and Azure returned 500. The model now emits a minimal name-only DTO (`ControlSelection` / `AssetControlSelection`); full control metadata is enriched from the catalog after generation. **HTTP API output unchanged.**
+- **`/wizard/risks` 500 errors (and intermittent JSON truncation)** — same class of contradiction: `Risk` / `AssetRisk` carried `Optional[Decimal]` computed fields (`inherentRisk`, `residualRiskCalculated`, `estimatedResidualRisk`) that the prompt forbids. The model now emits a minimal DTO (`RiskSelection` / `AssetRiskSelection`, `threatName` + `probability`); full risk objects are rebuilt after generation with the computed values left unset, as before. Verified on gpt-5.4-mini / medium: 67% → 0% batch-call failures. **HTTP API output unchanged.**
+- **Malformed JSON example in the controls/risks prompts** — the `{controls_json_schema}` / `{risks_json_schema}` example values used escaped `{{ }}` braces, which LangChain substitutes verbatim, so the model was shown literal `{{ }}` instead of valid JSON. Corrected to plain `{ }`.
 
 ## [0.1.0] — 2026-05-07
 
