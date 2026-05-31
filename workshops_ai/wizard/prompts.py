@@ -526,30 +526,30 @@ Prioritize risks that pose the greatest threat to business operations and data.
 # Controls
 # ===================================================================================
 
-# JSON schema for controls (can be updated when PlannedControl model changes)
-# Note: All fields except 'name' are optional
-CONTROLS_JSON_SCHEMA = """{{
+# JSON schema for controls selected by the LLM.
+# Full PlannedControl fields are enriched from the catalog after generation.
+CONTROLS_JSON_SCHEMA = """{
   "controls": [
-    {{
+    {
       "name": "exact control name"
-    }}
+    }
   ]
-}}"""
+}"""
 
-# JSON schema for batch controls (multiple assets at once)
-# Used in batch processing via OpenAI Structured Outputs
-BATCH_CONTROLS_JSON_SCHEMA = """{{
+# JSON schema for batch controls selected by the LLM.
+# Used in batch processing via OpenAI Structured Outputs.
+BATCH_CONTROLS_JSON_SCHEMA = """{
   "asset_controls": [
-    {{
+    {
       "assetName": "exact asset name from input",
       "controls": [
-        {{
+        {
           "name": "exact control name"
-        }}
+        }
       ]
-    }}
+    }
   ]
-}}"""
+}"""
 
 # Production prompt (hybrid catalog + AI approach)
 CONTROLS_SYSTEM_PROMPT = """
@@ -580,9 +580,9 @@ Quality Standards:
 - Relevance: Each control should meaningfully contribute to risk mitigation
 
 Output Rules:
-- Return ONLY valid JSON object with 'controls' array, no explanations or commentary
+- Return ONLY valid JSON matching the provided schema, no explanations or commentary
 - Control name MUST exactly match (case and spacing) the relevant_controls catalog entry
-- Return only the 'name' field for each control (all other fields are optional and should be omitted)
+- Return only selected control names; all full control metadata is added by the system after generation
 - Respect quantity constraint if provided (e.g., "Select 2-4 controls" means min 2, max 4)
 - The JSON must parse without errors
 

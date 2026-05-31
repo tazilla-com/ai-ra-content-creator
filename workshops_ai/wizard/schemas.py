@@ -12,7 +12,7 @@ from typing import Optional, List, Literal, Any
 from workshops_ai.api.schema.asset import Asset
 from workshops_ai.api.schema.impact import AssetImpact, ImpactEvaluation
 from workshops_ai.api.schema.threat import AssetRisk, Risk
-from workshops_ai.api.schema.control import AssetControls, PlannedControl
+from workshops_ai.api.schema.control import AssetControls
 from workshops_ai.api.schema.organization import Organization
 
 # ===================================================================================
@@ -135,6 +135,40 @@ class BatchRisksResponse(BaseModel):
     )
 
 
+class ControlSelection(BaseModel):
+    """
+    Minimal LLM output for one selected control.
+
+    Full PlannedControl metadata is enriched from the authoritative catalog after
+    model generation. The LLM should only decide which catalog control names apply.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        ...,
+        description="Exact selected control name from the provided relevant controls catalog"
+    )
+
+
+class AssetControlSelection(BaseModel):
+    """
+    Minimal LLM output for controls selected for one asset.
+
+    Asset IDs and full control metadata are restored/enriched from input and catalog
+    data after model generation.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    assetName: str = Field(
+        ...,
+        description="Exact asset name copied from the input asset"
+    )
+    controls: List[ControlSelection] = Field(
+        ...,
+        description="Selected controls for this asset, represented by exact catalog names only"
+    )
+
+
 class ControlsResponse(BaseModel):
     """
     Wrapper for control recommendations response with OpenAI Structured Outputs.
@@ -142,13 +176,14 @@ class ControlsResponse(BaseModel):
     This model is used as response_format in LLM calls to enforce JSON schema
     validation at the API level, ensuring the LLM returns valid structured data.
 
-    Reuses PlannedControl from api.schema.control for consistency.
+    Uses a minimal DTO because the endpoint only needs selected control names
+    from the model. Full PlannedControl metadata is enriched from the catalog.
     """
     model_config = ConfigDict(extra="forbid")
 
-    controls: List[PlannedControl] = Field(
+    controls: List[ControlSelection] = Field(
         ...,
-        description="List of selected controls with threat coverage and cost estimates for a single asset"
+        description="List of selected control names for a single asset"
     )
 
 
@@ -157,13 +192,14 @@ class BatchControlsResponse(BaseModel):
     Wrapper for batch control recommendations response with OpenAI Structured Outputs.
 
     Used when processing multiple assets in a single LLM call for better performance.
-    Each asset_controls entry contains the asset identification and its recommended controls.
+    Each asset_controls entry contains the asset name and selected control names.
+    Asset IDs and full control metadata are restored/enriched after generation.
     """
     model_config = ConfigDict(extra="forbid")
 
-    asset_controls: List[AssetControls] = Field(
+    asset_controls: List[AssetControlSelection] = Field(
         ...,
-        description="List of assets with their recommended security controls"
+        description="List of assets with selected control names"
     )
 
 
