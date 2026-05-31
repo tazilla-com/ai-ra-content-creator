@@ -381,29 +381,30 @@ Consider both direct and indirect impacts on business operations.
 # Risks
 # ===================================================================================
 
-# JSON schema for risks (can be updated when Risk model changes)
+# JSON schema for risks selected by the LLM (threatName + probability only).
+# Computed risk values are calculated by the system after generation.
 RISKS_JSON_SCHEMA = """[
-  {{
+  {
     "threatName": "exact catalog name",
     "probability": 0|1|2|3|4
-  }}
+  }
 ]"""
 
-# JSON schema for batch risks (multiple assets at once)
-# Used in batch processing via OpenAI Structured Outputs
-BATCH_RISKS_JSON_SCHEMA = """{{
+# JSON schema for batch risks (multiple assets at once).
+# Used in batch processing via OpenAI Structured Outputs.
+BATCH_RISKS_JSON_SCHEMA = """{
   "asset_risks": [
-    {{
+    {
       "assetName": "exact asset name from input",
       "risks": [
-        {{
+        {
           "threatName": "exact catalog name",
           "probability": 1|2|3|4
-        }}
+        }
       ]
-    }}
+    }
   ]
-}}"""
+}"""
 
 # Production prompt (catalog-based combined threat selection + probability estimation)
 COMBINED_RISK_SYSTEM_PROMPT = """

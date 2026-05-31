@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field, ConfigDict, model_validator
 from typing import Optional, List, Literal, Any
 from workshops_ai.api.schema.asset import Asset
 from workshops_ai.api.schema.impact import AssetImpact, ImpactEvaluation
-from workshops_ai.api.schema.threat import AssetRisk, Risk
+from workshops_ai.api.schema.threat import AssetRisk
 from workshops_ai.api.schema.control import AssetControls
 from workshops_ai.api.schema.organization import Organization
 
@@ -103,6 +103,46 @@ class BatchImpactsResponse(BaseModel):
     )
 
 
+class RiskSelection(BaseModel):
+    """
+    Minimal LLM output for one evaluated threat.
+
+    Only the two genuine model judgments are kept. The computed risk values
+    (inherentRisk / residualRiskCalculated / estimatedResidualRisk) are not
+    produced by the model — they are left unset and calculated downstream,
+    exactly as before this change.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    threatName: str = Field(
+        ...,
+        description="Exact threat name copied from the provided candidate threat catalog"
+    )
+    probability: Literal[0, 1, 2, 3, 4] = Field(
+        ...,
+        description="Probability level on the 0-4 scale (0 = not applicable)"
+    )
+
+
+class AssetRiskSelection(BaseModel):
+    """
+    Minimal LLM output for the threats evaluated for one asset.
+
+    Asset IDs and full Risk metadata are restored/enriched from input after
+    model generation.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    assetName: str = Field(
+        ...,
+        description="Exact asset name copied from the input asset"
+    )
+    risks: List[RiskSelection] = Field(
+        ...,
+        description="Evaluated threats for this asset, threatName + probability only"
+    )
+
+
 class RisksResponse(BaseModel):
     """
     Wrapper for risks evaluation response with OpenAI Structured Outputs.
@@ -110,13 +150,14 @@ class RisksResponse(BaseModel):
     This model is used as response_format in LLM calls to enforce JSON schema
     validation at the API level, ensuring the LLM returns valid structured data.
 
-    Reuses Risk from api.schema.threat for consistency.
+    Uses a minimal DTO because the model only decides threatName + probability.
+    Computed risk values are calculated by the system after generation.
     """
     model_config = ConfigDict(extra="forbid")
 
-    risks: List[Risk] = Field(
+    risks: List[RiskSelection] = Field(
         ...,
-        description="List of risk evaluations with threatName and probability (0-4) for a single asset"
+        description="List of evaluated threats (threatName + probability) for a single asset"
     )
 
 
@@ -125,13 +166,14 @@ class BatchRisksResponse(BaseModel):
     Wrapper for batch risks evaluation response with OpenAI Structured Outputs.
 
     Used when processing multiple assets in a single LLM call for better performance.
-    Each asset_risks entry contains the asset identification and its risk evaluations.
+    Each asset_risks entry contains the asset name and its evaluated threats.
+    Asset IDs and full Risk metadata are restored/enriched after generation.
     """
     model_config = ConfigDict(extra="forbid")
 
-    asset_risks: List[AssetRisk] = Field(
+    asset_risks: List[AssetRiskSelection] = Field(
         ...,
-        description="List of assets with their evaluated risks (threats with probability levels)"
+        description="List of assets with evaluated threats (threatName + probability)"
     )
 
 
