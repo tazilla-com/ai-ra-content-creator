@@ -489,10 +489,10 @@ class RiskGenerator:
             **sections
         )
 
-        # Calculate expected output tokens based on batch size and max threats per asset
-        # Each risk = ~88 tokens, plus overhead for JSON structure
+        # Calculate expected output tokens for the compact threatName + probability
+        # payload (computed risk values are no longer emitted by the model).
         items_per_asset = max_threats_per_asset or 10  # Conservative default if not specified
-        expected_output = len(assets) * items_per_asset * 88 + 500  # 500 for JSON wrapper
+        expected_output = len(assets) * items_per_asset * 40 + 300
 
         # Prepare invocation kwargs with Langfuse tracing
         invoke_kwargs = {
@@ -565,23 +565,15 @@ class RiskGenerator:
             # OpenAI Structured Outputs should return valid JSON directly
             response_data = json.loads(response_text_clean)
 
-            # Validate with Pydantic
+            # Validate with Pydantic (name-only selection DTO)
             batch_response = BatchRisksResponse.model_validate(response_data)
-            asset_risks_data = batch_response.asset_risks
-
-            # Restore assetId from original assets if LLM returned null
-            asset_lookup = {asset.name: asset for asset in assets}
-            for asset_risk in asset_risks_data:
-                if not asset_risk.assetId:
-                    original_asset = asset_lookup.get(asset_risk.assetName)
-                    if original_asset and original_asset.id:
-                        asset_risk.assetId = original_asset.id
+            asset_selections = batch_response.asset_risks
 
             logger.info(
                 "Batch response parsed successfully",
                 extra={
                     "requested_assets": len(assets),
-                    "returned_assets": len(asset_risks_data),
+                    "returned_assets": len(asset_selections),
                 }
             )
 
@@ -613,23 +605,80 @@ class RiskGenerator:
             ) from e
 
         # Validate asset count (WARNING if mismatch, not error)
-        if len(asset_risks_data) != len(assets):
-            warning_msg = f"Batch response has {len(asset_risks_data)} assets, expected {len(assets)} - continuing with partial results"
+        if len(asset_selections) != len(assets):
             logger.warning(
                 "batch_risks_count_mismatch",
                 extra={
                     "expected": len(assets),
-                    "received": len(asset_risks_data),
+                    "received": len(asset_selections),
                     "requested_asset_names": [a.name for a in assets],
-                    "returned_asset_names": [ar.assetName for ar in asset_risks_data],
+                    "returned_asset_names": [s.assetName for s in asset_selections],
                 }
             )
             # Continue with partial results instead of raising error
 
         # Apply max_threats_per_asset limit if specified
         if max_threats_per_asset is not None:
-            for asset_risk in asset_risks_data:
-                asset_risk.risks = asset_risk.risks[:max_threats_per_asset]
+            for selection in asset_selections:
+                selection.risks = selection.risks[:max_threats_per_asset]
+
+        # Rebuild full AssetRisk / Risk objects from the slim selections.
+        # assetId is restored from the input assets (the model no longer returns
+        # it); the computed risk values stay unset and are calculated downstream,
+        # exactly as before this change.
+        asset_lookup = {asset.name: asset for asset in assets}
+        asset_risks_data: List[AssetRisk] = []
+        emitted_asset_names: set[str] = set()
+
+        for index, selection in enumerate(asset_selections):
+            original_asset = asset_lookup.get(selection.assetName)
+            if original_asset is None and len(asset_selections) == len(assets):
+                original_asset = assets[index]
+                logger.warning(
+                    "batch_risk_asset_name_mismatch_restored_by_position",
+                    extra={
+                        "returned_asset_name": selection.assetName,
+                        "restored_asset_name": original_asset.name,
+                        "asset_index": index,
+                    }
+                )
+
+            if original_asset is None:
+                logger.warning(
+                    "batch_risk_unknown_asset_skipped",
+                    extra={
+                        "returned_asset_name": selection.assetName,
+                        "asset_index": index,
+                    }
+                )
+                continue
+
+            asset_risks_data.append(AssetRisk(
+                assetId=original_asset.id,
+                assetName=original_asset.name,
+                risks=[
+                    Risk(threatName=r.threatName, probability=r.probability)
+                    for r in selection.risks
+                ],
+            ))
+            emitted_asset_names.add(original_asset.name)
+
+        # Ensure every input asset has a result (empty risks if the model omitted it)
+        for asset in assets:
+            if asset.name in emitted_asset_names:
+                continue
+            logger.warning(
+                "batch_risk_missing_asset_result_added_empty",
+                extra={
+                    "asset_id": str(asset.id) if asset.id else None,
+                    "asset_name": asset.name,
+                }
+            )
+            asset_risks_data.append(AssetRisk(
+                assetId=asset.id,
+                assetName=asset.name,
+                risks=[],
+            ))
 
         logger.info(
             "Batch risks processing completed successfully",

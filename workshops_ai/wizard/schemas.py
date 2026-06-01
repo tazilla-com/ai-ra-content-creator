@@ -11,8 +11,8 @@ from pydantic import BaseModel, Field, ConfigDict, model_validator
 from typing import Optional, List, Literal, Any
 from workshops_ai.api.schema.asset import Asset
 from workshops_ai.api.schema.impact import AssetImpact, ImpactEvaluation
-from workshops_ai.api.schema.threat import AssetRisk, Risk
-from workshops_ai.api.schema.control import AssetControls, PlannedControl
+from workshops_ai.api.schema.threat import AssetRisk
+from workshops_ai.api.schema.control import AssetControls
 from workshops_ai.api.schema.organization import Organization
 
 # ===================================================================================
@@ -103,6 +103,46 @@ class BatchImpactsResponse(BaseModel):
     )
 
 
+class RiskSelection(BaseModel):
+    """
+    Minimal LLM output for one evaluated threat.
+
+    Only the two genuine model judgments are kept. The computed risk values
+    (inherentRisk / residualRiskCalculated / estimatedResidualRisk) are not
+    produced by the model — they are left unset and calculated downstream,
+    exactly as before this change.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    threatName: str = Field(
+        ...,
+        description="Exact threat name copied from the provided candidate threat catalog"
+    )
+    probability: Literal[0, 1, 2, 3, 4] = Field(
+        ...,
+        description="Probability level on the 0-4 scale (0 = not applicable)"
+    )
+
+
+class AssetRiskSelection(BaseModel):
+    """
+    Minimal LLM output for the threats evaluated for one asset.
+
+    Asset IDs and full Risk metadata are restored/enriched from input after
+    model generation.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    assetName: str = Field(
+        ...,
+        description="Exact asset name copied from the input asset"
+    )
+    risks: List[RiskSelection] = Field(
+        ...,
+        description="Evaluated threats for this asset, threatName + probability only"
+    )
+
+
 class RisksResponse(BaseModel):
     """
     Wrapper for risks evaluation response with OpenAI Structured Outputs.
@@ -110,13 +150,14 @@ class RisksResponse(BaseModel):
     This model is used as response_format in LLM calls to enforce JSON schema
     validation at the API level, ensuring the LLM returns valid structured data.
 
-    Reuses Risk from api.schema.threat for consistency.
+    Uses a minimal DTO because the model only decides threatName + probability.
+    Computed risk values are calculated by the system after generation.
     """
     model_config = ConfigDict(extra="forbid")
 
-    risks: List[Risk] = Field(
+    risks: List[RiskSelection] = Field(
         ...,
-        description="List of risk evaluations with threatName and probability (0-4) for a single asset"
+        description="List of evaluated threats (threatName + probability) for a single asset"
     )
 
 
@@ -125,13 +166,48 @@ class BatchRisksResponse(BaseModel):
     Wrapper for batch risks evaluation response with OpenAI Structured Outputs.
 
     Used when processing multiple assets in a single LLM call for better performance.
-    Each asset_risks entry contains the asset identification and its risk evaluations.
+    Each asset_risks entry contains the asset name and its evaluated threats.
+    Asset IDs and full Risk metadata are restored/enriched after generation.
     """
     model_config = ConfigDict(extra="forbid")
 
-    asset_risks: List[AssetRisk] = Field(
+    asset_risks: List[AssetRiskSelection] = Field(
         ...,
-        description="List of assets with their evaluated risks (threats with probability levels)"
+        description="List of assets with evaluated threats (threatName + probability)"
+    )
+
+
+class ControlSelection(BaseModel):
+    """
+    Minimal LLM output for one selected control.
+
+    Full PlannedControl metadata is enriched from the authoritative catalog after
+    model generation. The LLM should only decide which catalog control names apply.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        ...,
+        description="Exact selected control name from the provided relevant controls catalog"
+    )
+
+
+class AssetControlSelection(BaseModel):
+    """
+    Minimal LLM output for controls selected for one asset.
+
+    Asset IDs and full control metadata are restored/enriched from input and catalog
+    data after model generation.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    assetName: str = Field(
+        ...,
+        description="Exact asset name copied from the input asset"
+    )
+    controls: List[ControlSelection] = Field(
+        ...,
+        description="Selected controls for this asset, represented by exact catalog names only"
     )
 
 
@@ -142,13 +218,14 @@ class ControlsResponse(BaseModel):
     This model is used as response_format in LLM calls to enforce JSON schema
     validation at the API level, ensuring the LLM returns valid structured data.
 
-    Reuses PlannedControl from api.schema.control for consistency.
+    Uses a minimal DTO because the endpoint only needs selected control names
+    from the model. Full PlannedControl metadata is enriched from the catalog.
     """
     model_config = ConfigDict(extra="forbid")
 
-    controls: List[PlannedControl] = Field(
+    controls: List[ControlSelection] = Field(
         ...,
-        description="List of selected controls with threat coverage and cost estimates for a single asset"
+        description="List of selected control names for a single asset"
     )
 
 
@@ -157,13 +234,14 @@ class BatchControlsResponse(BaseModel):
     Wrapper for batch control recommendations response with OpenAI Structured Outputs.
 
     Used when processing multiple assets in a single LLM call for better performance.
-    Each asset_controls entry contains the asset identification and its recommended controls.
+    Each asset_controls entry contains the asset name and selected control names.
+    Asset IDs and full control metadata are restored/enriched after generation.
     """
     model_config = ConfigDict(extra="forbid")
 
-    asset_controls: List[AssetControls] = Field(
+    asset_controls: List[AssetControlSelection] = Field(
         ...,
-        description="List of assets with their recommended security controls"
+        description="List of assets with selected control names"
     )
 
 

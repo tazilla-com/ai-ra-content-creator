@@ -10,16 +10,19 @@ Pre-`0.1.0` history is available in `git log`.
 
 ## [Unreleased]
 
-### Config
-- **Renamed** `WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC` → `WORKSHOPS_AI_LLM__CALL_TIMEOUT_SEC` (and `LLMSettings.http_timeout_sec` → `call_timeout_sec`). The old name was confusing — it's a per-LLM/agent-call timeout, not an HTTP-protocol-level timeout, and was being conflated with `WORKSHOPS_AI_CHAT__TIMEOUT_SEC` (whole chat-request timeout including multiple LLM calls + tools). **Backward compatible** — the old env name is still accepted via `AliasChoices`.
-
-### Observability
-- **Langfuse spans** now include `reasoning_effort` in metadata for all 5 wizard generators (`services`, `assets`, `impacts`, `risks`, `controls`) and `web_search`. Resolves the cascade (body > env > default) so traces show what was actually applied.
-
 ### Added
 - **Cancelled-call usage recovery** — when the client closes the HTTP connection before the wizard response is delivered (e.g. user navigates away while the LLM call is in flight, but Azure has already consumed tokens), the call's usage is persisted to a per-session ledger in `session.wizard_metadata["pending_usage"]` (keyed by model). The next successful `/wizard/*` response rolls these recovered tokens into its `usage` field. `UsageMetrics` gains two backward-compatible fields: `includes_recovered: bool` and `recovered_cost_usd: float` (recovered cost is *included* in `cost_usd`). New helper module `wizard/pending_usage.py`; aggregate-per-model storage shape cannot grow beyond the number of allowed models, so no eviction logic is needed.
 - **Per-model TPM enforcement** — new env `WORKSHOPS_AI_WIZARD__OPENAI_CAPACITY_LIMITS` (per-model tokens-per-minute capacity, matches Azure deployment quotas). Enforced via per-model 60-second sliding window in `OpenAIThrottle`: calls that would push the rolling sum over the limit wait until the window slides, instead of failing. Independent from per-request limits (which still raise `RequestTooLargeError` with batch-split hint).
 - **Default per-request limits** updated for current allowed models: `gpt-5-mini` (300k), `gpt-5-nano` (500k), `gpt-5.1-chat` (300k), `gpt-5.4-mini` (300k), `gpt-5.4-nano` (500k), `gpt-4.1` (300k). `gpt-5` (plain) removed from defaults — use `gpt-5-mini` or `gpt-5-nano` instead.
+- **Langfuse spans** now include `reasoning_effort` in metadata for all 5 wizard generators (`services`, `assets`, `impacts`, `risks`, `controls`) and `web_search`. Resolves the cascade (body > env > default) so traces show what was actually applied.
+
+### Changed
+- **Renamed** `WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC` → `WORKSHOPS_AI_LLM__CALL_TIMEOUT_SEC` (and `LLMSettings.http_timeout_sec` → `call_timeout_sec`). The old name was confusing — it's a per-LLM/agent-call timeout, not an HTTP-protocol-level timeout, and was being conflated with `WORKSHOPS_AI_CHAT__TIMEOUT_SEC` (whole chat-request timeout including multiple LLM calls + tools). **Backward compatible** — the old env name is still accepted via `AliasChoices`.
+
+### Fixed
+- **`/wizard/controls` 500 errors ("The model produced invalid content")** — the batch controls call used the full `PlannedControl` / `AssetControls` models as the OpenAI Structured Outputs `response_format`. Their `Optional[Decimal]` cost fields and nested threat-coverage objects generate `anyOf` + regex `pattern` schemas that the system prompt simultaneously forbids; under gpt-5.4-mini (medium reasoning) the contradiction drove the model off-schema and Azure returned 500. The model now emits a minimal name-only DTO (`ControlSelection` / `AssetControlSelection`); full control metadata is enriched from the catalog after generation. **HTTP API output unchanged.**
+- **`/wizard/risks` 500 errors (and intermittent JSON truncation)** — same class of contradiction: `Risk` / `AssetRisk` carried `Optional[Decimal]` computed fields (`inherentRisk`, `residualRiskCalculated`, `estimatedResidualRisk`) that the prompt forbids. The model now emits a minimal DTO (`RiskSelection` / `AssetRiskSelection`, `threatName` + `probability`); full risk objects are rebuilt after generation with the computed values left unset, as before. Verified on gpt-5.4-mini / medium: 67% → 0% batch-call failures. **HTTP API output unchanged.**
+- **Malformed JSON example in the controls/risks prompts** — the `{controls_json_schema}` / `{risks_json_schema}` example values used escaped `{{ }}` braces, which LangChain substitutes verbatim, so the model was shown literal `{{ }}` instead of valid JSON. Corrected to plain `{ }`.
 
 ## [0.1.0] — 2026-05-07
 

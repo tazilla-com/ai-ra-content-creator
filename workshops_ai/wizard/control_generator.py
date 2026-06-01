@@ -515,7 +515,8 @@ class ControlGenerator:
             extra={"batch_size": len(assets)}
         )
 
-        # Create batch LLM client with BatchControlsResponse format
+        # Create batch LLM client with name-only BatchControlsResponse format.
+        # Full PlannedControl metadata is enriched from the catalog after selection.
         batch_llm = create_wizard_llm_client(
             model=self.model_name,
             response_format=BatchControlsResponse,
@@ -525,6 +526,7 @@ class ControlGenerator:
         # Build batch data structures
         batch_assets_json_list = []
         batch_asset_risks_json_list = []
+        batch_asset_inputs: List[Asset] = []
         # Track per-asset relevant controls (used to build name-only mapping below).
         asset_relevant_map: Dict[str, List[Dict[str, Any]]] = {}
         skipped_count = 0
@@ -573,6 +575,7 @@ class ControlGenerator:
 
             # Add to batch
             batch_assets_json_list.append(asset.model_dump(mode='json'))
+            batch_asset_inputs.append(asset)
 
             # Build risks with all available fields including inherentRisk
             risk_dicts = []
@@ -657,10 +660,9 @@ class ControlGenerator:
             **sections
         )
 
-        # Calculate expected output tokens based on batch size and max controls per asset
-        # Each control = ~143 tokens, plus overhead for JSON structure
+        # Calculate expected output tokens based on compact name-only output.
         items_per_asset = max_controls_per_asset or 10  # Conservative default if not specified
-        expected_output = len(batch_assets_json_list) * items_per_asset * 143 + 500  # 500 for JSON wrapper
+        expected_output = len(batch_assets_json_list) * items_per_asset * 24 + 300
 
         # Prepare invocation kwargs with Langfuse tracing
         invoke_kwargs = {
@@ -734,21 +736,14 @@ class ControlGenerator:
 
             # Validate with Pydantic
             batch_response = BatchControlsResponse.model_validate(response_data)
-            asset_controls_data = batch_response.asset_controls
-
-            # Restore assetId from original assets if LLM returned null
-            asset_lookup = {asset.name: asset for asset in assets}
-            for asset_control in asset_controls_data:
-                if not asset_control.assetId:
-                    original_asset = asset_lookup.get(asset_control.assetName)
-                    if original_asset and original_asset.id:
-                        asset_control.assetId = original_asset.id
+            asset_control_selections = batch_response.asset_controls
+            asset_lookup = {asset.name: asset for asset in batch_asset_inputs}
 
             logger.info(
                 "Batch response parsed successfully",
                 extra={
                     "requested_assets": len(batch_assets_json_list),
-                    "returned_assets": len(asset_controls_data),
+                    "returned_assets": len(asset_control_selections),
                 }
             )
 
@@ -780,39 +775,64 @@ class ControlGenerator:
             ) from e
 
         # Validate asset count (WARNING if mismatch, not error)
-        if len(asset_controls_data) != len(batch_assets_json_list):
-            warning_msg = f"Batch response has {len(asset_controls_data)} assets, expected {len(batch_assets_json_list)} - continuing with partial results"
+        if len(asset_control_selections) != len(batch_assets_json_list):
             logger.warning(
                 "batch_controls_count_mismatch",
                 extra={
                     "expected": len(batch_assets_json_list),
-                    "received": len(asset_controls_data),
+                    "received": len(asset_control_selections),
                 }
             )
 
         # Apply max_controls_per_asset limit if specified
         if max_controls_per_asset is not None:
-            for asset_control in asset_controls_data:
+            for asset_control in asset_control_selections:
                 asset_control.controls = asset_control.controls[:max_controls_per_asset]
 
         # Enrich controls with catalog data (description, category, threats)
         # Build catalog lookup dict for fast access
         catalog_lookup = {ctrl.name: ctrl for ctrl in control_catalog}
+        asset_controls_data: List[AssetControls] = []
+        emitted_asset_names: set[str] = set()
 
-        for asset_control in asset_controls_data:
-            enriched_controls = []
+        for index, selection in enumerate(asset_control_selections):
+            enriched_controls: List[PlannedControl] = []
+
+            original_asset = asset_lookup.get(selection.assetName)
+            if original_asset is None and len(asset_control_selections) == len(batch_asset_inputs):
+                original_asset = batch_asset_inputs[index]
+                logger.warning(
+                    "batch_control_asset_name_mismatch_restored_by_position",
+                    extra={
+                        "returned_asset_name": selection.assetName,
+                        "restored_asset_name": original_asset.name,
+                        "asset_index": index,
+                    }
+                )
+
+            if original_asset is None:
+                logger.warning(
+                    "batch_control_unknown_asset_skipped",
+                    extra={
+                        "returned_asset_name": selection.assetName,
+                        "asset_index": index,
+                    }
+                )
+                continue
+
+            asset_id = original_asset.id if original_asset else None
+            asset_name = original_asset.name
 
             # Get asset risks for this asset
-            asset_risk = asset_risks_dict.get(str(asset_control.assetId)) if asset_control.assetId else None
+            asset_risk = asset_risks_dict.get(str(asset_id)) if asset_id else None
             if not asset_risk:
-                asset_risk = asset_risks_dict.get(asset_control.assetName)
+                asset_risk = asset_risks_dict.get(asset_name)
 
-            for ctrl in asset_control.controls:
+            for ctrl in selection.controls:
                 # Find control in catalog
                 catalog_ctrl = catalog_lookup.get(ctrl.name)
                 if not catalog_ctrl:
-                    logger.warning(f"Control '{ctrl.name}' not found in catalog, using raw LLM data")
-                    enriched_controls.append(ctrl)
+                    logger.warning(f"Control '{ctrl.name}' not found in catalog, skipping")
                     continue
 
                 # Get threat coverage from control_threat_coverage mapping
@@ -851,8 +871,29 @@ class ControlGenerator:
                 )
                 enriched_controls.append(enriched_ctrl)
 
-            # Replace with enriched controls
-            asset_control.controls = enriched_controls
+            asset_controls_data.append(AssetControls(
+                assetId=asset_id,
+                assetName=asset_name,
+                controls=enriched_controls,
+            ))
+            emitted_asset_names.add(asset_name)
+
+        for asset in batch_asset_inputs:
+            if asset.name in emitted_asset_names:
+                continue
+
+            logger.warning(
+                "batch_control_missing_asset_result_added_empty",
+                extra={
+                    "asset_id": str(asset.id) if asset.id else None,
+                    "asset_name": asset.name,
+                }
+            )
+            asset_controls_data.append(AssetControls(
+                assetId=asset.id,
+                assetName=asset.name,
+                controls=[],
+            ))
 
         logger.info(
             "Batch controls processing completed successfully",

@@ -381,29 +381,30 @@ Consider both direct and indirect impacts on business operations.
 # Risks
 # ===================================================================================
 
-# JSON schema for risks (can be updated when Risk model changes)
+# JSON schema for risks selected by the LLM (threatName + probability only).
+# Computed risk values are calculated by the system after generation.
 RISKS_JSON_SCHEMA = """[
-  {{
+  {
     "threatName": "exact catalog name",
     "probability": 0|1|2|3|4
-  }}
+  }
 ]"""
 
-# JSON schema for batch risks (multiple assets at once)
-# Used in batch processing via OpenAI Structured Outputs
-BATCH_RISKS_JSON_SCHEMA = """{{
+# JSON schema for batch risks (multiple assets at once).
+# Used in batch processing via OpenAI Structured Outputs.
+BATCH_RISKS_JSON_SCHEMA = """{
   "asset_risks": [
-    {{
+    {
       "assetName": "exact asset name from input",
       "risks": [
-        {{
+        {
           "threatName": "exact catalog name",
           "probability": 1|2|3|4
-        }}
+        }
       ]
-    }}
+    }
   ]
-}}"""
+}"""
 
 # Production prompt (catalog-based combined threat selection + probability estimation)
 COMBINED_RISK_SYSTEM_PROMPT = """
@@ -526,30 +527,30 @@ Prioritize risks that pose the greatest threat to business operations and data.
 # Controls
 # ===================================================================================
 
-# JSON schema for controls (can be updated when PlannedControl model changes)
-# Note: All fields except 'name' are optional
-CONTROLS_JSON_SCHEMA = """{{
+# JSON schema for controls selected by the LLM.
+# Full PlannedControl fields are enriched from the catalog after generation.
+CONTROLS_JSON_SCHEMA = """{
   "controls": [
-    {{
+    {
       "name": "exact control name"
-    }}
+    }
   ]
-}}"""
+}"""
 
-# JSON schema for batch controls (multiple assets at once)
-# Used in batch processing via OpenAI Structured Outputs
-BATCH_CONTROLS_JSON_SCHEMA = """{{
+# JSON schema for batch controls selected by the LLM.
+# Used in batch processing via OpenAI Structured Outputs.
+BATCH_CONTROLS_JSON_SCHEMA = """{
   "asset_controls": [
-    {{
+    {
       "assetName": "exact asset name from input",
       "controls": [
-        {{
+        {
           "name": "exact control name"
-        }}
+        }
       ]
-    }}
+    }
   ]
-}}"""
+}"""
 
 # Production prompt (hybrid catalog + AI approach)
 CONTROLS_SYSTEM_PROMPT = """
@@ -580,9 +581,9 @@ Quality Standards:
 - Relevance: Each control should meaningfully contribute to risk mitigation
 
 Output Rules:
-- Return ONLY valid JSON object with 'controls' array, no explanations or commentary
+- Return ONLY valid JSON matching the provided schema, no explanations or commentary
 - Control name MUST exactly match (case and spacing) the relevant_controls catalog entry
-- Return only the 'name' field for each control (all other fields are optional and should be omitted)
+- Return only selected control names; all full control metadata is added by the system after generation
 - Respect quantity constraint if provided (e.g., "Select 2-4 controls" means min 2, max 4)
 - The JSON must parse without errors
 
