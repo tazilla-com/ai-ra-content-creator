@@ -17,6 +17,12 @@ class UsageMetrics(BaseModel):
     model: str
     cost_usd: float
 
+    # Tokens/cost from prior cancelled calls that we accumulated server-side
+    # and rolled into this successful response. recovered_cost_usd is INCLUDED
+    # in cost_usd above (i.e. cost_usd is the cumulative total).
+    includes_recovered: bool = False
+    recovered_cost_usd: float = 0.0
+
 
 def calculate_openai_cost(
     prompt_tokens: int,
@@ -78,4 +84,49 @@ def create_usage_metrics(
         total_tokens=total_tokens,
         model=model,
         cost_usd=cost_usd
+    )
+
+
+def merge_with_pending(
+    current: UsageMetrics,
+    pending: dict[str, dict[str, float]] | None,
+) -> UsageMetrics:
+    """
+    Roll a per-model pending-usage ledger into the current call's UsageMetrics.
+
+    Args:
+        current: UsageMetrics of the call about to be returned to the client.
+        pending: Per-model aggregate of recovered tokens, shape:
+            {model_name: {"prompt_tokens": int, "completion_tokens": int, "cost_usd": float}}
+            (cost was already computed per-model when accumulated, so we just sum.)
+
+    Returns:
+        New UsageMetrics with tokens/cost summed across the current call and all
+        pending entries. `model` stays the current call's model (this is the model
+        that produced the response payload); `includes_recovered` is set when any
+        pending tokens were merged in, and `recovered_cost_usd` reports the total
+        recovered cost separately for transparency.
+    """
+    if not pending:
+        return current
+
+    extra_prompt = 0
+    extra_completion = 0
+    extra_cost = 0.0
+    for _model, agg in pending.items():
+        extra_prompt += int(agg.get("prompt_tokens", 0))
+        extra_completion += int(agg.get("completion_tokens", 0))
+        extra_cost += float(agg.get("cost_usd", 0.0))
+
+    if extra_prompt == 0 and extra_completion == 0 and extra_cost == 0.0:
+        return current
+
+    return UsageMetrics(
+        prompt_tokens=current.prompt_tokens + extra_prompt,
+        completion_tokens=current.completion_tokens + extra_completion,
+        total_tokens=current.total_tokens + extra_prompt + extra_completion,
+        model=current.model,
+        cost_usd=current.cost_usd + extra_cost,
+        includes_recovered=True,
+        recovered_cost_usd=extra_cost,
     )

@@ -69,8 +69,39 @@ from workshops_ai.wizard.risk_generator import RiskGenerator
 from workshops_ai.wizard.control_generator import ControlGenerator
 from workshops_ai.wizard.content_resolver import ContentResolver
 from workshops_ai.wizard.exceptions import ContentNotFoundError
+from workshops_ai.wizard.cost_calculator import UsageMetrics, merge_with_pending
+from workshops_ai.wizard.pending_usage import (
+    accumulate_pending_usage,
+    flush_pending_usage,
+)
 
 logger = logging.getLogger(__name__)
+
+
+async def _finalize_usage(
+    http_request: Request,
+    session_id: str,
+    usage_metrics: UsageMetrics,
+) -> UsageMetrics:
+    """
+    Decide where this call's usage goes based on whether the client is still listening.
+
+    If the HTTP client has already disconnected (e.g. cancelled the wizard step
+    in their app), the response we're about to build will never be received.
+    Persist the usage to a per-session ledger so the next successful wizard
+    call can roll it into its own response.
+
+    If the client is still connected, flush any previously-accumulated pending
+    usage and merge it into this call's metrics so the client sees the
+    cumulative cost.
+    """
+    if await http_request.is_disconnected():
+        await accumulate_pending_usage(session_id, usage_metrics)
+        # Client won't see this response anyway — return metrics unchanged.
+        return usage_metrics
+
+    pending = await flush_pending_usage(session_id)
+    return merge_with_pending(usage_metrics, pending)
 
 
 # =============================================================================
@@ -278,6 +309,7 @@ async def get_session_id(
 async def generate_services(
     request: ServicesInput,
     response: Response,
+    http_request: Request,
     session_id: str = Depends(get_session_id),
 ) -> ServicesOutput:
     """
@@ -439,6 +471,11 @@ async def generate_services(
         extra={"session_id": session_id}
     )
 
+    # Reconcile usage with the pending-usage ledger: on client disconnect we
+    # persist this call's usage for the next call; otherwise we roll any
+    # previously-stashed usage into the response metrics.
+    usage_metrics = await _finalize_usage(http_request, session_id, usage_metrics)
+
     # Step 6: Add response headers (if enabled)
     if settings.wizard.expose_debug_info:
         # GPT headers (per-request metrics)
@@ -485,6 +522,7 @@ async def generate_services(
 async def generate_assets(
     request: AssetsInput,
     response: Response,
+    http_request: Request,
     session_id: str = Depends(get_session_id),
 ) -> AssetsOutput:
     """
@@ -664,6 +702,9 @@ async def generate_assets(
         extra={"session_id": session_id}
     )
 
+    # Roll pending-usage ledger into response, or persist this call's usage if disconnected.
+    usage_metrics = await _finalize_usage(http_request, session_id, usage_metrics)
+
     # Step 7: Add response headers (if enabled)
     if settings.wizard.expose_debug_info:
         # GPT headers (per-request metrics)
@@ -713,6 +754,7 @@ async def generate_assets(
 async def generate_impacts(
     request: ImpactsInput,
     response: Response,
+    http_request: Request,
     session_id: str = Depends(get_session_id),
 ) -> ImpactsOutput:
     """
@@ -898,6 +940,9 @@ async def generate_impacts(
         extra={"session_id": session_id}
     )
 
+    # Roll pending-usage ledger into response, or persist this call's usage if disconnected.
+    usage_metrics = await _finalize_usage(http_request, session_id, usage_metrics)
+
     # Step 6: Add response headers (if enabled)
     if settings.wizard.expose_debug_info:
         # GPT headers (per-request metrics)
@@ -945,6 +990,7 @@ async def generate_impacts(
 async def generate_risks(
     request: RisksInput,
     response: Response,
+    http_request: Request,
     session_id: str = Depends(get_session_id),
 ) -> RisksOutput:
     """
@@ -1148,6 +1194,9 @@ async def generate_risks(
         extra={"session_id": session_id}
     )
 
+    # Roll pending-usage ledger into response, or persist this call's usage if disconnected.
+    usage_metrics = await _finalize_usage(http_request, session_id, usage_metrics)
+
     # Step 7: Add response headers (if enabled)
     if settings.wizard.expose_debug_info:
         # GPT headers (per-request metrics)
@@ -1198,6 +1247,7 @@ async def generate_risks(
 async def generate_controls(
     request: ControlsInput,
     response: Response,
+    http_request: Request,
     session_id: str = Depends(get_session_id),
 ) -> ControlsOutput:
     """
@@ -1391,6 +1441,9 @@ async def generate_controls(
         "controls_saved_to_session",
         extra={"session_id": session_id}
     )
+
+    # Roll pending-usage ledger into response, or persist this call's usage if disconnected.
+    usage_metrics = await _finalize_usage(http_request, session_id, usage_metrics)
 
     # Step 6: Add response headers (if enabled)
     if settings.wizard.expose_debug_info:
