@@ -465,7 +465,7 @@ def _resolve_llm_config() -> tuple[str, int, int, Optional[str]]:
 
     # Timeout
     timeout = (
-        getattr(getattr(s, "llm", None), "http_timeout_sec", None)
+        getattr(getattr(s, "llm", None), "call_timeout_sec", None)
         or getattr(s, "openai_timeout_sec", None)
         or 60
     )

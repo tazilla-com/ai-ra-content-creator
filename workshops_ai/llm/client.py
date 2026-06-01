@@ -20,7 +20,7 @@ class _LLMSettingsP(Protocol):
     """Minimal contract that our Settings.llm must satisfy."""
     model: str
     temperature: float
-    http_timeout_sec: int
+    call_timeout_sec: int
     openai_max_retries: int
     api_key: Optional[str]  # optional; may be None
 
@@ -53,7 +53,7 @@ class LLMConfig(BaseModel):
     provider: Literal["openai", "azure"] = Field("openai", description="LLM provider identifier.")
     model: StrictStr = Field(DEFAULT_MODEL, description="Model name (e.g., gpt-4o-mini).")
     temperature: StrictFloat = Field(0.2, ge=0.0, le=2.0, description="Sampling temperature.")
-    http_timeout_sec: StrictInt = Field(30, ge=1, le=300, description="HTTP timeout in seconds.")
+    call_timeout_sec: StrictInt = Field(30, ge=1, le=300, description="Per-call LLM/agent timeout in seconds.")
     max_retries: StrictInt = Field(3, ge=0, le=10, description="HTTP retry attempts.")
     api_key: Optional[StrictStr] = Field(default=None, description="Provider API key.")
 
@@ -86,7 +86,7 @@ class LLMConfig(BaseModel):
         if not isinstance(settings, _AppSettingsP):
             raise TypeError(
                 "Settings object does not satisfy required interface. "
-                "Required: settings.llm.(model, temperature, http_timeout_sec, openai_max_retries, api_key) "
+                "Required: settings.llm.(model, temperature, call_timeout_sec, openai_max_retries, api_key) "
                 "and optional settings.langchain.(tracing_v2, api_key, endpoint, project)."
             )
 
@@ -100,7 +100,7 @@ class LLMConfig(BaseModel):
             provider=getattr(llm, "provider", "openai") or "openai",
             model=model,
             temperature=temperature,
-            http_timeout_sec=int(getattr(llm, "http_timeout_sec", 30)),
+            call_timeout_sec=int(getattr(llm, "call_timeout_sec", 30)),
             max_retries=int(getattr(llm, "openai_max_retries", 3)),
             api_key=getattr(llm, "api_key", None),
             azure_endpoint=getattr(llm, "azure_endpoint", None),
@@ -165,7 +165,7 @@ def make_llm_client(cfg: LLMConfig) -> Any:
             "azure_endpoint": cfg.azure_endpoint,
             "api_key": cfg.api_key,
             "api_version": cfg.azure_api_version,
-            "timeout": cfg.http_timeout_sec,
+            "timeout": cfg.call_timeout_sec,
             "max_retries": cfg.max_retries,
         }
         if not _is_reasoning_model(cfg.model):
@@ -180,7 +180,7 @@ def make_llm_client(cfg: LLMConfig) -> Any:
             )
         kwargs = {
             "model": cfg.model,
-            "timeout": cfg.http_timeout_sec,
+            "timeout": cfg.call_timeout_sec,
             "max_retries": cfg.max_retries,
             "api_key": cfg.api_key,
         }

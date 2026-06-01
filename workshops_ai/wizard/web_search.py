@@ -62,7 +62,11 @@ async def get_website_via_search(
         with langfuse_client.start_as_current_span(
             name="web_search",
             input={"url": url, "ai_model": ai_model, "resolved_model": settings.wizard.web_search_model},
-            metadata={"method": "web_search", "model": settings.wizard.web_search_model}
+            metadata={
+                "method": "web_search",
+                "model": settings.wizard.web_search_model,
+                "reasoning_effort": settings.wizard.web_search_reasoning_effort,
+            },
         ) as search_span:
             try:
                 result = await _get_website_via_search_impl(url, ai_model, settings, search_span)
@@ -304,6 +308,14 @@ async def _get_website_via_search_impl(
 
     # Extract text content without citations using output_text
     message = response.output_text
+
+    # TEMP DEBUG: log raw response preview to diagnose web_search_insufficient_content errors
+    # Remove after debugging is complete (search for "TEMP DEBUG" to find this block)
+    _preview = (message or "")[:500]
+    logger.info(
+        f"TEMP DEBUG web_search response | url={url} | model={model} | "
+        f"length={len(message) if message else 0} | preview={_preview!r}"
+    )
 
     # Extract sources from web_search_call output item
     sources = []

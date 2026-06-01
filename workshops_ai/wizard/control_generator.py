@@ -1312,7 +1312,11 @@ class ControlGenerator:
             from langfuse import propagate_attributes
 
             # Merge org metadata into span metadata
-            span_metadata = {"endpoint": "controls", "model": self.model_name}
+            span_metadata = {
+                "endpoint": "controls",
+                "model": self.model_name,
+                "reasoning_effort": self.reasoning_effort or self.settings.wizard.reasoning_effort,
+            }
             if org_metadata:
                 span_metadata.update(org_metadata)
 

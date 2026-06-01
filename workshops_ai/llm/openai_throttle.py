@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Deque, Tuple
+from collections import deque
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 
@@ -37,13 +38,20 @@ class OpenAIThrottle:
         rpm: int,
         tpm: int,
         max_concurrent: int,
-        per_request_limits: Optional[Dict[str, int]] = None
+        per_request_limits: Optional[Dict[str, int]] = None,
+        capacity_limits: Optional[Dict[str, int]] = None,
     ):
         self.rpm = rpm
         self.tpm = tpm
         self.max_concurrent = max_concurrent
         self.per_request_limits = per_request_limits or {}
+        self.capacity_limits = capacity_limits or {}
         self.metrics = ThrottleMetrics()
+
+        # Per-model sliding-window token tracking: model -> deque[(timestamp, tokens)]
+        # Used to enforce capacity_limits (TPM per model) before a call goes out.
+        self._model_usage: Dict[str, Deque[Tuple[float, int]]] = {}
+        self._capacity_lock = asyncio.Lock()
 
         self._encoder_cache: Dict[str, Any] = {}
 
@@ -205,6 +213,50 @@ class OpenAIThrottle:
 
         return total_seconds
 
+    _CAPACITY_WINDOW_SEC = 60
+
+    def _cleanup_model_usage(self, model: str, now: float) -> int:
+        """Drop entries older than the window and return current rolling sum."""
+        history = self._model_usage.get(model)
+        if not history:
+            return 0
+        cutoff = now - self._CAPACITY_WINDOW_SEC
+        while history and history[0][0] < cutoff:
+            history.popleft()
+        return sum(tokens for _, tokens in history)
+
+    async def _wait_for_capacity(self, model: str, estimated_tokens: int) -> None:
+        """Block until estimated_tokens fits under the per-model TPM capacity."""
+        limit = self.capacity_limits.get(model)
+        if limit is None:
+            return
+
+        # Loop because multiple waiters may all wake on the same window slide.
+        while True:
+            async with self._capacity_lock:
+                now = time.time()
+                used = self._cleanup_model_usage(model, now)
+                if used + estimated_tokens <= limit:
+                    return
+                # Wait until the oldest entry rolls out of the window.
+                history = self._model_usage.get(model)
+                if not history:
+                    return
+                wait_time = (history[0][0] + self._CAPACITY_WINDOW_SEC) - now
+                wait_time = max(0.1, wait_time + 0.05)
+
+            logger.warning(
+                f"Capacity limit reached for {model}: used={used} + est={estimated_tokens} > "
+                f"limit={limit} TPM. Waiting {wait_time:.1f}s for window to slide."
+            )
+            await asyncio.sleep(wait_time)
+
+    def _record_model_usage(self, model: str, tokens: int) -> None:
+        if model not in self.capacity_limits:
+            return
+        history = self._model_usage.setdefault(model, deque())
+        history.append((time.time(), tokens))
+
     async def _check_adaptive_limits(self, estimated_tokens: int) -> None:
         now = time.time()
 
@@ -276,6 +328,11 @@ class OpenAIThrottle:
             f"tokens={self.metrics.total_tokens}, estimated={estimated_tokens}, model={model}"
         )
 
+        # Per-model capacity (TPM) — waits if the rolling 60s window is full.
+        # Runs after per-request check but before semaphore, so blocked callers
+        # don't hold a concurrency slot while waiting.
+        await self._wait_for_capacity(model, estimated_tokens)
+
         await self._check_adaptive_limits(estimated_tokens)
 
         await self.semaphore.acquire()
@@ -283,13 +340,16 @@ class OpenAIThrottle:
         try:
             try:
                 # pyrate-limiter 3.x: try_acquire without weight (RPM only)
-                # TPM is enforced via adaptive limits (_check_adaptive_limits)
+                # TPM is enforced via per-model sliding window (_wait_for_capacity)
+                # and adaptive limits from response headers (_check_adaptive_limits)
                 self.limiter.try_acquire("openai")
             except BucketFullException:
                 self.metrics.rate_limit_hits += 1
                 logger.warning("Rate limiter full, waiting")
                 await asyncio.sleep(1.0)
                 self.limiter.try_acquire("openai")
+
+            self._record_model_usage(model, estimated_tokens)
 
             yield
 
@@ -329,10 +389,25 @@ class OpenAIThrottle:
 _throttle: Optional[OpenAIThrottle] = None
 
 
-def init_throttle(rpm: int, tpm: int, max_concurrent: int, per_request_limits: Optional[Dict[str, int]] = None) -> None:
+def init_throttle(
+    rpm: int,
+    tpm: int,
+    max_concurrent: int,
+    per_request_limits: Optional[Dict[str, int]] = None,
+    capacity_limits: Optional[Dict[str, int]] = None,
+) -> None:
     global _throttle
-    _throttle = OpenAIThrottle(rpm=rpm, tpm=tpm, max_concurrent=max_concurrent, per_request_limits=per_request_limits)
-    logger.info(f"OpenAI throttle initialized: {rpm} RPM, {tpm} TPM, {max_concurrent} concurrent, per-request limits: {per_request_limits}")
+    _throttle = OpenAIThrottle(
+        rpm=rpm,
+        tpm=tpm,
+        max_concurrent=max_concurrent,
+        per_request_limits=per_request_limits,
+        capacity_limits=capacity_limits,
+    )
+    logger.info(
+        f"OpenAI throttle initialized: {rpm} RPM, {tpm} TPM, {max_concurrent} concurrent, "
+        f"per-request limits: {per_request_limits}, capacity limits (TPM): {capacity_limits}"
+    )
 
 
 def get_throttle() -> OpenAIThrottle:

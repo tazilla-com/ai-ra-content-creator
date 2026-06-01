@@ -129,7 +129,7 @@ class ImpactAgent:
             try:
                 model = getattr(s.llm, "model")                       # type: ignore[attr-defined]
                 temperature = float(getattr(s.llm, "temperature"))    # type: ignore[attr-defined]
-                timeout = int(getattr(s.llm, "http_timeout_sec"))     # type: ignore[attr-defined]
+                timeout = int(getattr(s.llm, "call_timeout_sec"))     # type: ignore[attr-defined]
                 max_retries = int(getattr(s.llm, "openai_max_retries"))  # type: ignore[attr-defined]
             except Exception:
                 model = getattr(s, "llm_model", "gpt-4o-mini")

@@ -10,7 +10,15 @@ Pre-`0.1.0` history is available in `git log`.
 
 ## [Unreleased]
 
-(no changes since 0.1.0)
+### Config
+- **Renamed** `WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC` → `WORKSHOPS_AI_LLM__CALL_TIMEOUT_SEC` (and `LLMSettings.http_timeout_sec` → `call_timeout_sec`). The old name was confusing — it's a per-LLM/agent-call timeout, not an HTTP-protocol-level timeout, and was being conflated with `WORKSHOPS_AI_CHAT__TIMEOUT_SEC` (whole chat-request timeout including multiple LLM calls + tools). **Backward compatible** — the old env name is still accepted via `AliasChoices`.
+
+### Observability
+- **Langfuse spans** now include `reasoning_effort` in metadata for all 5 wizard generators (`services`, `assets`, `impacts`, `risks`, `controls`) and `web_search`. Resolves the cascade (body > env > default) so traces show what was actually applied.
+
+### Added
+- **Per-model TPM enforcement** — new env `WORKSHOPS_AI_WIZARD__OPENAI_CAPACITY_LIMITS` (per-model tokens-per-minute capacity, matches Azure deployment quotas). Enforced via per-model 60-second sliding window in `OpenAIThrottle`: calls that would push the rolling sum over the limit wait until the window slides, instead of failing. Independent from per-request limits (which still raise `RequestTooLargeError` with batch-split hint).
+- **Default per-request limits** updated for current allowed models: `gpt-5-mini` (300k), `gpt-5-nano` (500k), `gpt-5.1-chat` (300k), `gpt-5.4-mini` (300k), `gpt-5.4-nano` (500k), `gpt-4.1` (300k). `gpt-5` (plain) removed from defaults — use `gpt-5-mini` or `gpt-5-nano` instead.
 
 ## [0.1.0] — 2026-05-07
 

@@ -161,7 +161,7 @@ def _llm() -> ChatOpenAI:
     llm_cfg = getattr(s, "llm", None) or {}
     model = getattr(llm_cfg, "model", None) or "gpt-4o-mini"
     temperature = float(getattr(llm_cfg, "temperature", 0.0))
-    timeout = int(getattr(llm_cfg, "http_timeout_sec", 60))
+    timeout = int(getattr(llm_cfg, "call_timeout_sec", 60))
     max_retries = int(getattr(llm_cfg, "openai_max_retries", 3))
 
     return ChatOpenAI(model=model, temperature=temperature, timeout=timeout, max_retries=max_retries)  # type: ignore[call-arg]

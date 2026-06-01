@@ -18,7 +18,7 @@ import secrets
 from functools import lru_cache
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -205,16 +205,25 @@ class LLMSettings(BaseModel):
     Canonical (nested) ENV:
       WORKSHOPS_AI_LLM__MODEL=gpt-5-mini
       WORKSHOPS_AI_LLM__TEMPERATURE=0.2
-      WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC=60
+      WORKSHOPS_AI_LLM__CALL_TIMEOUT_SEC=240  # timeout for a single LLM/agent call
       WORKSHOPS_AI_LLM__OPENAI_MAX_RETRIES=3
       WORKSHOPS_AI_LLM__API_KEY=sk-...
 
     Legacy (flat) ENV handled in AppSettings.model_post_init():
       LLM_MODEL, LLM_TEMPERATURE, OPENAI_API_KEY
+
+    Legacy nested alias still accepted: WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC (use CALL_TIMEOUT_SEC instead).
     """
     model: str = "gpt-5.1-chat"
     temperature: float = 0.2
-    http_timeout_sec: int = 240
+    call_timeout_sec: int = Field(
+        default=240,
+        validation_alias=AliasChoices("call_timeout_sec", "http_timeout_sec"),
+        description=(
+            "Timeout (s) for a single LLM/agent call. "
+            "Distinct from chat.timeout_sec (whole chat request, may contain multiple LLM calls + tool calls)."
+        ),
+    )
     openai_max_retries: int = 3
     api_key: Optional[str] = None
 
@@ -438,13 +447,35 @@ class WizardSettings(BaseModel):
 
     openai_per_request_limits: dict[str, int] = Field(
         default_factory=lambda: {
-            "gpt-5": 500000,           # 500k TPM (Tier 1)
-            "gpt-5-mini": 500000,      # 500k TPM (Tier 1)
-            "gpt-4.1": 30000,          # 30k TPM (Tier 1)
-            "gpt-4o": 30000,           # 30k TPM (Tier 1)
-            "gpt-4o-mini": 200000,     # 200k TPM (Tier 1)
+            # Max tokens accepted in a single LLM call. Triggers RequestTooLargeError
+            # (with suggested smaller batch size) when exceeded — independent of capacity TPM.
+            "gpt-5-mini": 300000,
+            "gpt-5-nano": 500000,
+            "gpt-5.1-chat": 300000,
+            "gpt-5.4-mini": 300000,
+            "gpt-5.4-nano": 500000,
+            "gpt-4.1": 300000,
+            "gpt-4o": 30000,
+            "gpt-4o-mini": 200000,
         },
-        description="Per-request token limits for supported models (Tier 1 OpenAI rate limits)"
+        description="Per-request token limits per model (max tokens per single LLM call)"
+    )
+
+    openai_capacity_limits: dict[str, int] = Field(
+        default_factory=lambda: {
+            # Azure deployment TPM (tokens-per-minute) capacity per model.
+            # Enforced by OpenAIThrottle via per-model sliding window — calls wait
+            # when the rolling 60-second sum would exceed the limit.
+            "gpt-5-mini": 1_000_000,
+            "gpt-5-nano": 5_000_000,
+            "gpt-5.1-chat": 1_000_000,
+            "gpt-5.4-mini": 1_000_000,
+            "gpt-5.4-nano": 5_000_000,
+            "gpt-4.1": 1_000_000,
+            "gpt-4o": 450_000,
+            "gpt-4o-mini": 2_000_000,
+        },
+        description="Per-model TPM capacity (Azure deployment quota). Overrides global openai_throttle.tpm for matching models."
     )
 
     # Content retrieval method

@@ -110,7 +110,7 @@ def get_llm_client(
     client = _get_llm_client_cached(
         model=final_model,
         temperature=default_temperature,
-        http_timeout_sec=http_timeout,
+        call_timeout_sec=http_timeout,
         max_retries=max_retries,
         api_key=api_key,
         base_url=base_url,

@@ -146,7 +146,7 @@ def _get_llm_client_cached(
     *,
     model: str,
     temperature: float,
-    http_timeout_sec: Optional[int],
+    call_timeout_sec: Optional[int],
     max_retries: Optional[int],
     api_key: str,
     base_url: Optional[str],
@@ -173,9 +173,9 @@ def _get_llm_client_cached(
         }
         if not is_reasoning:
             kwargs["temperature"] = float(temperature)
-        if http_timeout_sec is not None:
-            kwargs["timeout"] = int(http_timeout_sec)
-            kwargs["request_timeout"] = int(http_timeout_sec)
+        if call_timeout_sec is not None:
+            kwargs["timeout"] = int(call_timeout_sec)
+            kwargs["request_timeout"] = int(call_timeout_sec)
         if max_retries is not None:
             kwargs["max_retries"] = int(max_retries)
         return ThrottledAzureChatOpenAI(**kwargs)  # type: ignore[call-arg]
@@ -191,9 +191,9 @@ def _get_llm_client_cached(
     if base_url:
         kwargs["base_url"] = base_url
         kwargs["openai_api_base"] = base_url
-    if http_timeout_sec is not None:
-        kwargs["timeout"] = int(http_timeout_sec)
-        kwargs["request_timeout"] = int(http_timeout_sec)
+    if call_timeout_sec is not None:
+        kwargs["timeout"] = int(call_timeout_sec)
+        kwargs["request_timeout"] = int(call_timeout_sec)
     if max_retries is not None:
         kwargs["max_retries"] = int(max_retries)
 
@@ -724,7 +724,7 @@ def make_default_deps(
     model = getattr(llm_settings, "model", None)
     api_key = getattr(llm_settings, "api_key", None) or getattr(s, "openai_api_key", None)
     base_url = getattr(llm_settings, "base_url", None) or getattr(s, "openai_base_url", None)
-    http_timeout = getattr(llm_settings, "http_timeout_sec", None)
+    call_timeout = getattr(llm_settings, "call_timeout_sec", None)
     max_retries = getattr(llm_settings, "openai_max_retries", None)
     provider = getattr(llm_settings, "provider", "openai") or "openai"
     azure_endpoint = getattr(llm_settings, "azure_endpoint", None)
@@ -738,7 +738,7 @@ def make_default_deps(
         model=model,
         api_key=api_key,
         temperature=llm_temperature,
-        http_timeout_sec=http_timeout,
+        call_timeout_sec=call_timeout,
         max_retries=max_retries,
         base_url=base_url,
         provider=provider,
