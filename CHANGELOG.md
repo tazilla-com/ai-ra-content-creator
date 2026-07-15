@@ -33,6 +33,21 @@ Pre-`0.1.0` history is available in `git log`.
 - **Renamed** `WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC` → `WORKSHOPS_AI_LLM__CALL_TIMEOUT_SEC` (and `LLMSettings.http_timeout_sec` → `call_timeout_sec`). The old name was confusing — it's a per-LLM/agent-call timeout, not an HTTP-protocol-level timeout, and was being conflated with `WORKSHOPS_AI_CHAT__TIMEOUT_SEC` (whole chat-request timeout including multiple LLM calls + tools). **Backward compatible** — the old env name is still accepted via `AliasChoices`.
 
 ### Documentation
+- **`docs/websocket-api.md`** — new. The Asset-workshop WebSocket protocol, which OpenAPI cannot
+  describe and which was previously undocumented in the repo: handshake and query params,
+  authentication (including the 4401 close code and why browser clients must use `?api_key=`), all
+  four client frames and all six server frames, error codes, limits, and the catalog
+  `scraped-content` contract. Corrected against the implementation while writing: the source
+  document described a `tool_status` frame that no code path emits, a 120 s request timeout (the
+  setting is 75 s and is **not enforced** — the agent task is awaited without a deadline), and a
+  10-message history cap (the real cap is 20 messages / 10 turns). It also omitted authentication
+  entirely, plus the `progress` and `ping`/`pong` frames, which are emitted. Gaps are now marked
+  rather than silently documented as working.
+- **`README.md` — the Asset workshop is documented for the first time.** The README described only
+  the wizard half; the LangGraph ReAct chat agent, its seven tools, the `/demo` UI, and the fact that
+  both halves share one session (the agent reads the wizard's services and writes back into
+  `wizard_steps["assets"]["assets"]`) were entirely absent. Also documents the catalog `file`/`http`
+  modes and `scripts/mock_tazilla_api.py` as a reference catalog backend for local `http`-mode work.
 - **`README.md` rewritten to match the current API.** It had drifted far enough to be actively
   misleading: it documented `GET`/`DELETE /wizard/state` (never existed — the real endpoints are
   `GET`/`DELETE /session`), described sessions as keyed by `org_id`/`user_id` query params (they are
