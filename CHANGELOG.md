@@ -16,8 +16,35 @@ Pre-`0.1.0` history is available in `git log`.
 - **Default per-request limits** updated for current allowed models: `gpt-5-mini` (300k), `gpt-5-nano` (500k), `gpt-5.1-chat` (300k), `gpt-5.4-mini` (300k), `gpt-5.4-nano` (500k), `gpt-4.1` (300k). `gpt-5` (plain) removed from defaults — use `gpt-5-mini` or `gpt-5-nano` instead.
 - **Langfuse spans** now include `reasoning_effort` in metadata for all 5 wizard generators (`services`, `assets`, `impacts`, `risks`, `controls`) and `web_search`. Resolves the cascade (body > env > default) so traces show what was actually applied.
 
+- **`LICENSE`** — the project is now released under the **Apache License 2.0**.
+
+### Removed
+- **`openapi.json`** (repo root) — a stale generated artifact advertising version `1.0.0` with none of
+  the `/wizard/*` endpoints; it predated the `1.0.0` → `0.1.0` baseline reset and contradicted both
+  the code and the README. FastAPI serves a live, always-current schema at `/openapi.json` when
+  `WORKSHOPS_AI_ENABLE_DOCS=true`.
+- **Root scratch files untracked** — `resp.json`, `test_sc.py`, `test_asset_agent.py`, `commands.txt`,
+  `constraints.off`, `constraints.txt`. Ad-hoc working files; the real suite is in
+  `workshops_ai/tests/`. Now gitignored (local copies unaffected).
+- **`.gitignore`** additionally covers local-only material: `docker-compose.override.yml`, `.claude/`,
+  `support/`, `_lf_*.json`.
+
 ### Changed
 - **Renamed** `WORKSHOPS_AI_LLM__HTTP_TIMEOUT_SEC` → `WORKSHOPS_AI_LLM__CALL_TIMEOUT_SEC` (and `LLMSettings.http_timeout_sec` → `call_timeout_sec`). The old name was confusing — it's a per-LLM/agent-call timeout, not an HTTP-protocol-level timeout, and was being conflated with `WORKSHOPS_AI_CHAT__TIMEOUT_SEC` (whole chat-request timeout including multiple LLM calls + tools). **Backward compatible** — the old env name is still accepted via `AliasChoices`.
+
+### Documentation
+- **`README.md` rewritten to match the current API.** It had drifted far enough to be actively
+  misleading: it documented `GET`/`DELETE /wizard/state` (never existed — the real endpoints are
+  `GET`/`DELETE /session`), described sessions as keyed by `org_id`/`user_id` query params (they are
+  keyed by the `X-Session-Id` header), and used `number_of_services` / `number_of_assets` request
+  fields (the real fields are `min_services`/`max_services` and `min_assets`/`max_assets` — and since
+  wizard inputs are `extra="forbid"`, the documented bodies returned **HTTP 422**). It also pointed
+  wizard model config at `WORKSHOPS_AI_LLM__MODEL` / `__TEMPERATURE`, which configure the chat/agent
+  path and are silently ignored by the wizard (`WORKSHOPS_AI_WIZARD__DEFAULT_MODEL` /
+  `__TEMPERATURE` are the wizard's). Now documented: both **OpenAI and Azure OpenAI** providers,
+  `reasoning_effort`, per-model TPM throttling, the control/threat catalogs, Langfuse prompt
+  management and tracing, Docker deployment, cancelled-call usage recovery, and the
+  `DISABLE_ALL_AUTH` / `CORS_ORIGINS=["*"]` / `ENABLE_DOCS` security notes.
 
 ### Fixed
 - **`/wizard/controls` 500 errors ("The model produced invalid content")** — the batch controls call used the full `PlannedControl` / `AssetControls` models as the OpenAI Structured Outputs `response_format`. Their `Optional[Decimal]` cost fields and nested threat-coverage objects generate `anyOf` + regex `pattern` schemas that the system prompt simultaneously forbids; under gpt-5.4-mini (medium reasoning) the contradiction drove the model off-schema and Azure returned 500. The model now emits a minimal name-only DTO (`ControlSelection` / `AssetControlSelection`); full control metadata is enriched from the catalog after generation. **HTTP API output unchanged.**

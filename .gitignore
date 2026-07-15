@@ -76,3 +76,19 @@ workshops_ai/data/outbox/**
 
 # Snyk Security Extension - AI Rules (auto-generated)
 .cursor/rules/snyk_rules.mdc
+
+# ===== Local dev overrides & agent config =====
+docker-compose.override.yml
+.claude/
+support/
+_lf_*.json
+
+# ===== Root scratch (untracked; regenerate or keep locally) =====
+# openapi.json is served live at /openapi.json when ENABLE_DOCS=true — don't commit a stale copy.
+/openapi.json
+/resp.json
+/test_sc.py
+/test_asset_agent.py
+/commands.txt
+/constraints.off
+/constraints.txt

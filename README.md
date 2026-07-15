@@ -1,130 +1,236 @@
-# AI Wizard API
+# AI RA Content Creator
 
-AI-powered risk analysis wizard for automated asset discovery, impact evaluation, threat identification, and control recommendations.
+AI-powered **risk analysis (RA)** content generation. Given an organisation's website, the wizard
+produces a structured risk analysis in six steps:
+
+```
+Website → Services → Assets → Impacts → Risks → Controls
+```
+
+Each step is an independent HTTP endpoint that builds on the previous step's output, held in a
+server-side session. Controls and risks are grounded in a curated catalog of security controls and
+threats rather than generated free-form.
+
+- **Version**: `0.1.0` (`0.x` — API may change; see [CHANGELOG.md](CHANGELOG.md))
+- **Stack**: FastAPI · LangChain · Redis · OpenAI / Azure OpenAI · Langfuse
 
 ## Features
 
-- **Multi-step Wizard Flow**: Services → Assets → Impacts → Risks → Controls
-- **Web Content Retrieval**: Traditional scraping (BeautifulSoup) or AI-powered web search (OpenAI)
-- **Session Management**: Redis-based state persistence across wizard steps
-- **LLM-Powered Generation**: Structured output generation using OpenAI models
-- **Cost Tracking**: Token usage and cost calculation per request
-- **Multi-language Support**: English, Slovak, Czech
+- **Six-step wizard flow** — services, assets, impacts, risks, controls, plus a combined
+  `/wizard/evaluation` that runs the whole chain in one call.
+- **Two LLM providers** — direct **OpenAI** or **Azure OpenAI**, selected by one env var.
+- **Reasoning-effort control** — per-request `reasoning_effort` for reasoning models (`gpt-5*`, `o1`,
+  `o3`, `o4`), with an env-level default.
+- **Catalog-grounded output** — risks and controls are selected from curated catalogs
+  (controls, threats, control×threat and asset-type×threat matrices), not invented by the model.
+- **Web content retrieval** — traditional scraping (BeautifulSoup) or AI-powered web search.
+- **Session management** — Redis-backed state across wizard steps, keyed by an `X-Session-Id` header.
+- **Rate limiting & resilience** — per-model tokens-per-minute throttling, per-request token limits,
+  and a circuit breaker around the LLM client.
+- **Cost tracking** — token usage and USD cost per request, including recovery of usage from
+  cancelled calls.
+- **Observability** — Langfuse tracing and remote prompt management.
+- **Multi-language output** — English, Slovak, Czech.
 
 ## Requirements
 
-- Python 3.11+
-- Redis (for session management)
-- OpenAI API key
+- **Python 3.11+**
+- **Redis** — required in practice; wizard steps chain through it
+- **An LLM key** — either an OpenAI API key or an Azure OpenAI deployment
 
-## Installation
+## Quick start (Docker)
 
-### 1. Clone and Setup Virtual Environment
+The fastest path. `docker-compose` starts two services: the API and Redis.
+
+```bash
+cp env.example .env
+# edit .env — at minimum set your LLM key (see Configuration below)
+
+docker compose up --build
+```
+
+The API is then on `http://localhost:8000`. Check it:
+
+```bash
+curl http://localhost:8000/health
+```
+
+## Quick start (local)
 
 ```bash
 python -m venv .venv
 
 # macOS/Linux
 source .venv/bin/activate
-
 # Windows PowerShell
 .\.venv\Scripts\Activate.ps1
-```
 
-### 2. Install Dependencies
-
-```bash
 pip install -U pip
 pip install -r requirements.txt
+
+cp env.example .env      # then edit .env
+
+uvicorn workshops_ai.app.main:app --host 0.0.0.0 --port 8000
 ```
 
-### 3. Environment Configuration
+Redis must be reachable at `WORKSHOPS_AI_REDIS__URL` (default `redis://localhost:6379/0`).
 
-Create a `.env` file in the project root:
+## Configuration
+
+All settings are environment variables prefixed `WORKSHOPS_AI_`, with `__` marking nesting.
+[`env.example`](env.example) is the complete annotated reference — the essentials are below.
+
+### Choosing an LLM provider
+
+The wizard supports **OpenAI** and **Azure OpenAI**. Pick one with `WORKSHOPS_AI_LLM__PROVIDER`.
+
+**Option A — direct OpenAI:**
 
 ```bash
-# ==================== App Configuration ====================
+WORKSHOPS_AI_LLM__PROVIDER=openai
+OPENAI_API_KEY=sk-your-openai-api-key-here
+```
+
+**Option B — Azure OpenAI:**
+
+```bash
+WORKSHOPS_AI_LLM__PROVIDER=azure
+WORKSHOPS_AI_LLM__API_KEY=your-azure-openai-api-key
+WORKSHOPS_AI_LLM__AZURE_ENDPOINT=https://your-resource.openai.azure.com/
+WORKSHOPS_AI_LLM__AZURE_API_VERSION=2025-03-01-preview
+```
+
+> **Azure deployment names must match the model names.** The resolved model name is passed straight
+> through as `azure_deployment`, so a deployment named `gpt-5-mini` is required for the default
+> model to work.
+
+### Wizard model settings
+
+> **Note:** `WORKSHOPS_AI_LLM__MODEL` and `WORKSHOPS_AI_LLM__TEMPERATURE` configure the **chat/agent**
+> path, **not** the wizard. The wizard has its own settings, below.
+
+```bash
+# Default model for all wizard steps
+WORKSHOPS_AI_WIZARD__DEFAULT_MODEL=gpt-5-mini
+
+# Reasoning effort: minimal | low | medium | high
+# Cascade: request body > this env var > default ("medium")
+WORKSHOPS_AI_WIZARD__REASONING_EFFORT=medium
+
+# Only applies to NON-reasoning models — ignored for gpt-5*, o1, o3, o4
+WORKSHOPS_AI_WIZARD__TEMPERATURE=0.2
+```
+
+**Allowed models:** `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5.1-chat`, `gpt-5.4-mini`,
+`gpt-5.4-nano`, `gpt-4.1`, `gpt-4o`, `gpt-4o-mini`. A model outside this list is rejected.
+
+`minimal` reasoning effort is only supported by `gpt-5`, `gpt-5-mini` and `gpt-5-nano`;
+`low`/`medium`/`high` work for all reasoning models.
+
+### App, security and storage
+
+```bash
 WORKSHOPS_AI_ENV=production
 WORKSHOPS_AI_LOG_LEVEL=INFO
 WORKSHOPS_AI_APP_HOST=0.0.0.0
 WORKSHOPS_AI_APP_PORT=8000
-WORKSHOPS_AI_ENABLE_DOCS=false
+WORKSHOPS_AI_ENABLE_DOCS=false          # true exposes /docs
 
-# CORS
+# CORS — "*" is rejected at startup unless WORKSHOPS_AI_ENV=dev
 WORKSHOPS_AI_CORS_ORIGINS=["https://yourdomain.com"]
 
-# ==================== Security ====================
-# API Key Authentication
+# API key auth
 WORKSHOPS_AI_SECURITY__ENABLE_API_KEY=true
 WORKSHOPS_AI_SECURITY__API_KEYS=["your-secure-api-key-here"]
 
-# JWT Authentication (optional)
+# JWT auth (optional)
 WORKSHOPS_AI_SECURITY__ENABLE_JWT=false
 
-# ==================== Redis ====================
+# Redis
 WORKSHOPS_AI_REDIS__URL=redis://localhost:6379/0
-
-# ==================== OpenAI ====================
-OPENAI_API_KEY=sk-your-openai-api-key-here
-WORKSHOPS_AI_LLM__MODEL=gpt-4o-mini
-WORKSHOPS_AI_LLM__TEMPERATURE=0.2
-
-# ==================== Wizard Settings ====================
-# Session
 WORKSHOPS_AI_WIZARD__SESSION_TTL_HOURS=8
+```
 
-# Web Search (AI-powered)
+### Web retrieval
+
+```bash
 WORKSHOPS_AI_WIZARD__WEB_SEARCH_ENABLED=true
-WORKSHOPS_AI_WIZARD__WEB_SEARCH_MODEL=gpt-4o
+WORKSHOPS_AI_WIZARD__WEB_SEARCH_MODEL=gpt-5-nano
 WORKSHOPS_AI_WIZARD__WEB_SEARCH_TIMEOUT_SEC=120
 
-# Traditional Scraping
 WORKSHOPS_AI_WIZARD__SCRAPE_ENABLED=true
 WORKSHOPS_AI_WIZARD__SCRAPE_TIMEOUT_SEC=10
 WORKSHOPS_AI_WIZARD__SCRAPE_MAX_RETRIES=2
 ```
 
-## API Endpoints
+### Rate limiting
 
-### Wizard Flow
+`WORKSHOPS_AI_WIZARD__OPENAI_CAPACITY_LIMITS` sets per-model tokens-per-minute capacity, matching
+your deployment quotas. Calls that would exceed the rolling 60-second window wait for the window to
+slide rather than failing. Per-request token limits are separate and raise a `RequestTooLargeError`
+with a batch-split hint.
 
-All wizard endpoints require authentication via `X-API-Key` header or JWT Bearer token.
+## Sessions
 
-#### 1. Scrape Website
+Wizard steps chain through a server-side session identified by the **`X-Session-Id`** header.
 
-```http
-POST /scrape/website
-Content-Type: application/json
-X-API-Key: your-api-key
+- Omit the header on your first call — the server generates an id and returns it in the
+  `X-Session-Id` response header.
+- Send that id on every subsequent call to chain the steps.
+- State is stored in Redis and expires after `WORKSHOPS_AI_WIZARD__SESSION_TTL_HOURS` (default 8).
 
-{
-  "url": "https://example.com",
-  "search_method": "scrape"  // "scrape" or "web_search"
-}
+```bash
+# 1. First call — no header; capture the returned id
+curl -i -X POST http://localhost:8000/wizard/services \
+  -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
+  -d '{"website_url": "https://example.com", "language": "en"}'
+# → response header: X-Session-Id: kJ8fQ2mNp4rT7vX1yZ3aBc
+
+# 2. Subsequent calls — reuse it
+curl -X POST http://localhost:8000/wizard/assets \
+  -H "X-Session-Id: kJ8fQ2mNp4rT7vX1yZ3aBc" \
+  -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
+  -d '{"language": "en", "max_assets": 10}'
 ```
 
-**Response:**
+## API
+
+All endpoints require authentication via an `X-API-Key` header or a JWT bearer token.
+
+> **Unknown request fields are rejected with HTTP 422.** Wizard inputs are strict
+> (`extra="forbid"`) — a typo in a field name is an error, not a silently ignored value.
+
+Every wizard step accepts these optional fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `language` | `en` \| `sk` \| `cs` | Output language (default `en`) |
+| `ai_model` | string | Model override for this call; must be in the allowed list |
+| `reasoning_effort` | `minimal` \| `low` \| `medium` \| `high` | Reasoning-effort override |
+
+### `POST /scrape/website`
+
 ```json
-{
-  "url": "https://example.com",
-  "content": "Combined scraped content from homepage, services, and about pages..."
-}
+{ "url": "https://example.com", "search_method": "scrape" }
 ```
 
-#### 2. Generate Services
+`search_method` is `scrape` (BeautifulSoup) or `web_search` (AI-powered). Returns the combined
+content of the homepage plus services and about pages.
 
-```http
-POST /wizard/services
-Content-Type: application/json
-X-API-Key: your-api-key
+### `POST /wizard/services`
 
+```json
 {
   "website_url": "https://example.com",
   "search_method": "web_search",
   "language": "en",
-  "number_of_services": 3
+  "min_services": 1,
+  "max_services": 3
 }
 ```
+
+`min_services` / `max_services` are optional, range 1–10. `organization_profile` may be supplied for
+better grounding.
 
 **Response:**
 ```json
@@ -139,118 +245,77 @@ X-API-Key: your-api-key
 }
 ```
 
-#### 3. Generate Assets
+### `POST /wizard/assets`
 
-```http
-POST /wizard/assets
-Content-Type: application/json
-X-API-Key: your-api-key
-
-{
-  "language": "en",
-  "number_of_assets": 10
-}
+```json
+{ "language": "en", "min_assets": 5, "max_assets": 10 }
 ```
 
-Assets are generated based on services and website content from session.
+Optional, range 1–100. Assets are generated from the services and website content in the session.
 
-#### 4. Generate Impacts
+### `POST /wizard/impacts`
 
-```http
-POST /wizard/impacts
-Content-Type: application/json
-X-API-Key: your-api-key
-
-{
-  "language": "en"
-}
+```json
+{ "language": "en" }
 ```
 
-#### 5. Generate Risks
+Reads assets from the session.
 
-```http
-POST /wizard/risks
-Content-Type: application/json
-X-API-Key: your-api-key
+### `POST /wizard/risks`
 
-{
-  "language": "en"
-}
+```json
+{ "language": "en" }
 ```
 
-#### 6. Generate Controls
+Reads assets and impacts from the session. Threats are selected from the threat catalog.
 
-```http
-POST /wizard/controls
-Content-Type: application/json
-X-API-Key: your-api-key
+### `POST /wizard/controls`
 
-{
-  "language": "en",
-  "max_controls_per_asset": 5
-}
+```json
+{ "language": "en", "max_controls_per_asset": 5 }
 ```
 
-#### 7. Full Evaluation (All Steps)
+Reads assets and risks from the session. Controls are selected from the control catalog and enriched
+with catalog metadata after generation.
 
-```http
-POST /wizard/evaluation
-Content-Type: application/json
-X-API-Key: your-api-key
+### `POST /wizard/evaluation`
 
+```json
 {
   "website_url": "https://example.com",
   "search_method": "web_search",
   "language": "en",
-  "number_of_services": 3,
-  "number_of_assets": 10,
+  "min_services": 1,
+  "max_services": 3,
+  "min_assets": 5,
+  "max_assets": 10,
   "max_controls_per_asset": 5
 }
 ```
 
-Runs all wizard steps in sequence and returns combined results.
+Runs all steps in sequence and returns the combined result.
 
-### State Management
+### Session
 
 ```http
-# Get current wizard state
-GET /wizard/state?org_id=org123&user_id=user456
-
-# Clear wizard state (reset)
-DELETE /wizard/state?org_id=org123&user_id=user456
+GET    /session      # current session state    (X-Session-Id header)
+DELETE /session      # clear session state      (X-Session-Id header)
 ```
 
-## Configuration
+### Catalogs
 
-### Session Management
+`GET /api/catalogs/*` exposes the underlying reference data — controls, threats, impacts, sectors,
+and the control×threat and asset-type×threat mappings.
 
-- **TTL**: Configurable via `WORKSHOPS_AI_WIZARD__SESSION_TTL_HOURS` (default: 8 hours)
-- **Storage**: Redis key pattern: `wizard:{org_id}:{user_id}`
+### Health
 
-### Web Scraping
+```http
+GET /health
+```
 
-Two methods available:
+## Cost tracking
 
-1. **Traditional Scraping** (`search_method="scrape"`):
-   - BeautifulSoup-based HTML parsing
-   - Fetches homepage + services + about pages
-   - Content sanitization and validation
-   - Prompt injection protection
-
-2. **AI Web Search** (`search_method="web_search"`):
-   - OpenAI-powered intelligent search
-   - Domain-filtered results
-   - Higher quality content extraction
-
-### Security
-
-- **API Key Auth**: Header `X-API-Key: your-key` or query param `?api_key=your-key`
-- **JWT Auth**: Header `Authorization: Bearer <token>`
-- **Content Sanitization**: Removes suspicious patterns and potential prompt injections
-
-## Cost Tracking
-
-All LLM operations return cost information:
+Every LLM operation reports usage and cost:
 
 ```json
 {
@@ -260,45 +325,97 @@ All LLM operations return cost information:
       "completion_tokens": 567,
       "total_tokens": 1801,
       "cost_usd": 0.00123,
-      "model": "gpt-4o-mini"
+      "model": "gpt-5-mini",
+      "includes_recovered": false,
+      "recovered_cost_usd": 0.0
     }
   }
 }
 ```
 
-Enable debug info via `WORKSHOPS_AI_WIZARD__EXPOSE_DEBUG_INFO=true`.
+If a client disconnects mid-call, the tokens Azure/OpenAI already consumed are recorded and rolled
+into the next successful response — `includes_recovered` marks that, and `recovered_cost_usd` is
+already included in `cost_usd`.
+
+Controlled by `WORKSHOPS_AI_WIZARD__EXPOSE_DEBUG_INFO`.
+
+## Observability
+
+[Langfuse](https://langfuse.com) provides tracing and **remote prompt management** — wizard prompts
+are fetched from Langfuse at runtime rather than being hard-coded. Traces include the resolved
+`reasoning_effort` for each generator.
+
+> Because prompts load remotely, changing a prompt in Langfuse changes behaviour without a code
+> deploy. Prompt variables are part of the API contract — see [CHANGELOG.md](CHANGELOG.md).
 
 ## Architecture
 
-### Components
+| Concern | Technology |
+|---|---|
+| API framework | FastAPI |
+| LLM orchestration | LangChain, LangGraph |
+| LLM providers | OpenAI, Azure OpenAI |
+| Session & state | Redis |
+| Prompt management, tracing | Langfuse |
+| Scraping | BeautifulSoup, lxml, publicsuffix2 |
+| Validation | Pydantic, pydantic-settings |
+| Resilience | Tenacity (retries), pybreaker (circuit breaker), pyrate-limiter |
+| Token accounting | tiktoken |
+| Logging | structlog |
+| Auth | PyJWT |
 
-- **FastAPI**: REST API framework
-- **Redis**: Session storage and caching
-- **OpenAI**: LLM for generation and web search
-- **BeautifulSoup + lxml**: HTML parsing for traditional scraping
-- **Pydantic**: Request/response validation
-- **Tenacity**: Retry logic for transient failures
-
-### Scraper Architecture
+### Scraper
 
 ```
 workshops_ai/wizard/scraper/
-├── core.py              # Main get_website() orchestration
-├── http_client.py       # Shared HTTP client with connection reuse
-├── text_processing.py   # Unicode normalization, encoding fixes
-├── sanitizer.py         # Security: prompt injection detection
-├── validation.py        # Content quality checks
-├── link_extractor.py    # Same-domain link extraction (PSL-based)
-└── constants.py         # URL patterns for services/about pages
+├── core.py              # get_website() orchestration
+├── http_client.py       # shared HTTP client with connection reuse
+├── text_processing.py   # unicode normalisation, encoding fixes
+├── sanitizer.py         # prompt-injection detection
+├── validation.py        # content quality checks
+├── link_extractor.py    # same-domain link extraction (PSL-based)
+├── constants.py         # URL patterns for services/about pages
+└── exceptions.py
 ```
 
-### Session Flow
+Two retrieval methods:
 
-1. **Scrape Website** → Content cached in Redis (`website_content`)
-2. **Generate Services** → Reads cached content, generates services
-3. **Generate Assets** → Reads services from session, generates assets
-4. **Generate Impacts** → Reads assets from session
-5. **Generate Risks** → Reads assets + impacts
-6. **Generate Controls** → Reads assets + risks
+1. **Traditional scraping** (`search_method="scrape"`) — BeautifulSoup HTML parsing across homepage,
+   services and about pages, with sanitisation, validation and prompt-injection protection.
+2. **AI web search** (`search_method="web_search"`) — model-driven, domain-filtered search.
 
-Each step saves results to session for use by subsequent steps.
+### Catalogs
+
+`workshops_ai/data/catalogs/` holds the reference data grounding the wizard's output: security
+controls, threats, impact types, sectors, and weighted control×threat and asset-type×threat
+matrices. Categories align with ISO/IEC 27002 domains. Served from disk or over HTTP, per
+`WORKSHOPS_AI_CATALOG__MODE`.
+
+### Session flow
+
+1. **Scrape website** → content cached in the session
+2. **Services** → from cached website content
+3. **Assets** → from services + website content
+4. **Impacts** → from assets
+5. **Risks** → from assets + impacts, grounded in the threat catalog
+6. **Controls** → from assets + risks, grounded in the control catalog
+
+Each step persists its result for the next.
+
+## Security notes
+
+- **`WORKSHOPS_AI_SECURITY__DISABLE_ALL_AUTH`** disables all authentication. It is a development
+  convenience and must never be enabled in a deployed environment.
+- **`WORKSHOPS_AI_CORS_ORIGINS=["*"]`** is rejected at startup unless `WORKSHOPS_AI_ENV=dev`.
+- **`WORKSHOPS_AI_ENABLE_DOCS`** should stay `false` in production; it exposes `/docs`.
+- Scraped content is sanitised for prompt-injection patterns before reaching the model.
+
+## Tests
+
+```bash
+pytest workshops_ai/tests/
+```
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
