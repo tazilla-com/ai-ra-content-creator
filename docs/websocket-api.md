@@ -91,7 +91,7 @@ payload fields are rejected — payloads are strict (`extra="forbid"`).
             "organizationName": "Acme Corporation",
             "legalForm": "s.r.o.",
             "country": "SK",
-            "numberOfEmployees": 150,
+            "numberOfEmployees": "150",
             "organizationalUnits": [
                 {"name": "IT oddelenie", "description": "Správa infraštruktúry"},
                 {"name": "Financie", "description": "Účtovníctvo a reporting"}
@@ -118,6 +118,36 @@ updates at existing entries. Set `selected: true` on assets the user has explici
 
 **`model` is required on every message,** which means the model can change mid-conversation without
 reconnecting.
+
+### `assets[]` — `AssetInput`
+
+Strict (`extra="forbid"`): an unknown field is a validation error, not a silently ignored value.
+
+| Field | Required | Type | Notes |
+|---|---|---|---|
+| `name` | **yes** | string | |
+| `assetType` | **yes** | string | Should match a value from `GET /api/catalogs/asset-types` |
+| `id` | no | UUID | Omit for assets the server has not seen |
+| `description` | no | string \| null | |
+| `isPrimary` | no | bool | Defaults to `true` |
+| `confidentiality` | no | enum \| null | `PUBLIC`, `INTERNAL`, `PROTECTED`, `STRICTLY_PROTECTED` |
+| `integrity` | no | enum \| null | `LOW`, `MEDIUM`, `HIGH` |
+| `availability` | no | enum \| null | `LOW`, `MEDIUM`, `HIGH` |
+| `selected` | no | bool | Defaults to `false`. Set `true` for assets the user selected. |
+
+### `organization` — `Organization`
+
+Also strict. Every field is optional; send what you have.
+
+| Field | Type | Notes |
+|---|---|---|
+| `organizationName` | string \| null | |
+| `legalForm` | string \| null | e.g. `s.r.o.`, `Inc.` |
+| `registeredOffice` | string \| null | Registered address |
+| `country` | string \| null | Country code, e.g. `SK` |
+| `numberOfEmployees` | **string** \| null | **A string, not a number.** Free text is intended — `"150"`, `"50-100"`, `"~200"` all work. Sending `150` as an integer is a validation error. |
+| `organizationalUnits` | array | `{name (required), description?}` |
+| `jobPositions` | array | `{title (required), description?}` |
 
 ## 1.2 `ping` — keepalive
 

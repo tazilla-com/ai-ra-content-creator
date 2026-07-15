@@ -43,6 +43,12 @@ Pre-`0.1.0` history is available in `git log`.
   10-message history cap (the real cap is 20 messages / 10 turns). It also omitted authentication
   entirely, plus the `progress` and `ping`/`pong` frames, which are emitted. Gaps are now marked
   rather than silently documented as working.
+- **`docs/websocket-api.md` — field tables for `AssetInput` and `Organization`,** and a fix to the
+  `chat` example, which did not validate. `Organization.numberOfEmployees` is `Optional[str]` — free
+  text like `"50-100"` or `"~200"` is the point — but the example passed `150` as an integer, and
+  Pydantic v2 does not coerce int → str, so the payload was rejected with *"Input should be a valid
+  string"*. Both payload models are `extra="forbid"`, so a wrong or unknown field is a hard error
+  rather than an ignored value; the example is now verified against the real `ChatPayload` model.
 - **`README.md` — the Asset workshop is documented for the first time.** The README described only
   the wizard half; the LangGraph ReAct chat agent, its seven tools, the `/demo` UI, and the fact that
   both halves share one session (the agent reads the wizard's services and writes back into
