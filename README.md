@@ -507,6 +507,25 @@ Each step persists its result for the next.
 pytest workshops_ai/tests/
 ```
 
+## Test & evidence harness
+
+[`harness/`](harness/) is a separate, opt-in **live test harness** that drives the real six-step
+wizard chain and the Asset-workshop agent against the configured provider and catalog, verifies the
+results, and renders a testing/deployment evidence report. It runs as its own container (it is **not**
+part of `docker compose up`) and is **config-driven** — it exercises whatever provider (OpenAI/Azure)
+and catalog (`http`/`file`) the service is configured with, using real calls only (no mocked
+responses).
+
+```bash
+# full evidence suite: normal operation, provider error, retry/fallback, user validation
+docker compose -f docker-compose.yaml -f docker-compose.override.yml \
+  -f harness/docker-compose.harness.yml run --rm harness
+```
+
+It also serves as an on-demand correctness check after changes. See
+**[harness/README.md](harness/README.md)** for its purpose, all subcommands, configuration, and how
+each result maps to the evidence appendix.
+
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).

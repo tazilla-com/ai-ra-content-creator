@@ -83,6 +83,9 @@ docker-compose.override.yml
 support/
 _lf_*.json
 
+# ===== Harness run artifacts (keep the harness, ignore its outputs) =====
+harness/runs/
+
 # ===== Root scratch (untracked; regenerate or keep locally) =====
 # openapi.json is served live at /openapi.json when ENABLE_DOCS=true — don't commit a stale copy.
 /openapi.json

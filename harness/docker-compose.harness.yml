@@ -1,0 +1,42 @@
+# Opt-in TEST harness — built and run SEPARATELY from the production stack.
+#
+# It is NOT started by `docker compose up` (guarded by the "harness" profile).
+# It reuses the application image (so it exercises the exact production code and
+# dependency versions) and runs as its own one-shot container on the same
+# network, where `mock-tazilla`, `redis`, and the provider credentials from
+# `.env` all resolve. No local Python is required.
+#
+#   # app image must exist (produced by the normal build)
+#   docker compose build api
+#
+#   # run the full evidence suite (redis + mock-tazilla start automatically)
+#   docker compose -f docker-compose.yaml -f docker-compose.override.yml \
+#     -f harness/docker-compose.harness.yml run --rm harness
+#
+#   # or run a specific command by appending args:
+#   docker compose ... run --rm harness python -m harness.runner chain --reps 1
+#
+# Run artifacts are written to ./harness/runs on the host (bind mount).
+services:
+  harness:
+    image: workshops-ai:local          # reuse the built app image; do NOT bake harness into it
+    container_name: workshops-ai-harness
+    profiles: ["harness"]              # excluded from `docker compose up`
+    env_file:
+      - .env                            # provider credentials + configured catalog (whatever is set)
+    environment:
+      # Reach infrastructure by compose service name (override host-oriented values from .env).
+      WORKSHOPS_AI_REDIS__URL: ${WORKSHOPS_AI_REDIS__URL:-redis://redis:6379/0}
+      WORKSHOPS_AI_REDIS_URL: ${WORKSHOPS_AI_REDIS_URL:-redis://redis:6379/0}
+      PYTHONPATH: /app
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./harness:/app/harness          # overlay harness code at runtime (kept out of the prod image)
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-tazilla:
+        condition: service_healthy
+    working_dir: /app
+    command: ["python", "-m", "harness.runner", "evidence", "--reps", "1"]
+    restart: "no"

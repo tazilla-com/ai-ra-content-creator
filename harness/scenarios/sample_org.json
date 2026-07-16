@@ -1,0 +1,12 @@
+{
+  "description": "Small fictional organisation used to drive the full wizard chain live. Not a real company.",
+  "organization_profile": {
+    "organizationName": "Northwind Freight s.r.o.",
+    "legalForm": "s.r.o.",
+    "country": "SK",
+    "numberOfEmployees": "120",
+    "sector": "Logistics and transport"
+  },
+  "website_content": "Northwind Freight s.r.o. is a regional logistics and transport company based in Bratislava, Slovakia, serving central-European supply chains since 2009. We operate three core lines of business. Freight forwarding and road transport: a fleet of 45 trucks moving palletised and full-truck-load cargo across the EU, dispatched and tracked from our operations centre. Contract warehousing: two temperature-controlled distribution centres (12,000 m2 total) offering pick-and-pack, cross-docking and inventory management, run on a warehouse management system (WMS). Customs brokerage: import/export declarations and duty handling for clients trading with non-EU partners. Customers use the Northwind Portal, a web application where they book shipments, download proof-of-delivery documents and track consignments in real time; the portal authenticates users and stores customer contact and shipment data. Internally the company runs an ERP system for orders, invoicing and finance, an HR system for its 120 employees, and email and file storage hosted with a cloud provider. The finance department processes customer payments and supplier invoices. IT is managed by a small in-house team with support from an external managed-services provider. Northwind holds customer commercial data, driver and employee personal data, and operational telemetry from vehicle tracking units.",
+  "language": "en"
+}
