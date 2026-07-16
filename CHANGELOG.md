@@ -6,11 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Pre-`0.1.0` history is available in `git log`.
-`1.0.0` is reserved for the first stable production release.
+`1.0.0` is the first stable production release.
 
-## [Unreleased]
+## [1.0.0] — 2026-07-16
 
 ### Added
+- **Evaluation & evidence harness** (`harness/`) — an opt-in, containerised live harness that drives the wizard chain and the Asset-workshop agent against the configured provider/catalog, verifies results, induces real faults, and renders testing/deployment evidence. Excluded from `docker compose up`; see `harness/README.md`.
 - **Cancelled-call usage recovery** — when the client closes the HTTP connection before the wizard response is delivered (e.g. user navigates away while the LLM call is in flight, but Azure has already consumed tokens), the call's usage is persisted to a per-session ledger in `session.wizard_metadata["pending_usage"]` (keyed by model). The next successful `/wizard/*` response rolls these recovered tokens into its `usage` field. `UsageMetrics` gains two backward-compatible fields: `includes_recovered: bool` and `recovered_cost_usd: float` (recovered cost is *included* in `cost_usd`). New helper module `wizard/pending_usage.py`; aggregate-per-model storage shape cannot grow beyond the number of allowed models, so no eviction logic is needed.
 - **Per-model TPM enforcement** — new env `WORKSHOPS_AI_WIZARD__OPENAI_CAPACITY_LIMITS` (per-model tokens-per-minute capacity, matches Azure deployment quotas). Enforced via per-model 60-second sliding window in `OpenAIThrottle`: calls that would push the rolling sum over the limit wait until the window slides, instead of failing. Independent from per-request limits (which still raise `RequestTooLargeError` with batch-split hint).
 - **Default per-request limits** updated for current allowed models: `gpt-5-mini` (300k), `gpt-5-nano` (500k), `gpt-5.1-chat` (300k), `gpt-5.4-mini` (300k), `gpt-5.4-nano` (500k), `gpt-4.1` (300k). `gpt-5` (plain) removed from defaults — use `gpt-5-mini` or `gpt-5-nano` instead.

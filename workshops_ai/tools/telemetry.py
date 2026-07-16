@@ -198,7 +198,7 @@ def _build_cfg_from_settings() -> _Config:
         return _Config(
             enabled=True,
             service="workshops_ai",
-            version="0.1.0",
+            version="1.0.0",
             environment="dev",
             level=logging.INFO,
             log_to_file=False,
@@ -209,7 +209,7 @@ def _build_cfg_from_settings() -> _Config:
     return _Config(
         enabled=bool(getattr(tel, "enabled", True)),
         service=str(getattr(_SETTINGS, "service_name", "workshops_ai")),
-        version=str(getattr(_SETTINGS, "version", "0.1.0")),
+        version=str(getattr(_SETTINGS, "version", "1.0.0")),
         environment=str(getattr(_SETTINGS, "env", "dev")),
         level=_level_from_str(getattr(tel, "level", "INFO")),
         log_to_file=bool(getattr(tel, "log_to_file", False)),
