@@ -518,7 +518,7 @@ responses).
 
 ```bash
 # full evidence suite: normal operation, provider error, retry/fallback, user validation
-docker compose -f docker-compose.yaml -f docker-compose.override.yml \
+docker compose -f docker-compose.yaml \
   -f harness/docker-compose.harness.yml run --rm harness
 ```
 

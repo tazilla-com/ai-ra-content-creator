@@ -66,7 +66,7 @@ The harness starts `redis` and `mock-tazilla` automatically as dependencies:
 
 ```bash
 # Full Appendix-D evidence suite (chain + agent + timeout fault + token-limit fault + report)
-docker compose -f docker-compose.yaml -f docker-compose.override.yml \
+docker compose -f docker-compose.yaml \
   -f harness/docker-compose.harness.yml run --rm harness
 ```
 

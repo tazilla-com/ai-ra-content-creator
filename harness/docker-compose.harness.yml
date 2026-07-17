@@ -2,19 +2,31 @@
 #
 # It is NOT started by `docker compose up` (guarded by the "harness" profile).
 # It reuses the application image (so it exercises the exact production code and
-# dependency versions) and runs as its own one-shot container on the same
-# network, where `mock-tazilla`, `redis`, and the provider credentials from
-# `.env` all resolve. No local Python is required.
+# dependency versions) and runs as its own one-shot container on the compose
+# network, where `redis`, the bundled `mock-tazilla` catalog backend, and the
+# provider credentials from `.env` all resolve. No local Python is required.
 #
 #   # app image must exist (produced by the normal build)
 #   docker compose build api
 #
-#   # run the full evidence suite (redis + mock-tazilla start automatically)
-#   docker compose -f docker-compose.yaml -f docker-compose.override.yml \
+#   # run the full evidence suite
+#   docker compose -f docker-compose.yaml \
 #     -f harness/docker-compose.harness.yml run --rm harness
 #
 #   # or run a specific command by appending args:
 #   docker compose ... run --rm harness python -m harness.runner chain --reps 1
+#
+# CATALOG: the harness uses whatever catalog the application is configured with.
+#   - WORKSHOPS_AI_CATALOG__MODE=http (e.g. ENDPOINT=http://mock-tazilla:9000):
+#     the `mock-tazilla` reference backend defined in THIS file is started as a
+#     dependency, so http mode works out of the box on a fresh clone.
+#   - WORKSHOPS_AI_CATALOG__MODE=file: the bundled CSVs are used; mock-tazilla
+#     still starts (harmless) but is not read.
+#   - Any other endpoint (a real Tazilla catalog service): it must be reachable
+#     from this container; the harness preflight fails fast with a clear message.
+#
+# `mock-tazilla` is defined here (not only in the local docker-compose.override.yml)
+# so the harness is self-contained and reproducible from the public repository.
 #
 # Run artifacts are written to ./harness/runs on the host (bind mount).
 services:
@@ -40,3 +52,23 @@ services:
     working_dir: /app
     command: ["python", "-m", "harness.runner", "evidence", "--reps", "1"]
     restart: "no"
+
+  # Reference catalog backend (serves the bundled CSVs over the Tazilla catalog
+  # contract). Defined here so the harness works from a clean public checkout;
+  # it mirrors the service in docker-compose.override.yml, so including both files
+  # merges cleanly.
+  mock-tazilla:
+    image: workshops-ai:local
+    container_name: workshops-ai-mock-tazilla
+    command: ["python", "scripts/mock_tazilla_api.py", "--host", "0.0.0.0", "--port", "9000"]
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./workshops_ai/data:/app/workshops_ai/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:9000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
