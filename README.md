@@ -25,7 +25,7 @@ The two are **not separate products**. The workshop reads the services the wizar
 writes assets back into the same session, so you can start in either and finish in the other. Risks
 and controls are selected from curated catalogs rather than invented by the model.
 
-- **Version**: `1.0.0` (see [CHANGELOG.md](CHANGELOG.md))
+- **Version**: `1.1.0` (see [CHANGELOG.md](CHANGELOG.md))
 - **Stack**: FastAPI · LangChain · LangGraph · Redis · OpenAI / Azure OpenAI · Langfuse
 - **Docs**: REST API — OpenAPI schema at `/openapi.json`, Swagger UI at `/docs` ·
   [WebSocket API](docs/websocket-api.md) · live demo UI at `/demo`

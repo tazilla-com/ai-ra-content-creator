@@ -666,7 +666,7 @@ class AppSettings(BaseSettings):
     # App meta / server
     env: str = "dev"
     service_name: str = "AI Risk Analysis API"
-    version: str = "1.0.0"
+    version: str = "1.1.0"
     log_level: str = "INFO"
     app_host: str = "0.0.0.0"
     app_port: int = 8000

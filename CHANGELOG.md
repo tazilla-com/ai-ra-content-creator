@@ -8,9 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-`0.1.0` history is available in `git log`.
 `1.0.0` is the first stable production release.
 
-## [Unreleased]
+## [1.1.0] — 2026-07-21
+
+Both fixes in this release share one root cause: the published repository depended on files that
+existed only on a developer machine, so a clean clone could not build or run the harness.
 
 ### Fixed
+- **Harness could not start from a clean clone** — `harness/docker-compose.harness.yml` declared a
+  `depends_on: mock-tazilla`, but that service was defined only in the gitignored
+  `docker-compose.override.yml`. The harness now defines `mock-tazilla` itself, so `http`-mode catalog
+  runs work from a fresh checkout with no local-only files.
 - **Docker build failed from a clean checkout** — `Dockerfile` did `COPY constraints.txt ./constraints.txt`
   unconditionally in both the builder and runtime stages, while `constraints.txt` was gitignored in
   `1.0.0`. `COPY` of a missing path is a hard error, so `docker compose up --build` — the README's own
