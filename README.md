@@ -10,7 +10,11 @@ through the chain:
 Website → Services → Assets → Impacts → Risks → Controls
 ```
 
-Each step is an independent HTTP endpoint consuming the previous step's output.
+Each step is an independent HTTP endpoint consuming the previous step's output. The public REST
+surface — the wizard steps, catalogs, session and scrape — is published by the service as an OpenAPI
+schema at `/openapi.json`, with Swagger UI at `/docs` and ReDoc at `/redoc` when
+`WORKSHOPS_AI_ENABLE_DOCS=true` (off by default; the schema at `/openapi.json` is always served).
+Internal and tool-layer routes are deliberately excluded from the schema.
 
 **2. The Asset workshop** — a conversational agent over WebSocket. Instead of generating an asset
 register in one shot, you talk to it: *"create assets for the IT department"*, *"mark the database as
@@ -23,7 +27,8 @@ and controls are selected from curated catalogs rather than invented by the mode
 
 - **Version**: `1.0.0` (see [CHANGELOG.md](CHANGELOG.md))
 - **Stack**: FastAPI · LangChain · LangGraph · Redis · OpenAI / Azure OpenAI · Langfuse
-- **Docs**: [WebSocket API](docs/websocket-api.md) · live demo UI at `/demo`
+- **Docs**: REST API — OpenAPI schema at `/openapi.json`, Swagger UI at `/docs` ·
+  [WebSocket API](docs/websocket-api.md) · live demo UI at `/demo`
 
 ## Features
 

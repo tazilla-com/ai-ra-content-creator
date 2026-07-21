@@ -20,8 +20,10 @@
       && rm -rf /var/lib/apt/lists/*
   
   COPY requirements.txt ./requirements.txt
-  COPY constraints.txt ./constraints.txt
-  
+  # Optional pin file: the bracket glob makes COPY a no-op when it is absent,
+  # matching the `if [[ -f ... ]]` guards below. A plain COPY would hard-fail.
+  COPY constraints.tx[t] ./
+
   # Use BuildKit cache for pip
   RUN --mount=type=cache,target=/root/.cache/pip \
     if [[ -f constraints.txt ]]; then \
@@ -52,8 +54,9 @@
   # Install from prebuilt wheels
   COPY --from=builder /wheels /wheels
   COPY requirements.txt ./requirements.txt
-  COPY constraints.txt ./constraints.txt
-  
+  # Optional pin file — see the note in the builder stage.
+  COPY constraints.tx[t] ./
+
   RUN --mount=type=cache,target=/root/.cache/pip \
       if [[ -f constraints.txt ]]; then \
         python -m pip install --no-index --find-links=/wheels -r requirements.txt -c constraints.txt; \

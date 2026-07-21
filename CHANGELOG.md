@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Pre-`0.1.0` history is available in `git log`.
 `1.0.0` is the first stable production release.
 
+## [Unreleased]
+
+### Fixed
+- **Docker build failed from a clean checkout** — `Dockerfile` did `COPY constraints.txt ./constraints.txt`
+  unconditionally in both the builder and runtime stages, while `constraints.txt` was gitignored in
+  `1.0.0`. `COPY` of a missing path is a hard error, so `docker compose up --build` — the README's own
+  quick start — failed before installing any dependency. The surrounding `if [[ -f constraints.txt ]]`
+  guards show the file was always meant to be optional; the `COPY` simply ran before them. Now
+  `COPY constraints.tx[t] ./`, whose bracket glob is a no-op when the file is absent. The empty
+  placeholder `constraints.txt` has been removed, so a local build and a clean-clone build are
+  identical. Drop a real pin file in place to re-enable constrained installs.
+
 ## [1.0.0] — 2026-07-16
 
 ### Added
