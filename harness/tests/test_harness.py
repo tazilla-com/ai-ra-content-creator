@@ -89,6 +89,86 @@ def test_config_summary_excludes_secrets():
     assert summary["catalog_endpoint"] == "http://mock-tazilla:9000"
 
 
+# --- startup-log redaction (regression: credentials were logged in the clear) -
+
+# These two need workshops_ai importable. Every other test in this file is
+# deliberately independent of the application, so they skip rather than fail
+# when the package is not on the path.
+
+def _load_settings_module():
+    try:
+        from workshops_ai import settings as settings_mod
+    except Exception:  # pragma: no cover - application not importable here
+        return None
+    return settings_mod
+
+
+def test_redacted_dict_hides_every_credential():
+    """AppSettings.redacted_dict() must leak no credential, including the provider key.
+
+    Regression: this used to redact six fields and miss llm.api_key (the Azure/OpenAI key) plus
+    the four flat legacy aliases, which hold copies of the same values.
+    """
+    settings_mod = _load_settings_module()
+    if settings_mod is None:
+        return
+
+    canary = "CANARY-SECRET-VALUE-do-not-log"
+    s = settings_mod.AppSettings()
+    s.security.jwt_secret = canary
+    s.security.api_keys = [canary, canary + "-2"]
+    s.catalog.auth_token = canary
+    s.llm.api_key = canary
+    s.langchain.api_key = canary
+    s.langfuse.public_key = canary
+    s.langfuse.secret_key = canary
+    s.langchain_api_key_flat = canary
+    s.langfuse_public_key_flat = canary
+    s.langfuse_secret_key_flat = canary
+    s.openai_api_key_flat = canary
+
+    rendered = json.dumps(s.redacted_dict(), default=str)
+    assert canary not in rendered, "redacted_dict() leaked a credential"
+    # and it must still be useful for diagnosis
+    assert s.env in rendered
+
+
+def test_every_secret_path_exists_on_the_model():
+    """The explicit secret list must not drift away from the fields it names."""
+    settings_mod = _load_settings_module()
+    if settings_mod is None:
+        return
+
+    s = settings_mod.AppSettings()
+    data = s.model_dump()
+    for path in settings_mod._SECRET_FIELD_PATHS:
+        node = data
+        for part in path.split("."):
+            assert isinstance(node, dict) and part in node, (
+                f"_SECRET_FIELD_PATHS names {path!r}, which is not a field on AppSettings"
+            )
+            node = node[part]
+
+
+def test_redact_for_log_handles_pydantic_models():
+    """redact_for_log() must not pass a model through untouched.
+
+    Regression: it walked Mapping/list/tuple only, so a BaseModel hit the leaf branch and came back
+    unredacted. That is how the startup log printed every credential.
+    """
+    settings_mod = _load_settings_module()
+    if settings_mod is None:
+        return
+    from workshops_ai.tools.telemetry import redact_for_log
+
+    canary = "CANARY-SECRET-VALUE-do-not-log"
+    s = settings_mod.AppSettings()
+    s.llm.api_key = canary
+    s.security.jwt_secret = canary
+
+    assert canary not in json.dumps(redact_for_log(s), default=str)
+
+
 # --- report renderer ---------------------------------------------------------
 
 def test_report_render_smoke():

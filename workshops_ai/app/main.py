@@ -11,7 +11,10 @@
 #   - Chat UI is provided by workshops_ai/chatui/router.py
 #
 # Change:
-#   - Use central `mask_secrets()` to redact config in the startup log (replaces settings.redacted_dict()).
+#   - Redact config in the startup log via settings.redacted_dict(). An earlier change routed this
+#     through telemetry.redact_for_log() aliased as `mask_secrets()`; that function only walks
+#     Mapping/list/tuple, so an AppSettings instance passed through untouched and the line logged
+#     every credential in the clear. Reverted deliberately — do not re-introduce the alias.
 #   - Added session propagation helpers for HTTP: a stable cookie/header name and a
 #     `get_session_id_from_request()` fallback that chat_router can use when body lacks `session_id`.
 #   - ✅ NEW: Enable faulthandler at startup and register SIGUSR2 to dump stacks (for recursion/debug).
@@ -54,8 +57,7 @@ except Exception:
 from workshops_ai.settings import get_settings
 settings = get_settings()
 
-# Central secret masking (for startup log redaction)
-from workshops_ai.tools.telemetry import redact_for_log as mask_secrets
+# Startup-log redaction goes through settings.redacted_dict() — see the note in the header.
 
 # Optional HTTP auth dependency (used for HTTP routers, NOT for WebSocket)
 try:
@@ -322,9 +324,13 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     except Exception as e:
         logger.warning("tracing.setup_failed: %s", e)
 
-    # Log redacted settings (no secrets)
+    # Log redacted settings (no secrets).
+    #
+    # This MUST go through AppSettings.redacted_dict(). The generic redact_for_log() walks
+    # Mapping/list/tuple and treats anything else as a leaf — and AppSettings is a BaseModel, not a
+    # Mapping, so it passed straight through and this line logged every credential in the clear.
     try:
-        logger.info("startup.begin %s", mask_secrets(settings))
+        logger.info("startup.begin %s", settings.redacted_dict())
     except Exception:
         logger.info("startup.begin")
 
