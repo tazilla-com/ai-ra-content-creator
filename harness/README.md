@@ -132,7 +132,9 @@ Per-run CLI flags (see `--help` on any subcommand):
 | `--kind` | — (`timeout` \| `token_limit`) | fault |
 | `--records` | — | report |
 
-## Evidence coverage (maps to the testing/deployment appendix)
+## Evidence coverage
+
+Each category of the testing/deployment appendix, and how the harness produces its evidence:
 
 | Appendix category | How the harness produces it |
 |---|---|
