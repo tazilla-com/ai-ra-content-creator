@@ -637,6 +637,31 @@ class RagSettings(BaseModel):
 # ------------------------------------------------------------------------------
 # Root settings
 # ------------------------------------------------------------------------------
+_REDACTED = "***"
+
+# Every settings field that holds a credential, as a dotted path.
+#
+# This is an EXPLICIT LIST and not a name pattern on purpose: a pattern that guesses fails open —
+# add a credential whose name does not match it and the value stays in the clear, looking perfectly
+# healthy. A list can only ever be out of date, and being out of date is visible in review.
+#
+# Adding a credential field to this class means adding its path here in the same change.
+_SECRET_FIELD_PATHS: tuple[str, ...] = (
+    "security.jwt_secret",
+    "catalog.auth_token",
+    "llm.api_key",              # the provider key (Azure/OpenAI) — the most sensitive value here
+    "langchain.api_key",
+    "langfuse.public_key",
+    "langfuse.secret_key",
+    # Flat legacy aliases. These hold COPIES of the same credentials, so redacting only the nested
+    # form leaves the value in the clear one line further down.
+    "langchain_api_key_flat",
+    "langfuse_public_key_flat",
+    "langfuse_secret_key_flat",
+    "openai_api_key_flat",
+)
+
+
 class AppSettings(BaseSettings):
     """
     Application root settings.
@@ -795,37 +820,28 @@ class AppSettings(BaseSettings):
 
     def redacted_dict(self) -> dict:
         """
-        Return a dict safe for logging (secrets redacted).
-        - API keys -> "***"
-        - JWT secret -> "***"
-        - Catalog auth token -> "***"
-        - LangChain API key -> "***"
+        Return a dict safe for logging: every credential replaced with "***".
+
+        Driven by ``_SECRET_FIELD_PATHS`` rather than a per-field if-chain, so that adding a
+        credential to this class and forgetting to redact it is a one-line omission in a list
+        someone reviews, not an invisible gap.
         """
         data = self.model_dump()
 
-        # Security
-        sec = data.get("security", {})
-        if sec.get("api_keys"):
-            sec["api_keys"] = ["***", f"({len(self.security.api_keys)} keys)"]
-        if sec.get("jwt_secret"):
-            sec["jwt_secret"] = "***"
+        for path in _SECRET_FIELD_PATHS:
+            *parents, leaf = path.split(".")
+            node: Any = data
+            for parent in parents:
+                node = node.get(parent) if isinstance(node, dict) else None
+                if node is None:
+                    break
+            if isinstance(node, dict) and node.get(leaf):
+                node[leaf] = _REDACTED
 
-        # Catalog
-        cat = data.get("catalog", {})
-        if cat.get("auth_token"):
-            cat["auth_token"] = "***"
-
-        # LangChain
-        lc = data.get("langchain", {})
-        if lc.get("api_key"):
-            lc["api_key"] = "***"
-
-        # Langfuse
-        lf = data.get("langfuse", {})
-        if lf.get("public_key"):
-            lf["public_key"] = "***"
-        if lf.get("secret_key"):
-            lf["secret_key"] = "***"
+        # api_keys is a list of credentials: keep the count, drop every value.
+        sec = data.get("security")
+        if isinstance(sec, dict) and sec.get("api_keys"):
+            sec["api_keys"] = [_REDACTED, f"({len(self.security.api_keys)} keys)"]
 
         return data
 

@@ -54,10 +54,10 @@ except Exception:  # pragma: no cover
 # Common sensitive key names to redact (case-insensitive exact field name match)
 _SENSITIVE_KEYS = {
     "password", "pass", "pwd",
-    "token", "access_token", "refresh_token",
-    "secret", "client_secret", "secret_key",
+    "token", "access_token", "refresh_token", "auth_token",
+    "secret", "client_secret", "secret_key", "jwt_secret",
     "authorization", "authorization_header", "auth",
-    "api_key", "apikey", "x-api-key",
+    "api_key", "apikey", "api_keys", "x-api-key", "public_key",
     "bearer", "session", "cookie",
 }
 
@@ -124,6 +124,15 @@ def redact_for_log(obj: Any, *, sensitive_keys: Iterable[str] = _SENSITIVE_KEYS)
                 return [_walk(v) for v in x]
             if isinstance(x, tuple):
                 return tuple(_walk(v) for v in x)
+            # A pydantic model is NOT a Mapping. Without this branch it falls through to the leaf
+            # case below and is returned unredacted — which is exactly how the startup log came to
+            # print every credential in the clear. Duck-typed so this module stays dependency-free.
+            dump = getattr(x, "model_dump", None)
+            if callable(dump):
+                try:
+                    return _walk(dump())
+                except Exception:
+                    return "<unserializable model>"
             # leaf
             return _redact_value(x)
 
