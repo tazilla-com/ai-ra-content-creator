@@ -50,8 +50,57 @@ harness/
 ├── runner.py                    # CLI entry point
 ├── selftest.py                  # zero-dependency runner for the deterministic tests
 ├── scenarios/                   # production-shape inputs (sample_org.json drives the live chain)
-└── tests/                       # deterministic tests (verifiers, report, config redaction)
+├── tests/                       # deterministic tests (verifiers, report, config redaction)
+└── audit/                       # read-only instrumentation: what actually runs (see below)
 ```
+
+## `audit/` — establishing which code actually runs
+
+The rest of the harness answers *"is the output correct?"*. `audit/` answers a different question:
+**"which code was executed at all?"** — the one static analysis cannot answer, because a module can be
+imported and still never run.
+
+Nothing in the application imports it; every module is a standalone `python -m` entry point. It uses
+only the standard library (`sys.setprofile`), so it runs inside the production image unchanged.
+
+| Module | What it does |
+|---|---|
+| `exec_probe.py` | records every Python function entered, keyed `file:line:qualname`. Also wraps any module: `python -m harness.audit.exec_probe -m harness.runner chain` |
+| `inventory.py` | every function/method in the tree, from the AST — the denominator |
+| `surface_drive.py` | drives the real ASGI app **in-process** over every route incl. the WebSocket, under the probe |
+| `report_coverage.py` | joins inventory × probe → per-file "never executed" table |
+| `langfuse_recon.py` | read-only dump of the hosted prompt registry, traces and observations |
+
+```bash
+# inside the running api container (or any container built from this image)
+docker exec workshops-ai-api python -m harness.audit.inventory --base /app --out /app/logs/audit/inventory.json
+docker exec workshops-ai-api python -m harness.audit.surface_drive --no-llm --out /app/logs/audit/exec.json   # free
+docker exec workshops-ai-api python -m harness.audit.surface_drive          --out /app/logs/audit/exec.json   # live, ~$0.04
+docker exec workshops-ai-api python -m harness.audit.report_coverage \
+    --inventory /app/logs/audit/inventory.json --exec /app/logs/audit/exec.json
+docker exec workshops-ai-api python -m harness.audit.langfuse_recon
+```
+
+Artifacts land in `/app/logs/audit/`, which is bind-mounted, so they survive a redeploy.
+
+**Why `surface_drive` runs in-process rather than over HTTP:** the probe has to live in the same
+interpreter as the code it records. Driving the app through `starlette.testclient` exercises the genuine
+middleware stack, dependency graph, routers and WebSocket handler while keeping everything in one
+process the probe can see.
+
+**Two traps worth knowing before reusing this:**
+
+- The probe→inventory join must be on **qualname, not line number**. For a decorated function CPython
+  reports `co_firstlineno` at the first decorator while the AST reports the `def`; joining on line
+  silently marks every decorated endpoint as never-run.
+- The probe is **function-level**. A 2,000-line file with 7 methods yields 7 data points, so it cannot
+  distinguish branches inside a large method.
+
+`surface_drive` also covers a gap the rest of the harness has by design: the harness drives the
+generators **in-process**, so it never exercises the API's request validation, middleware, auth or
+session layers. (That gap is why nobody had noticed that `scenarios/sample_org.json`'s
+`organization_profile` carries a `sector` key, which `api/schema/organization.py:Organization` —
+`extra="forbid"` — rejects with 422 when the same profile is POSTed to the wizard REST API.)
 
 ## Prerequisites
 
