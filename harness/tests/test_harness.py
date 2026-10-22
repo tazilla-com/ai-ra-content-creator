@@ -7,6 +7,9 @@ are triggered explicitly via the container and are not part of this suite.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -202,3 +205,98 @@ def test_bundled_scenario_loads():
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data.get("website_content")
     assert data.get("organization_profile", {}).get("organizationName")
+
+
+# --- health probes (regression: each probe imported the app and wrote a Redis session) -----------
+
+_HEALTHCHECK = Path(__file__).resolve().parents[2] / "docker" / "healthcheck.py"
+
+
+def _probe(port: int) -> int:
+    env = {"APP_HOST": "127.0.0.1", "APP_PORT": str(port), "PATH": os.environ.get("PATH", "")}
+    return subprocess.run([sys.executable, str(_HEALTHCHECK)], env=env, timeout=10).returncode
+
+
+def test_healthcheck_probes_livez_without_importing_the_app():
+    """docker/healthcheck.py must answer from /livez alone and import nothing of workshops_ai.
+
+    Regression: it imported workshops_ai.settings, which made every probe cost about 0.4 s of CPU.
+    """
+    import http.server
+    import threading
+
+    status = {"code": 200}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(status["code"] if self.path == "/livez" else 404)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    try:
+        assert _probe(port) == 0
+        status["code"] = 503
+        assert _probe(port) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert _probe(port) == 1  # nothing listening
+
+    imported = subprocess.run(
+        [sys.executable, "-c", "import runpy, sys; runpy.run_path(sys.argv[1]); "
+         "print(sorted(m for m in sys.modules if m.startswith('workshops_ai')))", str(_HEALTHCHECK)],
+        capture_output=True, text=True, timeout=10,
+    ).stdout.strip()
+    assert imported == "[]", imported
+
+
+def test_session_middleware_gives_probes_no_session():
+    """Health probes must get no session: no Redis write, no cookie.
+
+    Regression: every cookie-less request got a new sess:<id> key with an 8 h TTL, so each probe
+    wrote one. Needs workshops_ai and starlette importable, like the redaction tests.
+    """
+    try:
+        from starlette.applications import Starlette
+        from starlette.responses import PlainTextResponse
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+        from workshops_ai.app.middlewares import session_middleware as sm
+    except Exception:  # pragma: no cover - application not importable here
+        return
+
+    writes = []
+
+    class FakeRedis:
+        async def get(self, key):
+            return None
+
+        async def set(self, key, value, ex=None):
+            writes.append(key)
+
+    async def fake_get_redis():
+        return FakeRedis()
+
+    async def ok(request):
+        return PlainTextResponse("OK")
+
+    original = sm.get_redis
+    sm.get_redis = fake_get_redis
+    try:
+        app = Starlette(routes=[Route(p, ok) for p in ("/livez", "/readyz", "/health", "/wizard/state")])
+        app.add_middleware(sm.SessionMiddleware, secure_cookie=False)
+        client = TestClient(app)
+        for path in ("/livez", "/readyz", "/health"):
+            response = client.get(path)
+            assert response.status_code == 200 and "set-cookie" not in response.headers, path
+        assert writes == []
+        response = client.get("/wizard/state")
+        assert "wsai.sid" in response.headers.get("set-cookie", "")
+        assert len(writes) == 1 and writes[0].startswith("sess:")
+    finally:
+        sm.get_redis = original

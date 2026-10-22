@@ -6,6 +6,7 @@ from workshops_ai.app.services.redis_pool import get_redis
 
 COOKIE = "wsai.sid"
 TTL = 8 * 60 * 60  # 8 h
+PROBE_PATHS = {"/livez", "/readyz", "/health"}  # no session for health probes: each one wrote a new key
 
 class SessionMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, *, secure_cookie: bool):
@@ -13,6 +14,8 @@ class SessionMiddleware(BaseHTTPMiddleware):
         self.secure_cookie = secure_cookie
 
     async def dispatch(self, request: Request, call_next):
+        if request.url.path in PROBE_PATHS:
+            return await call_next(request)
         sid = request.cookies.get(COOKIE) or secrets.token_urlsafe(18)
         r = await get_redis()
         data = {}
