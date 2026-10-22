@@ -33,12 +33,17 @@ def get_langfuse_client():
 
     try:
         from langfuse import Langfuse
+        from opentelemetry.sdk.trace import TracerProvider
 
         # Build kwargs for Langfuse client
         langfuse_kwargs = {
             "public_key": settings.langfuse.public_key,
             "secret_key": settings.langfuse.secret_key,
             "host": settings.langfuse.base_url,
+            # Langfuse gets a TracerProvider of its own, so only spans created through this client are
+            # exported. Without one the SDK registers itself as the global OpenTelemetry provider and
+            # exports every span of every library: FastAPI >= 0.156 traces each request, /livez included.
+            "tracer_provider": TracerProvider(),
         }
 
         # Add environment if configured
