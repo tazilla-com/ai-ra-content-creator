@@ -1,18 +1,21 @@
 # File: docker/healthcheck.py
+# Standard library only: importing workshops_ai.settings made every probe cost about 0.4 s of CPU,
+# where the request itself costs a few milliseconds. Reads the same variables the settings do.
+import http.client
+import os
 import sys
-from urllib.request import urlopen
-from urllib.error import URLError, HTTPError
-from workshops_ai.settings import get_settings
 
 
 def main() -> int:
-    s = get_settings()
-    host = "127.0.0.1" if s.app_host in ("0.0.0.0", "::") else s.app_host
-    url = f"http://{host}:{s.app_port}/livez"
+    host = os.environ.get("APP_HOST") or os.environ.get("WORKSHOPS_AI_APP_HOST") or "0.0.0.0"
+    if host in ("0.0.0.0", "::"):
+        host = "127.0.0.1"
+    port = int(os.environ.get("APP_PORT") or os.environ.get("WORKSHOPS_AI_APP_PORT") or 8000)
     try:
-        with urlopen(url, timeout=2) as r:
-            return 0 if r.status == 200 else 1
-    except (URLError, HTTPError, Exception):
+        conn = http.client.HTTPConnection(host, port, timeout=2)
+        conn.request("GET", "/livez")
+        return 0 if conn.getresponse().status == 200 else 1
+    except Exception:
         return 1
 
 
