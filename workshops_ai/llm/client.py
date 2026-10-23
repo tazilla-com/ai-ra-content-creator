@@ -139,8 +139,8 @@ def _apply_tracing(cfg: LLMConfig) -> None:
 
 
 def _is_reasoning_model(model: str) -> bool:
-    """Reasoning models (gpt-5*, o1*, o3*, o4*) don't support temperature parameter."""
-    return any(model.startswith(p) for p in ("gpt-5", "o1", "o3", "o4"))
+    """Reasoning models (gpt-5*, gpt-6*, o1*, o3*, o4*) don't support temperature parameter."""
+    return any(model.startswith(p) for p in ("gpt-5", "gpt-6", "o1", "o3", "o4"))
 
 
 def make_llm_client(cfg: LLMConfig) -> Any:

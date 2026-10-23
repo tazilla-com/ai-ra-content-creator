@@ -40,8 +40,8 @@ def create_wizard_llm_client(
         else settings.wizard.reasoning_effort
     )
 
-    # Reasoning models (gpt-5*, o1*, o3*, o4*) don't support temperature parameter
-    _REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+    # Reasoning models (gpt-5*, gpt-6*, o1*, o3*, o4*) don't support temperature parameter
+    _REASONING_PREFIXES = ("gpt-5", "gpt-6", "o1", "o3", "o4")
     is_reasoning = any(resolved_model.startswith(p) for p in _REASONING_PREFIXES)
 
     # Azure OpenAI provider

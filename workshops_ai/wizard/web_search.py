@@ -228,7 +228,7 @@ async def _get_website_via_search_impl(
 
         # Add reasoning parameter only for reasoning models (gpt-5, o1, etc)
         # Non-reasoning models (gpt-4o, gpt-4o-mini) don't support this parameter
-        reasoning_models = ("gpt-5", "o1", "o3", "o4")
+        reasoning_models = ("gpt-5", "gpt-6", "o1", "o3", "o4")
         is_reasoning_model = any(model.startswith(prefix) for prefix in reasoning_models)
         if settings.wizard.web_search_reasoning_effort and is_reasoning_model:
             request_params["reasoning"] = {"effort": settings.wizard.web_search_reasoning_effort}
