@@ -300,3 +300,35 @@ def test_session_middleware_gives_probes_no_session():
         assert len(writes) == 1 and writes[0].startswith("sess:")
     finally:
         sm.get_redis = original
+
+
+# --- dependencies (regression: every image build resolved the whole stack afresh) -----------------
+
+_REPO = Path(__file__).resolve().parents[2]
+
+
+def _entries(name: str) -> list[str]:
+    lines = (_REPO / name).read_text(encoding="utf-8").splitlines()
+    return [s for s in (line.split("#", 1)[0].strip() for line in lines) if s]
+
+
+def test_constraints_pin_every_requirement():
+    """constraints.txt must pin every package requirements.txt names, to a version it allows.
+
+    Regression: requirements.txt pinned 3 of its 38 lines, so each build could change most of the stack.
+    """
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+    from packaging.version import Version
+
+    pins = {}
+    for entry in _entries("constraints.txt"):
+        name, sep, version = entry.partition("==")
+        assert sep and version and not set(version) & set("<>=!~,;"), f"not an exact pin: {entry}"
+        pins[canonicalize_name(name)] = Version(version)
+    for entry in _entries("requirements.txt"):
+        req = Requirement(entry)
+        pin = pins.get(canonicalize_name(req.name))
+        assert pin is not None, f"{req.name} has no pin in constraints.txt"
+        allowed = req.specifier.contains(pin, prereleases=True)
+        assert allowed, f"{req.name}=={pin} is outside {req.specifier}"
