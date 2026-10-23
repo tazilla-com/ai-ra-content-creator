@@ -442,7 +442,7 @@ class WizardSettings(BaseModel):
                 "completion": 0.0006,  # $0.60 per 1M tokens (output)
             },
         },
-        description="OpenAI pricing per 1M tokens (January 2025). Can be overridden via ENV JSON."
+        description="OpenAI pricing per 1K tokens (January 2025). Can be overridden via ENV JSON."
     )
 
     openai_per_request_limits: dict[str, int] = Field(

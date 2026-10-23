@@ -332,3 +332,21 @@ def test_constraints_pin_every_requirement():
         assert pin is not None, f"{req.name} has no pin in constraints.txt"
         allowed = req.specifier.contains(pin, prereleases=True)
         assert allowed, f"{req.name}=={pin} is outside {req.specifier}"
+
+
+# --- cost (regression: every cost_usd was 1000x too low) ------------------------------------------
+
+def test_openai_cost_uses_prices_per_1k_tokens():
+    """openai_pricing holds USD per 1K tokens, as env.example and every price table give it.
+
+    Regression: the calculator divided by 1M, so every cost_usd was 1000x too low. Needs workshops_ai
+    importable, like the redaction tests.
+    """
+    try:
+        from workshops_ai.wizard.cost_calculator import calculate_openai_cost
+    except Exception:  # pragma: no cover - application not importable here
+        return
+
+    pricing = {"gpt-5.4-mini": {"prompt": 0.00075, "completion": 0.0045}}  # $0.75 / $4.50 per 1M
+    cost = calculate_openai_cost(1_000_000, 1_000_000, "gpt-5.4-mini", pricing)
+    assert abs(cost - 5.25) < 1e-9, cost

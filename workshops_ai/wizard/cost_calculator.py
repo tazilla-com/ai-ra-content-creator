@@ -48,9 +48,9 @@ def calculate_openai_cost(
     # Get pricing for model (default to gpt-4o-mini if unknown)
     model_pricing = pricing.get(model, pricing.get("gpt-4o-mini", {"prompt": 0.00015, "completion": 0.0006}))
 
-    # Calculate cost (pricing is per 1M tokens)
-    prompt_cost = (prompt_tokens / 1_000_000) * model_pricing["prompt"]
-    completion_cost = (completion_tokens / 1_000_000) * model_pricing["completion"]
+    # Calculate cost (pricing is per 1K tokens)
+    prompt_cost = (prompt_tokens / 1_000) * model_pricing["prompt"]
+    completion_cost = (completion_tokens / 1_000) * model_pricing["completion"]
 
     return prompt_cost + completion_cost
 
