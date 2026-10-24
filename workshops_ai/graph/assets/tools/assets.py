@@ -68,20 +68,10 @@ def list_services(
     state: Annotated[dict, InjectedState]
 ) -> Command:
     """
-    List business services from the wizard.
+    List the organization's business services from the wizard's first step: name, description and sector.
 
-    CRITICAL: ALWAYS use this tool when user asks about their services!
-
-    USE THIS TOOL WHEN:
-    - User asks: "aké mám služby?", "what are my services?", "show my services"
-    - User asks: "koľko služieb mám?", "how many services?"
-    - You need to understand the business context before creating assets
-
-    NEVER guess or make up services! Always call this tool to get facts.
-
-    Returns:
-    - List of all business services with name, description, and sector
-    - Empty list if no services have been generated yet
+    Use them as context when proposing or creating assets. An empty list means the wizard has identified no
+    services yet; that is no reason to stop.
     """
     services = state.get("services", [])
 
@@ -121,23 +111,16 @@ def list_assets(
     state: Annotated[dict, InjectedState]
 ) -> Command:
     """
-    List all current assets in the system.
+    List the assets that exist now: name, description, type, CIA values, primary or supporting, and whether the
+    user has selected them.
 
-    CRITICAL: ALWAYS use this tool when user asks about their assets!
-
-    USE THIS TOOL WHEN:
-    - User asks: "aké mám assety?", "what assets do I have?", "show my assets"
-    - User asks: "koľko assetov mám?", "how many assets?"
-    - User wants to see current state before updating
-    - You need to verify asset names before calling update_assets
-
-    NEVER guess or make up asset names! Always call this tool to get facts.
-
-    Returns:
-    - List of all assets with their properties (name, description, CIA levels, etc)
-    - Empty list if no assets exist yet
+    Call it when the user asks about their assets, and before changing or deleting assets, to copy their names
+    exactly. Never guess an asset's name.
     """
     input_assets = state.get("input_assets", [])
+    selected = state.get("selected_assets", [])
+    selected_ids = {a.get("id") for a in selected if a.get("id")}
+    selected_names = {a.get("name") for a in selected if a.get("name")}
 
     if not input_assets:
         content = "No assets found in the system. You can create new assets if needed."
@@ -159,6 +142,7 @@ def list_assets(
         avail = asset.get("availability", "Not set")
         asset_type = asset.get("assetType", "Not set")
         is_primary = asset.get("isPrimary", False)
+        is_selected = asset.get("id") in selected_ids or name in selected_names
 
         assets_summary.append(
             f"{i}. **{name}**\n"
@@ -167,7 +151,8 @@ def list_assets(
             f"   - Confidentiality: {conf}\n"
             f"   - Integrity: {integ}\n"
             f"   - Availability: {avail}\n"
-            f"   - Primary: {is_primary}"
+            f"   - Primary: {is_primary}\n"
+            f"   - Selected by the user: {'yes' if is_selected else 'no'}"
         )
 
     content = f"Found {len(input_assets)} asset(s):\n\n" + "\n\n".join(assets_summary)
@@ -187,51 +172,19 @@ def create_assets(
     state: Annotated[dict, InjectedState]
 ) -> Command:
     """
-    Create one or more assets with FULL CIA classification.
+    Create assets from one description of all of them: primary and supporting assets in one call.
 
-    WHEN TO USE THIS TOOL:
-    - User confirms your proposed assets → create them as proposed
-    - User modifies your proposals BEFORE creation → create with modifications
-    - DO NOT use update_assets on proposals that don't exist yet!
+    Describe each asset as a numbered item: its name, what it holds or does, whether it is supporting, and for a
+    primary asset its confidentiality, integrity and availability when they are known. Write the description in
+    the user's language: the assets get their names and descriptions in it. The asset types are chosen from
+    Tazilla's catalogue.
 
-    Example: You propose A, B, C. User says "create A and B, change B integrity to HIGH, skip C"
-    → Call create_assets ONCE with A (as proposed) and B (with HIGH integrity)
-    → Do NOT call update_assets (B doesn't exist yet to update!)
+    Primary assets are information together with the business activity that uses it; they have CIA values.
+    Supporting assets are what primary assets run on or depend on, such as systems, applications, servers,
+    networks, devices, premises or staff; they have no CIA values.
 
-    CRITICAL REQUIREMENTS:
-    - PRIMARY assets (databases, applications, data) MUST have CIA levels
-    - Supporting assets (servers, network, locations, staff) must NOT have CIA (leave as None)
-    - Asset type MUST be from valid_asset_types in your state
-
-    BEFORE CALLING THIS TOOL, ensure you have context for CIA classification:
-    - Check organization info in state (industry, size helps determine CIA)
-    - If industry-specific: call lookup_knowledge first for best practices
-    - If company-specific: call scrape_company_info first
-    - If still unclear: ASK the user before creating!
-
-    QUESTIONS TO ASK USER IF CONTEXT IS MISSING:
-    - "Aké dáta bude tento systém obsahovať?" (What data will it store?)
-    - "Je tento systém kritický pre dennú prevádzku?" (Is it critical for operations?)
-    - "Kto bude mať prístup k týmto dátam?" (Who will access this data?)
-    - "Čo sa stane ak systém nebude dostupný hodinu/deň?" (Impact of downtime?)
-
-    BATCH CAPABILITY:
-    - Describe ALL assets (primary + supporting) in ONE call
-    - NEVER call this tool twice — once for primary and once for supporting
-    - Example: "1. Patient DB with PROTECTED/HIGH/HIGH. 2. Servers as supporting infrastructure."
-
-    HOW TO WRITE GOOD DESCRIPTIONS:
-    - Correct: "Database storing customer personal data and payment info" → Clear CIA context
-    - Correct: "Internal wiki for company policies, non-sensitive" → Clear LOW sensitivity
-    - Wrong: "Database" → Too vague, unclear CIA
-    - Wrong: "Server" → No context for classification
-
-    CIA QUICK REFERENCE:
-    - Confidentiality: PUBLIC < INTERNAL < PROTECTED < STRICTLY_PROTECTED
-    - Integrity: LOW < MEDIUM < HIGH (impact of data corruption)
-    - Availability: LOW < MEDIUM < HIGH (acceptable downtime)
-
-    Returns Command that updates state with generated assets.
+    Example: "1. Customer orders and invoicing, PROTECTED confidentiality, HIGH integrity, HIGH availability.
+    2. Order management system, supporting. 3. Office network, supporting."
     """
     from workshops_ai.graph.assets.tools.generator import generate_assets_with_structured_output
 
@@ -241,31 +194,45 @@ def create_assets(
     services = state.get("services", [])
 
     if not valid_types:
+        # LangGraph refuses a tool result without a ToolMessage for the call (ValueError)
+        error_msg = "No valid asset types available. Cannot create assets."
         return Command(
             update={
-                "error": "No valid asset types available. Cannot create assets."
+                "messages": [ToolMessage(content=error_msg, tool_call_id=tool_call_id)]
             }
         )
 
-    result = generate_assets_with_structured_output(
+    result, rejected = generate_assets_with_structured_output(
         description=description,
         organization=organization,
         existing_assets=existing_assets,
         valid_types=valid_types,
         services=services,
+        model=state.get("model"),
     )
 
     assets_dicts = [asset.model_dump() for asset in result.assets]
 
-    # Return Command with ToolMessage (required for LangGraph)
-    asset_names = [a["name"] for a in assets_dicts]
+    # Return Command with ToolMessage (required for LangGraph). The agent reports what was created, so it
+    # gets each asset's type and classification, not only its name
+    lines = []
+    for a in assets_dicts:
+        if a.get("isPrimary"):
+            lines.append(f"- {a['name']} ({a['assetType']}; primary; confidentiality {a['confidentiality']}, "
+                         f"integrity {a['integrity']}, availability {a['availability']})")
+        else:
+            lines.append(f"- {a['name']} ({a['assetType']}; supporting)")
+    content = f"Created {len(assets_dicts)} assets:\n" + "\n".join(lines)
+    if rejected:
+        content += "\nNot created, because their type is not in the catalogue: " + "; ".join(
+            f"{a.name} (type {a.assetType!r})" for a in rejected)
     return Command(
         update={
             "generated_assets": assets_dicts,
             "tools_used": ["create_assets"],
             "messages": [
                 ToolMessage(
-                    content=f"Created {len(assets_dicts)} assets: {', '.join(asset_names)}",
+                    content=content,
                     tool_call_id=tool_call_id
                 )
             ]
@@ -288,50 +255,14 @@ def update_assets(
     state: Annotated[dict, InjectedState]
 ) -> Command:
     """
-    Update one or more existing assets.
+    Change existing assets. Pass only the fields that change; the others stay as they are.
 
-    IMPORTANT: You have full access to input_assets in your state - check there for current values!
+    asset_names: the names exactly as list_assets returns them; the same change applies to each of them.
+    Fields: name, description, assetType (a type from Tazilla's catalogue), confidentiality (PUBLIC, INTERNAL,
+    PROTECTED or STRICTLY_PROTECTED), integrity and availability (LOW, MEDIUM or HIGH), isPrimary. Supporting
+    assets have no CIA values.
 
-    USE THIS TOOL WHEN:
-    - User wants to change CIA levels: "nastav [Asset Name] na HIGH availability"
-    - User wants to rename asset: "premenuj [Asset Name] na [New Name]"
-    - User wants to change description or type
-    - User wants to batch update: "všetky vybrané assety na PROTECTED"
-
-    PARTIAL UPDATES - CRITICAL:
-    - Only provide parameters you want to CHANGE
-    - Other fields remain unchanged automatically
-    - Example: update_assets(["Asset Name"], integrity="HIGH")
-      → Only integrity changes, confidentiality and availability stay the same
-    - DO NOT ask user for unchanged values - just update what they requested!
-
-    VALID UPDATE PARAMETERS:
-    - name: Asset name (string)
-    - description: Asset description (string)
-    - assetType: Must be from valid_asset_types in state
-    - confidentiality: PUBLIC | INTERNAL | PROTECTED | STRICTLY_PROTECTED
-    - integrity: LOW | MEDIUM | HIGH
-    - availability: LOW | MEDIUM | HIGH
-    - isPrimary: true | false
-
-    CANNOT UPDATE:
-    - id: Asset ID is immutable
-
-    BATCH UPDATES:
-    - Pass multiple asset names in asset_names list
-    - Same updates applied to ALL specified assets
-    - Example: update_assets(["Asset Name 1", "Asset Name 2"], availability="HIGH")
-
-    ASSET NAME MATCHING:
-    - Asset names must match EXACTLY (case-sensitive)
-    - Check input_assets in state for correct names
-    - If asset not found, error is returned
-
-    PARTIAL SUCCESS:
-    - If some assets found and some not, updates found ones
-    - Reports which assets were not found
-
-    Returns Command that updates state with modified assets.
+    A proposal that was never created is not an asset: create it with create_assets instead.
     """
     # Build updates dict from non-None parameters
     updates = {}
@@ -354,7 +285,6 @@ def update_assets(
         error_msg = "No fields to update. Provide at least one field: name, description, confidentiality, integrity, availability, assetType, isPrimary"
         return Command(
             update={
-                "error": error_msg,
                 "messages": [ToolMessage(content=error_msg, tool_call_id=tool_call_id)]
             }
         )
@@ -367,7 +297,6 @@ def update_assets(
         error_msg = f"Invalid update fields: {invalid_fields}. Valid: {VALID_UPDATE_FIELDS}"
         return Command(
             update={
-                "error": error_msg,
                 "messages": [ToolMessage(content=error_msg, tool_call_id=tool_call_id)]
             }
         )
@@ -376,7 +305,6 @@ def update_assets(
         error_msg = f"Invalid assetType: {updates['assetType']}. Must be one of: {valid_types}"
         return Command(
             update={
-                "error": error_msg,
                 "messages": [ToolMessage(content=error_msg, tool_call_id=tool_call_id)]
             }
         )
@@ -391,7 +319,6 @@ def update_assets(
             error_msg = f"Invalid {field}: {updates[field]}. Must be one of: {valid_values} or None (for supporting assets)"
             return Command(
                 update={
-                    "error": error_msg,
                     "messages": [ToolMessage(content=error_msg, tool_call_id=tool_call_id)]
                 }
             )
@@ -413,7 +340,6 @@ def update_assets(
         error_msg = f"No assets found with names: {not_found}. Check input_assets for correct names."
         return Command(
             update={
-                "error": error_msg,
                 "messages": [ToolMessage(content=error_msg, tool_call_id=tool_call_id)]
             }
         )
@@ -445,24 +371,10 @@ def delete_assets(
     state: Annotated[dict, InjectedState]
 ) -> Command:
     """
-    Delete one or more existing assets by name.
+    Delete existing assets, all in one call.
 
-    USE THIS TOOL WHEN:
-    - User wants to remove assets: "remove Asset X", "delete all medium assets"
-    - User wants to clear assets: "remove all assets", "start over"
-    - User says: "odstrán", "vymaž", "zmaž", "remove", "delete"
-
-    IMPORTANT:
-    - Asset names must match EXACTLY (case-sensitive)
-    - Always call list_assets first to verify exact names before deleting
-    - If some assets are not found, found ones are still deleted
-    - Deletion is immediate - assets are removed from the system
-
-    BATCH DELETION:
-    - Pass multiple asset names in asset_names list
-    - Example: delete_assets(["Asset 1", "Asset 2", "Asset 3"])
-
-    Returns Command that marks assets for deletion in state.
+    asset_names: the names exactly as list_assets returns them. Names not found are reported; the others are
+    deleted.
     """
     input_assets = state.get("input_assets", [])
 

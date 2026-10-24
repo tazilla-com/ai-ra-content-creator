@@ -259,47 +259,39 @@ def get_agent_system_prompt() -> dict:
     return prompt_data
 
 
-def build_system_prompt(state: AgentState | None = None) -> str:
-    """Build system prompt with optional dynamic context."""
-    prompt_parts = [get_agent_system_prompt()["prompt_text"]]
+def build_system_prompt(state: AgentState | None = None, base_prompt: str | None = None) -> str:
+    """
+    The system prompt with what the session knows and no tool shows: the asset types of the catalog, the
+    business services, the organization and the assets the user has selected.
 
-    if state:
-        org = state.get("organization")
-        if org:
-            context_hints = []
+    Args:
+        state: The agent's state; without it, the prompt alone
+        base_prompt: The hosted prompt's text; fetched when None
+    """
+    prompt = base_prompt if base_prompt is not None else get_agent_system_prompt()["prompt_text"]
+    if not state:
+        return prompt
 
-            if org.get("industry"):
-                context_hints.append(
-                    f"**Current Organization Industry**: {org['industry']} "
-                    "(consider industry-specific compliance when classifying assets)"
-                )
+    # "; " between names: an asset type's name may contain a comma ("Equipment, machines")
+    lines = []
+    asset_types = state.get("valid_asset_types") or []
+    if asset_types:
+        lines.append("Asset types in Tazilla's catalogue: " + "; ".join(asset_types))
+    services = [s.get("name") for s in state.get("services") or [] if s.get("name")]
+    if services:
+        lines.append("The organization's business services: " + "; ".join(services))
+    org = state.get("organization") or {}
+    org_parts = [
+        f"{label} {org[key]}"
+        for key, label in (("organizationName", "name"), ("country", "country"), ("numberOfEmployees", "employees"))
+        if org.get(key)
+    ]
+    if org_parts:
+        lines.append("Organization: " + ", ".join(org_parts))
+    selected = [a.get("name") for a in state.get("selected_assets") or [] if a.get("name")]
+    if selected:
+        lines.append("Assets the user has selected: " + "; ".join(selected))
 
-            if org.get("language"):
-                lang_map = {"cs": "Czech", "sk": "Slovak", "en": "English"}
-                lang_name = lang_map.get(org["language"], org["language"])
-                context_hints.append(
-                    f"**User's Language**: {lang_name} "
-                    f"(respond in {lang_name}, but keep CIA values in English as specified)"
-                )
-
-            if context_hints:
-                prompt_parts.append("\n---\n# SESSION CONTEXT\n")
-                prompt_parts.extend([f"- {hint}\n" for hint in context_hints])
-
-        services = state.get("services", [])
-        if services:
-            service_names = [s.get("name", "") for s in services if s.get("name")]
-            if service_names:
-                prompt_parts.append(
-                    f"\n**Business Services**: {', '.join(service_names)} "
-                    "— use these as context when proposing and classifying assets.\n"
-                )
-
-        selected = state.get("selected_assets", [])
-        if selected:
-            prompt_parts.append(
-                f"\n**User has {len(selected)} asset(s) selected** - "
-                "they likely want to update these.\n"
-            )
-
-    return "".join(prompt_parts)
+    if not lines:
+        return prompt
+    return prompt.rstrip() + "\n\n# Session context\n\n" + "\n".join(f"- {line}" for line in lines) + "\n"
