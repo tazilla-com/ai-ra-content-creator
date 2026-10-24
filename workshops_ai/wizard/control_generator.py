@@ -333,6 +333,7 @@ class ControlGenerator:
         allowed_control_names: List[str],
         asset_risk_threats: List[str],
         relevant_controls: List[Dict[str, Any]],
+        catalog_controls: Optional[List[PlannedControl]] = None,
     ) -> List[PlannedControl]:
         """
         Parse JSON response and validate control recommendations.
@@ -343,6 +344,7 @@ class ControlGenerator:
             allowed_control_names: List of allowed control names from pre-filtered list
             asset_risk_threats: List of threat names from asset risks
             relevant_controls: Pre-filtered controls with risk_coverage mapping
+            catalog_controls: The control catalog; id and costs come from its entry, as in the batch path
 
         Returns:
             List of validated PlannedControl objects with auto-populated threats
@@ -372,6 +374,7 @@ class ControlGenerator:
 
             # Build lookup dict from relevant_controls for fast access
             controls_lookup = {ctrl["name"]: ctrl for ctrl in relevant_controls}
+            catalog_lookup = {ctrl.name: ctrl for ctrl in catalog_controls or []}
 
             # Validate each control
             validated: List[PlannedControl] = []
@@ -446,14 +449,18 @@ class ControlGenerator:
                             )
                             continue
 
-                    # Create PlannedControl (threats can be empty, it's now optional)
+                    # Create PlannedControl (threats can be empty, it's now optional). A null id means a new
+                    # catalog entry to the API (api/schema/control.py), so the catalog's id is kept
+                    catalog_entry = catalog_lookup.get(name)
                     validated.append(PlannedControl(
-                        id=None,
+                        id=catalog_entry.id if catalog_entry else None,
                         name=name,
                         description=description,
                         category=category,
-                        implementationCost=impl_cost,
-                        estimatedAnnualCost=annual_cost,
+                        implementationCost=impl_cost if impl_cost is not None else (
+                            catalog_entry.implementationCost if catalog_entry else None),
+                        estimatedAnnualCost=annual_cost if annual_cost is not None else (
+                            catalog_entry.estimatedAnnualCost if catalog_entry else None),
                         threats=threats if threats else None
                     ))
 
@@ -1680,6 +1687,7 @@ class ControlGenerator:
                                                 allowed_control_names=allowed_control_names,
                                                 asset_risk_threats=asset_threat_names,
                                                 relevant_controls=relevant_controls,
+                                                catalog_controls=control_catalog,
                                             )
 
                                             # Apply max limit if specified
@@ -1854,12 +1862,19 @@ class ControlGenerator:
                                                     ensure_ascii=False
                                                 )
                                                 relevant_controls_json = json.dumps(relevant_controls, ensure_ascii=False)
+                                                # The hosted prompt may use the mapping, as in copy 1: without it,
+                                                # format_messages raises KeyError and every asset gets no controls
+                                                controls_per_asset_json = json.dumps(
+                                                    [{"assetName": asset.name, "controls": [c["name"] for c in relevant_controls]}],
+                                                    ensure_ascii=False
+                                                )
 
                                                 # Format prompt for debug preview
                                                 messages = prompt.format_messages(
                                                     assets_json=asset_json,
                                                     asset_risks_json=asset_risks_json,
                                                     relevant_controls_json=relevant_controls_json,
+                                                    controls_per_asset_json=controls_per_asset_json,
                                                     controls_constraint=controls_constraint,
                                                     controls_json_schema=CONTROLS_JSON_SCHEMA,
                                                     language=language,
@@ -1874,6 +1889,7 @@ class ControlGenerator:
                                                     assets_json=asset_json,
                                                     asset_risks_json=asset_risks_json,
                                                     relevant_controls_json=relevant_controls_json,
+                                                    controls_per_asset_json=controls_per_asset_json,
                                                     controls_constraint=controls_constraint,
                                                     controls_json_schema=CONTROLS_JSON_SCHEMA,
                                                     language=language,
@@ -1894,6 +1910,7 @@ class ControlGenerator:
                                                     allowed_control_names=allowed_control_names,
                                                     asset_risk_threats=asset_threat_names,
                                                     relevant_controls=relevant_controls,
+                                                    catalog_controls=control_catalog,
                                                 )
 
                                                 # Apply max limit if specified
@@ -2159,12 +2176,17 @@ class ControlGenerator:
                                 ensure_ascii=False
                             )
                             relevant_controls_json = json.dumps(relevant_controls, ensure_ascii=False)
+                            controls_per_asset_json = json.dumps(
+                                [{"assetName": asset.name, "controls": [c["name"] for c in relevant_controls]}],
+                                ensure_ascii=False
+                            )
 
                             # Format prompt for debug preview
                             messages = prompt.format_messages(
                                 assets_json=asset_json,
                                 asset_risks_json=asset_risks_json,
                                 relevant_controls_json=relevant_controls_json,
+                                controls_per_asset_json=controls_per_asset_json,
                                 controls_constraint=controls_constraint,
                                 controls_json_schema=CONTROLS_JSON_SCHEMA,
                                 language=language,
@@ -2179,6 +2201,7 @@ class ControlGenerator:
                                 assets_json=asset_json,
                                 asset_risks_json=asset_risks_json,
                                 relevant_controls_json=relevant_controls_json,
+                                controls_per_asset_json=controls_per_asset_json,
                                 controls_constraint=controls_constraint,
                                 controls_json_schema=CONTROLS_JSON_SCHEMA,
                                 language=language,
@@ -2199,6 +2222,7 @@ class ControlGenerator:
                                 allowed_control_names=allowed_control_names,
                                 asset_risk_threats=asset_threat_names,
                                 relevant_controls=relevant_controls,
+                                catalog_controls=control_catalog,
                             )
 
                             # Apply max limit if specified
@@ -2322,12 +2346,17 @@ class ControlGenerator:
                                     ensure_ascii=False
                                 )
                                 relevant_controls_json = json.dumps(relevant_controls, ensure_ascii=False)
+                                controls_per_asset_json = json.dumps(
+                                    [{"assetName": asset.name, "controls": [c["name"] for c in relevant_controls]}],
+                                    ensure_ascii=False
+                                )
 
                                 # Format prompt for debug preview
                                 messages = prompt.format_messages(
                                     assets_json=asset_json,
                                     asset_risks_json=asset_risks_json,
                                     relevant_controls_json=relevant_controls_json,
+                                    controls_per_asset_json=controls_per_asset_json,
                                     controls_constraint=controls_constraint,
                                     controls_json_schema=CONTROLS_JSON_SCHEMA,
                                     language=language,
@@ -2342,6 +2371,7 @@ class ControlGenerator:
                                     assets_json=asset_json,
                                     asset_risks_json=asset_risks_json,
                                     relevant_controls_json=relevant_controls_json,
+                                    controls_per_asset_json=controls_per_asset_json,
                                     controls_constraint=controls_constraint,
                                     controls_json_schema=CONTROLS_JSON_SCHEMA,
                                     language=language,
@@ -2362,6 +2392,7 @@ class ControlGenerator:
                                     allowed_control_names=allowed_control_names,
                                     asset_risk_threats=asset_threat_names,
                                     relevant_controls=relevant_controls,
+                                    catalog_controls=control_catalog,
                                 )
 
                                 # Apply max limit if specified

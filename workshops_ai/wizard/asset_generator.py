@@ -518,6 +518,30 @@ class AssetGenerator:
                 details={"response_preview": response_text[:200]}
             ) from e
 
+    @staticmethod
+    def _limit_new_assets(
+        assets: List[Asset],
+        previous_assets: Optional[List[Asset]],
+        max_assets: int,
+    ) -> List[Asset]:
+        """Cut the newly generated assets to max_assets; previous assets are never cut.
+
+        The prompt's count limits only new assets, while a cut over the whole list dropped the user's own
+        assets first once there were more of them than max_assets. A previous asset is known by its id,
+        or by its name when it has none yet.
+        """
+        previous_ids = {a.id for a in previous_assets or [] if a.id}
+        previous_names = {a.name for a in previous_assets or []}
+        kept: List[Asset] = []
+        new_count = 0
+        for asset in assets:
+            if (asset.id and asset.id in previous_ids) or asset.name in previous_names:
+                kept.append(asset)
+            elif new_count < max_assets:
+                kept.append(asset)
+                new_count += 1
+        return kept
+
     async def generate_assets(
         self,
         website_content: str,
@@ -751,7 +775,7 @@ class AssetGenerator:
 
                                 # Apply max limit if specified
                                 if max_assets is not None:
-                                    assets = assets[:max_assets]
+                                    assets = self._limit_new_assets(assets, previous_assets, max_assets)
 
                                 parse_span.update(
                                     output={
@@ -854,7 +878,7 @@ class AssetGenerator:
 
                 # Apply max limit if specified
                 if max_assets is not None:
-                    assets = assets[:max_assets]
+                    assets = self._limit_new_assets(assets, previous_assets, max_assets)
 
                 # Build debug info
                 debug_info = {

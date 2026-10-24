@@ -1477,11 +1477,12 @@ class RiskGenerator:
                                         ) as asset_span:
                                             try:
                                                 # Select relevant threats for this asset
+                                                # The limit applies to the evaluations below, as in the other
+                                                # fallback; the selector takes none and raised TypeError here
                                                 relevant_threats = self._select_relevant_threats(
                                                     asset=asset,
                                                     all_threat_names=all_threat_names,
                                                     threat_mapping=threat_mapping,
-                                                    max_threats=max_threats_per_asset,
                                                 )
 
                                                 # Single-asset JSON
