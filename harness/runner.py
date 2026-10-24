@@ -62,8 +62,13 @@ def _write(out_dir: Path, records: dict) -> None:
 
 
 def _base_records(settings, preflight, reps: int) -> dict:
+    from harness.prompt_override import served
+
+    meta = {"generated_at": _now(), "reps": reps}
+    if served():
+        meta["prompts_from_files"] = served()
     return {
-        "meta": {"generated_at": _now(), "reps": reps},
+        "meta": meta,
         "config": config_summary(settings),
         "preflight": preflight,
     }
@@ -237,6 +242,8 @@ def _add_common(sp) -> None:
     sp.add_argument("--max-services", type=int, default=3, dest="max_services")
     sp.add_argument("--max-assets", type=int, default=5, dest="max_assets")
     sp.add_argument("--max-controls", type=int, default=5, dest="max_controls")
+    sp.add_argument("--prompts-dir", default=None, dest="prompts_dir",
+                    help="serve prompts from DIR/<name>.json instead of Langfuse (harness/prompt_override.py)")
 
 
 def main() -> int:
@@ -276,6 +283,11 @@ def main() -> int:
     rp.set_defaults(func=cmd_report, is_async=False)
 
     args = p.parse_args()
+    if getattr(args, "prompts_dir", None):
+        from harness.prompt_override import install
+
+        for name, digest in install(args.prompts_dir).items():
+            print(f"prompt from file: {name} sha256:{digest}")
     if getattr(args, "is_async", False):
         return asyncio.run(args.func(args))
     return args.func(args)

@@ -28,6 +28,11 @@ def _config_block(config: dict, preflight: dict, meta: dict) -> list[str]:
         f"- **Catalog:** mode `{config.get('catalog_mode')}`"
         + (f" @ `{config.get('catalog_endpoint')}`" if config.get("catalog_endpoint") else "")
         + f"  ·  preflight ok: `{preflight.get('ok')}`",
+        *(
+            [f"- **Prompts from files:** "
+             + ", ".join(f"`{n}` sha256:{d}" for n, d in meta["prompts_from_files"].items())]
+            if meta.get("prompts_from_files") else []
+        ),
         "",
         "_No credentials are included in this report._",
         "",

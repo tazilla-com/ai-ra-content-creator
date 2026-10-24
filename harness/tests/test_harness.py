@@ -446,3 +446,59 @@ def test_reasoning_effort_per_model():
     finally:
         wizard_client.get_settings, wizard_client.ThrottledAzureChatOpenAI = original
     assert [b.get("reasoning_effort") for b in built] == ["high", "medium", "low"], built
+
+
+# --- prompts from files (harness/prompt_override.py) ---------------------------------------------
+
+def test_prompts_from_files():
+    """A prompt with a file under --prompts-dir is converted as a fetched one; others reach Langfuse.
+
+    Needs workshops_ai and the Langfuse SDK importable, like the redaction tests.
+    """
+    try:
+        import langfuse.model  # noqa: F401
+        from workshops_ai.llm import langfuse_helper
+        from harness import prompt_override
+    except Exception:  # pragma: no cover - application not importable here
+        return
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _check_prompts_from_files(Path(tmp), langfuse_helper, prompt_override)
+
+
+def _check_prompts_from_files(tmp_path, langfuse_helper, prompt_override):
+    (tmp_path / "wizard").mkdir()
+    (tmp_path / "wizard" / "x.json").write_text(json.dumps({"type": "chat", "prompt": [
+        {"role": "system", "content": 'Rules. Output like {"name": "..."}.'},
+        {"role": "user", "content": "Company: {{organization}}"},
+    ]}), encoding="utf-8")
+    (tmp_path / "helper").mkdir()
+    (tmp_path / "helper" / "t.json").write_text(json.dumps({"type": "text", "prompt": "Search {{q}}"}),
+                                                encoding="utf-8")
+
+    asked = []
+
+    class Inner:
+        def get_prompt(self, name, **kwargs):
+            asked.append(name)
+            raise RuntimeError("not in Langfuse")
+
+        def flush(self):
+            return "flushed"
+
+    saved = langfuse_helper._langfuse_client, dict(prompt_override._served)
+    langfuse_helper._langfuse_client = Inner()
+    try:
+        assert sorted(prompt_override.install(tmp_path)) == ["helper/t", "wizard/x"]
+        chat = langfuse_helper.get_langchain_prompt_from_langfuse("wizard/x", label="development")
+        assert chat.input_variables == ["organization"], chat.input_variables
+        assert "Company: ACME" in chat.format(organization="ACME")
+        text = langfuse_helper.get_text_prompt_from_langfuse("helper/t", label="development")
+        assert text["prompt_source"] == "langfuse" and text["prompt_text"] == "Search {q}", text
+        assert langfuse_helper.get_langchain_prompt_from_langfuse("wizard/other") is None
+        assert asked == ["wizard/other"] and langfuse_helper.get_langfuse_client().flush() == "flushed"
+    finally:
+        langfuse_helper._langfuse_client = saved[0]
+        prompt_override._served.clear()
+        prompt_override._served.update(saved[1])

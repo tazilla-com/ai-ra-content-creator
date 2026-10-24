@@ -45,6 +45,7 @@ harness/
 ├── steps.py                     # drive services→assets→impacts→risks→controls + the agent
 ├── verify.py                    # correctness verifiers per step (schema, CIA, catalog membership, HITL)
 ├── faults.py                    # config-induced REAL faults (timeout; tiny token cap → batch-split)
+├── prompt_override.py           # --prompts-dir: prompts from files, to compare prompt versions
 ├── report.py                    # records → redaction-safe Appendix-D markdown
 ├── release_evidence.py          # non-destructive deployment record (host/CI)
 ├── runner.py                    # CLI entry point
@@ -179,6 +180,7 @@ Per-run CLI flags (see `--help` on any subcommand):
 | `--reps` | 1 | chain, evidence |
 | `--message` | a create request | agent |
 | `--no-expect-proposal` | a proposal is required | agent: for a message that asks no change |
+| `--prompts-dir` | — (prompts from Langfuse) | all live runs: serve each prompt with a file `DIR/<name>.json` from that file (`prompt_override.py`) |
 | `--kind` | — (`timeout` \| `token_limit`) | fault |
 | `--records` | — | report |
 
