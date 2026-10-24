@@ -24,6 +24,22 @@ from workshops_ai.llm.langfuse_helper import get_langfuse_callback_handler
 logger = logging.getLogger(__name__)
 
 
+def _agent_llm(settings, model_override: str | None = None):
+    """The agent's chat model, able to call function tools.
+
+    GPT-6 on chat completions refuses function tools with reasoning: HTTP 400, "Function tools with
+    reasoning_effort are not supported for this model in /v1/chat/completions. To use function tools, use
+    /v1/responses or set reasoning_effort to 'none'." Measured on gpt-6-sol and gpt-6-luna, 2026-10-24.
+    """
+    llm = make_llm_client_from_settings(
+        settings,
+        override_model=model_override
+    )
+    if (model_override or settings.llm.model).startswith("gpt-6"):
+        llm.reasoning_effort = "none"
+    return llm
+
+
 def create_asset_agent(
     checkpointer=None,
     model_override: str | None = None
@@ -40,10 +56,7 @@ def create_asset_agent(
     """
     settings = get_settings()
 
-    llm = make_llm_client_from_settings(
-        settings,
-        override_model=model_override
-    )
+    llm = _agent_llm(settings, model_override)
 
     # lookup_knowledge is left out: its search_rag is a stub that always finds nothing
     tools = [

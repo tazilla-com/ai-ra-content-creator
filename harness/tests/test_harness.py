@@ -665,3 +665,22 @@ def test_agent_asset_types_matched_to_the_catalog():
     assert [(a.name, a.assetType) for a in result.assets] == [("Servers", "Server infrastructure")]
     assert [a.name for a in rejected] == ["Customer DB"]
     assert "- Equipment, machines" in seen["prompt"] and "Name: Northwind" in seen["prompt"]
+
+
+def test_agent_llm_calls_tools_on_gpt6():
+    """The agent's client sends reasoning_effort none to GPT-6, which refuses function tools with reasoning on
+    chat completions (HTTP 400); other models keep their default. Needs workshops_ai importable, like the redaction
+    tests.
+    """
+    try:
+        from workshops_ai.graph.assets.agent import _agent_llm
+        from workshops_ai.settings import get_settings
+    except Exception:  # pragma: no cover - application not importable here
+        return
+
+    settings = get_settings()
+    if not settings.llm.api_key:  # pragma: no cover - no provider configured
+        return
+    assert _agent_llm(settings, "gpt-6-sol").reasoning_effort == "none"
+    assert _agent_llm(settings, "gpt-6-luna").reasoning_effort == "none"
+    assert _agent_llm(settings, "gpt-5.4-mini").reasoning_effort is None
