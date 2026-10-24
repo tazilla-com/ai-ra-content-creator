@@ -350,3 +350,81 @@ def test_openai_cost_uses_prices_per_1k_tokens():
     pricing = {"gpt-5.4-mini": {"prompt": 0.00075, "completion": 0.0045}}  # $0.75 / $4.50 per 1M
     cost = calculate_openai_cost(1_000_000, 1_000_000, "gpt-5.4-mini", pricing)
     assert abs(cost - 5.25) < 1e-9, cost
+
+
+# --- reasoning models (regression: GPT-6 got temperature and no reasoning_effort) -------------------
+
+def test_gpt6_models_are_reasoning_models():
+    """A gpt-6* model gets reasoning_effort and no temperature, as gpt-5* does.
+
+    Regression: the reasoning prefixes named gpt-5, o1, o3 and o4 only. Needs workshops_ai importable,
+    like the redaction tests.
+    """
+    try:
+        from workshops_ai.llm import client as llm_client, wizard_client
+    except Exception:  # pragma: no cover - application not importable here
+        return
+
+    assert llm_client._is_reasoning_model("gpt-6.1-sol") and llm_client._is_reasoning_model("gpt-6-luna")
+    assert not llm_client._is_reasoning_model("gpt-4.1")
+
+    built = []
+    settings = SimpleNamespace(
+        wizard=SimpleNamespace(default_model="gpt-6.1-sol", allowed_models=["gpt-6.1-sol", "gpt-4.1"],
+                               reasoning_effort="medium", reasoning_effort_by_model={}, temperature=0.2,
+                               llm_timeout_sec=60),
+        llm=SimpleNamespace(provider="azure", azure_endpoint="https://example.invalid/", api_key="test",
+                            azure_api_version="2025-03-01-preview"),
+    )
+    original = wizard_client.get_settings, wizard_client.ThrottledAzureChatOpenAI
+    wizard_client.get_settings = lambda: settings
+    wizard_client.ThrottledAzureChatOpenAI = lambda **kwargs: built.append(kwargs)
+    try:
+        wizard_client.create_wizard_llm_client(model="gpt-6.1-sol")
+        wizard_client.create_wizard_llm_client(model="gpt-4.1")
+    finally:
+        wizard_client.get_settings, wizard_client.ThrottledAzureChatOpenAI = original
+    assert built[0].get("reasoning_effort") == "medium" and "temperature" not in built[0], built[0]
+    assert built[1].get("temperature") == 0.2 and "reasoning_effort" not in built[1], built[1]
+
+
+def test_reasoning_effort_per_model():
+    """A model in WIZARD__REASONING_EFFORT_BY_MODEL gets its own effort when the request names none; other
+    models get WIZARD__REASONING_EFFORT, and the request body wins over both. Needs workshops_ai importable,
+    like the redaction tests.
+    """
+    try:
+        from workshops_ai import settings as settings_mod
+        from workshops_ai.llm import wizard_client
+    except Exception:  # pragma: no cover - application not importable here
+        return
+
+    key = "WORKSHOPS_AI_WIZARD__REASONING_EFFORT_BY_MODEL"
+    saved = os.environ.get(key)
+    os.environ[key] = '{"gpt-6-luna": "high"}'
+    try:
+        assert settings_mod.AppSettings().wizard.reasoning_effort_by_model == {"gpt-6-luna": "high"}
+    finally:
+        if saved is None:
+            del os.environ[key]
+        else:
+            os.environ[key] = saved
+
+    built = []
+    settings = SimpleNamespace(
+        wizard=SimpleNamespace(default_model="gpt-6-sol", allowed_models=["gpt-6-sol", "gpt-6-luna"],
+                               reasoning_effort="medium", reasoning_effort_by_model={"gpt-6-luna": "high"},
+                               temperature=0.2, llm_timeout_sec=60),
+        llm=SimpleNamespace(provider="azure", azure_endpoint="https://example.invalid/", api_key="test",
+                            azure_api_version="2025-03-01-preview"),
+    )
+    original = wizard_client.get_settings, wizard_client.ThrottledAzureChatOpenAI
+    wizard_client.get_settings = lambda: settings
+    wizard_client.ThrottledAzureChatOpenAI = lambda **kwargs: built.append(kwargs)
+    try:
+        wizard_client.create_wizard_llm_client(model="gpt-6-luna")
+        wizard_client.create_wizard_llm_client(model="gpt-6-sol")
+        wizard_client.create_wizard_llm_client(model="gpt-6-luna", reasoning_effort="low")
+    finally:
+        wizard_client.get_settings, wizard_client.ThrottledAzureChatOpenAI = original
+    assert [b.get("reasoning_effort") for b in built] == ["high", "medium", "low"], built

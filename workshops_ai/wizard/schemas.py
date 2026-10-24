@@ -261,8 +261,9 @@ class WizardStepInput(BaseModel):
         None,
         examples=["low"],
         description=(
-            "Reasoning effort override for reasoning models (gpt-5*, o1, o3, o4). "
-            "Cascade: body > env (WORKSHOPS_AI_WIZARD__REASONING_EFFORT) > Pydantic default. "
+            "Reasoning effort override for reasoning models (gpt-5*, gpt-6*, o1, o3, o4). "
+            "Cascade: body > env per model (WORKSHOPS_AI_WIZARD__REASONING_EFFORT_BY_MODEL) "
+            "> env (WORKSHOPS_AI_WIZARD__REASONING_EFFORT) > Pydantic default. "
             "Per-model support: 'minimal' works only for gpt-5/gpt-5-mini/gpt-5-nano; "
             "'low'/'medium'/'high' work for all reasoning models. "
             "Ignored for non-reasoning models (gpt-4*, gpt-5.1-chat in chat-only mode)."

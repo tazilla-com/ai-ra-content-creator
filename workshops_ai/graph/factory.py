@@ -159,8 +159,8 @@ def _get_llm_client_cached(
     Build a LangChain ChatOpenAI/AzureChatOpenAI client and cache it by its immutable config.
     This avoids re-instantiation per request/graph build.
     """
-    # Reasoning models (gpt-5*, o1*, o3*, o4*) don't support temperature parameter
-    is_reasoning = any(model.startswith(p) for p in ("gpt-5", "o1", "o3", "o4"))
+    # Reasoning models (gpt-5*, gpt-6*, o1*, o3*, o4*) don't support temperature parameter
+    is_reasoning = any(model.startswith(p) for p in ("gpt-5", "gpt-6", "o1", "o3", "o4"))
 
     if provider == "azure":
         if ThrottledAzureChatOpenAI is None:
