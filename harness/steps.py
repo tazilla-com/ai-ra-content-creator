@@ -218,17 +218,13 @@ async def run_agent(
     session_id = session_id or new_session_id("agent")
     model = model or settings.llm.model
 
-    valid_types = None
-    try:
-        from workshops_ai.wizard.catalog_provider import get_catalog_provider
+    # The asset types as handle_chat loads them (routers/ws_router.py, _build_agent_state). The catalog provider has
+    # no get_catalog_names, so the earlier lookup failed silently and every run so far gave the agent no types.
+    from workshops_ai.wizard.prompt_context import PromptContextBuilder
 
-        provider = get_catalog_provider()
-        try:
-            valid_types = list(provider.get_catalog_names("asset_types", session_id=session_id))
-        except TypeError:
-            valid_types = list(provider.get_catalog_names("asset_types"))
-    except Exception:
-        valid_types = None
+    builder = PromptContextBuilder(session_id=session_id)
+    asset_types = await builder._get_cached_catalog("asset_types", builder.provider.load_asset_type_catalog)
+    valid_types = [at["name"] for at in asset_types]
 
     started = time.time()
     try:
