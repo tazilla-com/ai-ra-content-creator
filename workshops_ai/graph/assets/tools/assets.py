@@ -209,6 +209,7 @@ def create_assets(
         valid_types=valid_types,
         services=services,
         model=state.get("model"),
+        user_message=state.get("user_message"),
     )
 
     assets_dicts = [asset.model_dump() for asset in result.assets]

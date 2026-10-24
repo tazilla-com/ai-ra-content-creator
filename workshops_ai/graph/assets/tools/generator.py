@@ -81,6 +81,7 @@ def generate_assets_with_structured_output(
     valid_types: list[str],
     services: list[dict] | None = None,
     model: str | None = None,
+    user_message: str | None = None,
 ) -> tuple[CreateAssetsOutput, list[GeneratedAsset]]:
     """
     Use structured output to generate validated asset output.
@@ -92,6 +93,7 @@ def generate_assets_with_structured_output(
         valid_types: Valid asset type values
         services: Business services from the wizard
         model: The model of the request; the configured default when None
+        user_message: The user's message, whose language the assets take
 
     Returns:
         CreateAssetsOutput with the assets whose type is in the catalog, and the assets left out for their type
@@ -122,6 +124,8 @@ def generate_assets_with_structured_output(
     organization_text = ("\nOrganization:\n" + "\n".join(org_lines) + "\n") if org_lines else ""
 
     existing_names = [a.get("name") for a in existing_assets if a.get("name")]
+    # The agent may write the description in another language than the user's; the user's message decides
+    language_hint = f': "{user_message[:300]}"' if user_message else " (the language of the description)"
 
     # One type per line: a type name may contain a comma ("Equipment, machines")
     prompt = f"""
@@ -143,8 +147,8 @@ Rules:
   are null.
 - Use the CIA values the description gives exactly. Infer the missing ones from what the asset holds and what
   its loss would cause.
-- Write name, description, reasoning and summary in the language of the description. Keep the CIA values and the
-  asset type names exactly as listed.
+- Write name, description, reasoning and summary in the language of the user's message{language_hint}. Keep the
+  CIA values and the asset type names exactly as listed.
 - id is null.
 """
 

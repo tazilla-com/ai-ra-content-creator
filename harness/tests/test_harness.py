@@ -658,13 +658,15 @@ def test_agent_asset_types_matched_to_the_catalog():
     try:
         result, rejected = generator.generate_assets_with_structured_output(
             description="1. Servers", organization={"organizationName": "Northwind"}, existing_assets=[],
-            valid_types=["Server infrastructure", "Equipment, machines"], model="gpt-6-sol")
+            valid_types=["Server infrastructure", "Equipment, machines"], model="gpt-6-sol",
+            user_message="Vytvor aktivum pre servery")
     finally:
         generator.make_llm_client_from_settings = original
     assert seen["model"] == "gpt-6-sol"
     assert [(a.name, a.assetType) for a in result.assets] == [("Servers", "Server infrastructure")]
     assert [a.name for a in rejected] == ["Customer DB"]
     assert "- Equipment, machines" in seen["prompt"] and "Name: Northwind" in seen["prompt"]
+    assert 'language of the user\'s message: "Vytvor aktivum pre servery"' in seen["prompt"]
 
 
 def test_agent_llm_calls_tools_on_gpt6():
