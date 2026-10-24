@@ -371,7 +371,8 @@ def test_gpt6_models_are_reasoning_models():
     built = []
     settings = SimpleNamespace(
         wizard=SimpleNamespace(default_model="gpt-6.1-sol", allowed_models=["gpt-6.1-sol", "gpt-4.1"],
-                               reasoning_effort="medium", temperature=0.2, llm_timeout_sec=60),
+                               reasoning_effort="medium", reasoning_effort_by_model={}, temperature=0.2,
+                               llm_timeout_sec=60),
         llm=SimpleNamespace(provider="azure", azure_endpoint="https://example.invalid/", api_key="test",
                             azure_api_version="2025-03-01-preview"),
     )
@@ -385,3 +386,45 @@ def test_gpt6_models_are_reasoning_models():
         wizard_client.get_settings, wizard_client.ThrottledAzureChatOpenAI = original
     assert built[0].get("reasoning_effort") == "medium" and "temperature" not in built[0], built[0]
     assert built[1].get("temperature") == 0.2 and "reasoning_effort" not in built[1], built[1]
+
+
+def test_reasoning_effort_per_model():
+    """A model in WIZARD__REASONING_EFFORT_BY_MODEL gets its own effort when the request names none; other
+    models get WIZARD__REASONING_EFFORT, and the request body wins over both. Needs workshops_ai importable,
+    like the redaction tests.
+    """
+    try:
+        from workshops_ai import settings as settings_mod
+        from workshops_ai.llm import wizard_client
+    except Exception:  # pragma: no cover - application not importable here
+        return
+
+    key = "WORKSHOPS_AI_WIZARD__REASONING_EFFORT_BY_MODEL"
+    saved = os.environ.get(key)
+    os.environ[key] = '{"gpt-6-luna": "high"}'
+    try:
+        assert settings_mod.AppSettings().wizard.reasoning_effort_by_model == {"gpt-6-luna": "high"}
+    finally:
+        if saved is None:
+            del os.environ[key]
+        else:
+            os.environ[key] = saved
+
+    built = []
+    settings = SimpleNamespace(
+        wizard=SimpleNamespace(default_model="gpt-6-sol", allowed_models=["gpt-6-sol", "gpt-6-luna"],
+                               reasoning_effort="medium", reasoning_effort_by_model={"gpt-6-luna": "high"},
+                               temperature=0.2, llm_timeout_sec=60),
+        llm=SimpleNamespace(provider="azure", azure_endpoint="https://example.invalid/", api_key="test",
+                            azure_api_version="2025-03-01-preview"),
+    )
+    original = wizard_client.get_settings, wizard_client.ThrottledAzureChatOpenAI
+    wizard_client.get_settings = lambda: settings
+    wizard_client.ThrottledAzureChatOpenAI = lambda **kwargs: built.append(kwargs)
+    try:
+        wizard_client.create_wizard_llm_client(model="gpt-6-luna")
+        wizard_client.create_wizard_llm_client(model="gpt-6-sol")
+        wizard_client.create_wizard_llm_client(model="gpt-6-luna", reasoning_effort="low")
+    finally:
+        wizard_client.get_settings, wizard_client.ThrottledAzureChatOpenAI = original
+    assert [b.get("reasoning_effort") for b in built] == ["high", "medium", "low"], built

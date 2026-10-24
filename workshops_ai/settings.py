@@ -397,6 +397,13 @@ class WizardSettings(BaseModel):
             "'low', 'medium', 'high' (universal). Set to None to omit parameter (model default)."
         )
     )
+    reasoning_effort_by_model: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Reasoning effort per model, used when the request body names none; models not listed use "
+            "reasoning_effort. E.g. {\"gpt-6-luna\": \"high\"}."
+        )
+    )
     allowed_models: list[str] = Field(
         default_factory=lambda: [
             "gpt-5",

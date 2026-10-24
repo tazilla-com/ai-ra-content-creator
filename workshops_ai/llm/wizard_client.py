@@ -19,7 +19,8 @@ def create_wizard_llm_client(
         model: Model name (ak None, použije sa default z settings)
         response_format: OpenAI structured outputs schema (optional)
         reasoning_effort: Override reasoning effort for this call. Cascade: body > env > code default.
-            If None, falls back to settings.wizard.reasoning_effort.
+            If None, falls back to settings.wizard.reasoning_effort_by_model for the model, then to
+            settings.wizard.reasoning_effort.
 
     Returns:
         ThrottledChatOpenAI instance
@@ -34,10 +35,10 @@ def create_wizard_llm_client(
     if resolved_model not in settings.wizard.allowed_models:
         raise ModelNotAllowedError(resolved_model, settings.wizard.allowed_models)
 
-    # Cascade: body param > env/settings > None
+    # Cascade: body param > per-model env/settings > env/settings > None
     resolved_reasoning_effort = (
         reasoning_effort if reasoning_effort is not None
-        else settings.wizard.reasoning_effort
+        else settings.wizard.reasoning_effort_by_model.get(resolved_model, settings.wizard.reasoning_effort)
     )
 
     # Reasoning models (gpt-5*, gpt-6*, o1*, o3*, o4*) don't support temperature parameter
