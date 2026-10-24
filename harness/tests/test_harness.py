@@ -76,6 +76,24 @@ def test_verify_agent_flags_unknown_tools():
     assert any(c["name"] == "only_known_non_writing_tools" and not c["passed"] for c in checks)
 
 
+def test_verify_agent_fails_without_proposal():
+    # 2026-10-13: a create request answered with a reply and 0 assets passed every check
+    class FakeAIMsg:
+        content = "Please give me your company's website URL."
+    result = {"generated_assets": [], "deleted_asset_names": [], "messages": [FakeAIMsg()], "error": None}
+    checks = verify.verify_agent(result)
+    assert any(c["name"] == "produced_proposal" and not c["passed"] for c in checks)
+
+    # a question asks no change: no proposal is required
+    checks = verify.verify_agent(result, expect_proposal=False)
+    assert all(c["passed"] for c in checks)
+    assert not any(c["name"] == "produced_proposal" for c in checks)
+
+    result["deleted_asset_names"] = ["Old wiki"]
+    checks = verify.verify_agent(result)
+    assert all(c["passed"] for c in checks)
+
+
 # --- config summary redaction ------------------------------------------------
 
 def test_config_summary_excludes_secrets():

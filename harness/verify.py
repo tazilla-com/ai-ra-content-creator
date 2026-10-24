@@ -132,12 +132,13 @@ def verify_controls(asset_controls: list, catalog_control_names: set | None = No
     return checks
 
 
-def verify_agent(result: dict) -> list[dict]:
+def verify_agent(result: dict, expect_proposal: bool = True) -> list[dict]:
     """User-validation / human-in-the-loop checks.
 
     The agent returns *proposals* (generated assets / RFC 6902 patches); it has no
-    write path to the Tazilla system of record. We assert it produced a response,
-    did not error, and used only known, non-writing tools.
+    write path to the Tazilla system of record. We assert it did not error, used
+    only known, non-writing tools, and — for a message that asks for a change —
+    proposed at least one asset or deletion. A reply without a proposal fails.
     """
     generated = result.get("generated_assets") or []
     deleted = result.get("deleted_asset_names") or []
@@ -149,20 +150,15 @@ def verify_agent(result: dict) -> list[dict]:
     ]
     tool_names = [t for t in tool_names if t]
     only_known = all(t in _AGENT_TOOLS for t in tool_names)
-    return [
-        check("no_error", not error, str(error) if error else ""),
-        check(
+    checks = [check("no_error", not error, str(error) if error else "")]
+    if expect_proposal:
+        checks.append(check(
             "produced_proposal",
-            bool(generated or deleted or result.get("messages")),
+            bool(generated or deleted),
             f"{len(generated)} proposed asset(s), {len(deleted)} to delete",
-        ),
-        check("only_known_non_writing_tools", only_known, f"tools={tool_names}"),
-        check(
-            "no_system_of_record_write",
-            True,
-            "agent has no Tazilla write path; changes are proposals applied by the client",
-        ),
-    ]
+        ))
+    checks.append(check("only_known_non_writing_tools", only_known, f"tools={tool_names}"))
+    return checks
 
 
 def summarize(checks: list[dict]) -> tuple[int, int]:

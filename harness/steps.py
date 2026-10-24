@@ -208,6 +208,7 @@ async def run_agent(
     input_assets: Optional[list] = None,
     workshop_id: str = "assets",
     session_id: Optional[str] = None,
+    expect_proposal: bool = True,
 ) -> dict:
     """Drive the Asset-workshop agent and assert human-in-the-loop invariants."""
     from workshops_ai.graph.assets.agent import invoke_asset_agent
@@ -239,18 +240,22 @@ async def run_agent(
             valid_asset_types=valid_types,
             model=model,
         )
-        checks = verify.verify_agent(result)
+        checks = verify.verify_agent(result, expect_proposal=expect_proposal)
         passed, total = verify.summarize(checks)
         tool_names = [
             getattr(m, "name", None)
             for m in result.get("messages", [])
             if type(m).__name__ == "ToolMessage"
         ]
+        messages = result.get("messages") or []
+        reply = getattr(messages[-1], "content", "") if messages else ""
         return {
             "kind": "agent",
             "status": "ok" if not result.get("error") else "error",
             "duration_sec": round(time.time() - started, 3),
             "message": message,
+            # the agent's final text, so a run without a proposal shows why (it may quote scraped website text)
+            "reply": str(reply)[:2000],
             "generated_assets": _dump_list(result.get("generated_assets"), limit=10),
             "deleted_asset_names": result.get("deleted_asset_names") or [],
             "tools_used": [t for t in tool_names if t],

@@ -126,7 +126,7 @@ by appending your own command:
 # Full wizard chain only, verified, 2 reps
 docker compose ... run --rm harness python -m harness.runner chain --reps 2
 
-# Drive the agent; asserts it PROPOSES changes and never writes to Tazilla
+# Drive the agent; asserts it PROPOSES changes and calls only known non-writing tools
 docker compose ... run --rm harness python -m harness.runner agent \
   --message "Create an asset for the customer database and set confidentiality to PROTECTED."
 
@@ -178,6 +178,7 @@ Per-run CLI flags (see `--help` on any subcommand):
 | `--max-services` / `--max-assets` / `--max-controls` | 3 / 5 / 5 | chain, evidence |
 | `--reps` | 1 | chain, evidence |
 | `--message` | a create request | agent |
+| `--no-expect-proposal` | a proposal is required | agent: for a message that asks no change |
 | `--kind` | — (`timeout` \| `token_limit`) | fault |
 | `--records` | — | report |
 
@@ -191,7 +192,7 @@ Each category of the testing/deployment appendix, and how the harness produces i
 | Malformed output | guarded by structured outputs; the representative differential (a fixed production incident) is the project `CHANGELOG.md` 67%→0% result — reproducing malformed output live is non-deterministic and is not forced |
 | Timeout / provider error | `fault --kind timeout` induces a real 1s-timeout failure and asserts it surfaces cleanly |
 | Retry / fallback | `fault --kind token_limit` triggers a real `RequestTooLargeError` → asserts the recursive batch-split recovers |
-| User validation | the agent run asserts it returns **proposals** (patches / generated assets), uses only known non-writing tools, and has **no** write path to the Tazilla system of record |
+| User validation | the agent run asserts it returns **proposals** (generated assets / deletions; a reply without one fails) and uses only known non-writing tools. That it has **no** write path to the Tazilla system of record is a property of its tools (`workshops_ai/graph/assets/tools/`), not a runtime check |
 | Release to production | `release_evidence.py` captures source revision, container health, image identity, and `/health` (status / version / environment) |
 
 ## Output

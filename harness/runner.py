@@ -111,7 +111,9 @@ async def cmd_agent(args) -> int:
     preflight = preflight_catalog(settings)
     from harness import steps
 
-    agent = await steps.run_agent(message=args.message, model=args.model)
+    agent = await steps.run_agent(
+        message=args.message, model=args.model, expect_proposal=args.expect_proposal,
+    )
     records = _base_records(settings, preflight, 1)
     records["agent"] = agent
     out_dir = _run_dir("agent")
@@ -260,6 +262,8 @@ def main() -> int:
     ag = sub.add_parser("agent", help="drive the agent")
     _add_common(ag)
     ag.add_argument("--message", default="Create an asset for the customer shipment-tracking database and set its confidentiality to PROTECTED.")
+    ag.add_argument("--no-expect-proposal", action="store_false", dest="expect_proposal",
+                    help="the message asks no change (a question): do not require a proposal")
     ag.set_defaults(func=cmd_agent, is_async=True)
 
     fa = sub.add_parser("fault", help="induce a real fault")
