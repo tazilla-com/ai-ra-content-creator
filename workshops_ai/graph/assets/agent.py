@@ -10,7 +10,6 @@ from langgraph.prebuilt import create_react_agent
 
 from workshops_ai.graph.assets.state import AgentState
 from workshops_ai.graph.assets.tools import (
-    lookup_knowledge,
     scrape_company_info,
     list_assets,
     list_services,
@@ -23,6 +22,22 @@ from workshops_ai.settings import get_settings
 from workshops_ai.llm.langfuse_helper import get_langfuse_callback_handler
 
 logger = logging.getLogger(__name__)
+
+
+def _agent_llm(settings, model_override: str | None = None):
+    """The agent's chat model, able to call function tools.
+
+    GPT-6 on chat completions refuses function tools with reasoning: HTTP 400, "Function tools with
+    reasoning_effort are not supported for this model in /v1/chat/completions. To use function tools, use
+    /v1/responses or set reasoning_effort to 'none'." Measured on gpt-6-sol and gpt-6-luna, 2026-10-24.
+    """
+    llm = make_llm_client_from_settings(
+        settings,
+        override_model=model_override
+    )
+    if (model_override or settings.llm.model).startswith("gpt-6"):
+        llm.reasoning_effort = "none"
+    return llm
 
 
 def create_asset_agent(
@@ -41,13 +56,10 @@ def create_asset_agent(
     """
     settings = get_settings()
 
-    llm = make_llm_client_from_settings(
-        settings,
-        override_model=model_override
-    )
+    llm = _agent_llm(settings, model_override)
 
+    # lookup_knowledge is left out: its search_rag is a stub that always finds nothing
     tools = [
-        lookup_knowledge,
         scrape_company_info,
         list_assets,
         list_services,
@@ -62,15 +74,21 @@ def create_asset_agent(
         from langgraph.checkpoint.memory import MemorySaver
         checkpointer = MemorySaver()
 
-    from workshops_ai.graph.assets.prompts import get_agent_system_prompt
+    from langchain_core.messages import SystemMessage
+    from workshops_ai.graph.assets.prompts import build_system_prompt, get_agent_system_prompt
 
     prompt_data = get_agent_system_prompt()
+    base_prompt = prompt_data["prompt_text"]
+
+    def prompt_with_session_context(state):
+        # The hosted prompt, plus what the session knows and no tool shows: asset types, services, selection
+        return [SystemMessage(content=build_system_prompt(state, base_prompt))] + list(state["messages"])
 
     agent = create_react_agent(
         model=llm,
         tools=tools,
         state_schema=AgentState,
-        prompt=prompt_data["prompt_text"],
+        prompt=prompt_with_session_context,
         checkpointer=checkpointer,
     )
 
@@ -98,6 +116,7 @@ async def invoke_asset_agent(
     conversation_history: list[dict] | None = None,
     model: str | None = None,
     checkpointer = None,
+    organization: dict | None = None,
 ):
     """
     Invoke asset agent with message.
@@ -113,6 +132,7 @@ async def invoke_asset_agent(
         conversation_history: Previous conversation messages
         model: Optional model override
         checkpointer: Optional checkpointer (defaults to MemorySaver)
+        organization: Organization from the payload or the session (api.schema Organization fields)
 
     Returns:
         Agent state with generated_assets, tools_used, messages, etc.
@@ -159,14 +179,14 @@ async def invoke_asset_agent(
 
     initial_state: AgentState = {
         "messages": messages,
-        # organization retrieved via scrape_company_info tool from wizard_metadata.website_content
+        "organization": organization or {},
         "input_assets": input_assets or [],
         "selected_assets": selected_assets or [],
         "valid_asset_types": valid_asset_types or [],
         "services": services or [],
         "recent_operations": recent_operations or [],
         "user_message": message,
-        "model": model or "gpt-4o",
+        "model": model or get_settings().llm.model,
         "session_id": session_id,
         "workshop_id": workshop_id,
         "generated_assets": [],
@@ -225,7 +245,10 @@ async def invoke_asset_agent(
 
     langfuse_client = get_langfuse_client()
 
-    # Try to set up Langfuse tracing with explicit span for separate traces
+    # Try to set up Langfuse tracing with explicit span for separate traces. A tracing failure before the agent
+    # starts runs it untraced; a failure of the agent itself is raised, not run a second time
+    result = None
+    started = False
     if langfuse_client:
         try:
             # For langfuse 3.x with LangChain integration
@@ -260,6 +283,7 @@ async def invoke_asset_agent(
                         }
                     )
 
+                    started = True
                     result = await agent.ainvoke(initial_state, config=config)
 
                     # KĽÚČOVÉ: update_trace() PO invoke prepíše CallbackHandler hodnoty
@@ -278,9 +302,11 @@ async def invoke_asset_agent(
 
                     logger.info("Updated trace with custom input/output")
         except Exception as e:
+            if started and result is None:
+                raise
             logger.warning(f"Failed to create Langfuse handler: {e}")
-            result = await agent.ainvoke(initial_state, config=config)
-    else:
+    if result is None:
+        config.pop("callbacks", None)
         result = await agent.ainvoke(initial_state, config=config)
 
     logger.info(

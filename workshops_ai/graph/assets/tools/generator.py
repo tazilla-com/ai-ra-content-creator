@@ -80,21 +80,26 @@ def generate_assets_with_structured_output(
     existing_assets: list[dict],
     valid_types: list[str],
     services: list[dict] | None = None,
-) -> CreateAssetsOutput:
+    model: str | None = None,
+    user_message: str | None = None,
+) -> tuple[CreateAssetsOutput, list[GeneratedAsset]]:
     """
     Use structured output to generate validated asset output.
 
     Args:
         description: What assets to create
-        organization: Company context
+        organization: Company context (api.schema Organization fields)
         existing_assets: Current assets (avoid duplicates)
         valid_types: Valid asset type values
+        services: Business services from the wizard
+        model: The model of the request; the configured default when None
+        user_message: The user's message, whose language the assets take
 
     Returns:
-        CreateAssetsOutput with generated assets
+        CreateAssetsOutput with the assets whose type is in the catalog, and the assets left out for their type
     """
     settings = get_settings()
-    llm = make_llm_client_from_settings(settings)
+    llm = make_llm_client_from_settings(settings, override_model=model)
 
     llm_with_structure = llm.with_structured_output(CreateAssetsOutput)
 
@@ -105,67 +110,74 @@ def generate_assets_with_structured_output(
         services_text = (
             "\nBusiness services this organization provides:\n"
             + "\n".join(f"- {name}" for name in service_names)
-            + "\n\nUse these services as context when creating assets - assets should support these business services.\n"
+            + "\n"
         )
 
+    # The fields of api.schema Organization; the payload carries no industry or size
+    organization = organization or {}
+    org_lines = [
+        f"- {label}: {organization[key]}"
+        for key, label in (("organizationName", "Name"), ("legalForm", "Legal form"),
+                           ("country", "Country"), ("numberOfEmployees", "Employees"))
+        if organization.get(key)
+    ]
+    organization_text = ("\nOrganization:\n" + "\n".join(org_lines) + "\n") if org_lines else ""
+
+    existing_names = [a.get("name") for a in existing_assets if a.get("name")]
+    # The agent may write the description in another language than the user's; the user's message decides
+    language_hint = f': "{user_message[:300]}"' if user_message else " (the language of the description)"
+
+    # One type per line: a type name may contain a comma ("Equipment, machines")
     prompt = f"""
-Generate assets based on this description:
+Create exactly the assets described below, no more and no fewer.
+
+Description:
 {description}
+{organization_text}{services_text}
+Asset types in Tazilla's catalogue; give each asset exactly one of these names:
+{chr(10).join(f"- {t}" for t in valid_types)}
 
-Organization context:
-- Industry: {organization.get('industry', 'Unknown')}
-- Size: {organization.get('size', 'Unknown')}
-- Name: {organization.get('name', 'Unknown')}
-{services_text}
-Valid asset types (use ONLY these - always in English):
-{', '.join(valid_types)}
+Existing assets, which must not be created again:
+{chr(10).join(f"- {n}" for n in existing_names) or "- none"}
 
-Existing assets (avoid duplicates):
-{[a.get('name') for a in existing_assets]}
-
-CRITICAL: Create EXACTLY the assets mentioned in the description — no more, no less.
-- Include BOTH primary assets (with CIA) AND supporting assets (with CIA = null) if described
-- If description mentions "servers as supporting infrastructure", create them as isPrimary=false
-- Do NOT invent extra assets beyond what the description lists
-
-CIA Classification Rules:
-- **If description includes specific CIA values** (e.g., "with PROTECTED confidentiality, HIGH integrity"):
-  → Use EXACTLY those values, do NOT change them!
-- **If description doesn't specify CIA values**:
-  → Infer appropriate values from organization context and asset description
-
-LOCALIZATION RULES (CRITICAL):
-1. **LOCALIZE these fields** in the same language as the description (Slovak/Czech/English):
-   - name: Asset name
-   - description: Asset description
-   - reasoning: Explanation for CIA classification
-
-2. **NEVER translate these fields** (always English):
-   - confidentiality: PUBLIC, INTERNAL, PROTECTED, STRICTLY_PROTECTED
-   - integrity: LOW, MEDIUM, HIGH
-   - availability: LOW, MEDIUM, HIGH
-   - assetType: Must be exactly from valid_asset_types list above
-
-3. **id field**: Always null (backend generates UUID after save)
-
-Requirements:
-- Every PRIMARY asset MUST have CIA classification
-- For supporting assets (isPrimary=false): set CIA to null
-- Include localized reasoning for each classification
-- Use appropriate asset type from the list (in English)
+Rules:
+- Primary assets (isPrimary true) are information together with the business activity that uses it; each has
+  confidentiality, integrity and availability. Supporting assets (isPrimary false) are what primary assets run on
+  or depend on, such as systems, applications, servers, networks, devices, premises or staff; their CIA values
+  are null. A primary asset takes the type for electronic data with its business process, or the one for paper data.
+- Use the CIA values the description gives exactly. Infer the missing ones from what the asset holds and what
+  its loss would cause.
+- Write name, description, reasoning and summary in the language of the user's message{language_hint}. Keep the
+  CIA values and the asset type names exactly as listed.
+- id is null.
 """
 
     logger.info(
         "Generating assets with structured output",
         extra={
             "description_length": len(description),
-            "organization_industry": organization.get("industry"),
+            "organization_name": organization.get("organizationName"),
             "valid_types_count": len(valid_types),
             "existing_assets_count": len(existing_assets)
         }
     )
 
     result: CreateAssetsOutput = llm_with_structure.invoke(prompt)
+
+    # The type must be a catalog name: matched without regard to case and surrounding spaces, and given the
+    # catalog's own spelling; an asset with another type is left out and reported to the agent
+    catalog_types = {t.strip().casefold(): t for t in valid_types}
+    accepted: list[GeneratedAsset] = []
+    rejected: list[GeneratedAsset] = []
+    for asset in result.assets:
+        asset_type = catalog_types.get((asset.assetType or "").strip().casefold())
+        if asset_type is None:
+            logger.warning(f"Asset '{asset.name}' has type '{asset.assetType}', not in the catalog; left out")
+            rejected.append(asset)
+            continue
+        asset.assetType = asset_type
+        accepted.append(asset)
+    result.assets = accepted
 
     # Post-processing: enforce CIA rules
     for asset in result.assets:
@@ -201,7 +213,7 @@ Requirements:
 
     logger.info(
         "Assets generated",
-        extra={"assets_count": len(result.assets)}
+        extra={"assets_count": len(result.assets), "rejected_count": len(rejected)}
     )
 
-    return result
+    return result, rejected

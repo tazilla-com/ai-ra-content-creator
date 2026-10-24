@@ -271,6 +271,8 @@ async def handle_chat(
         input_assets = initial_state.get("input_assets", [])
         logger.info(f"Invoking agent: {len(input_assets)} assets, {len(conversation_history)} history msgs")
 
+        # The payload's organization, else the one the wizard saved in the session
+        organization = chat_payload.organization or session.organization
         task = asyncio.create_task(invoke_asset_agent(
             message=chat_payload.message,
             session_id=session.session_id,
@@ -282,6 +284,7 @@ async def handle_chat(
             recent_operations=initial_state.get("recent_operations"),
             conversation_history=conversation_history,
             model=chat_payload.model,
+            organization=organization.model_dump() if organization else None,
         ))
         _running_tasks[session.session_id] = task
         try:

@@ -76,6 +76,24 @@ def test_verify_agent_flags_unknown_tools():
     assert any(c["name"] == "only_known_non_writing_tools" and not c["passed"] for c in checks)
 
 
+def test_verify_agent_fails_without_proposal():
+    # 2026-10-13: a create request answered with a reply and 0 assets passed every check
+    class FakeAIMsg:
+        content = "Please give me your company's website URL."
+    result = {"generated_assets": [], "deleted_asset_names": [], "messages": [FakeAIMsg()], "error": None}
+    checks = verify.verify_agent(result)
+    assert any(c["name"] == "produced_proposal" and not c["passed"] for c in checks)
+
+    # a question asks no change: no proposal is required
+    checks = verify.verify_agent(result, expect_proposal=False)
+    assert all(c["passed"] for c in checks)
+    assert not any(c["name"] == "produced_proposal" for c in checks)
+
+    result["deleted_asset_names"] = ["Old wiki"]
+    checks = verify.verify_agent(result)
+    assert all(c["passed"] for c in checks)
+
+
 # --- config summary redaction ------------------------------------------------
 
 def test_config_summary_excludes_secrets():
@@ -428,3 +446,243 @@ def test_reasoning_effort_per_model():
     finally:
         wizard_client.get_settings, wizard_client.ThrottledAzureChatOpenAI = original
     assert [b.get("reasoning_effort") for b in built] == ["high", "medium", "low"], built
+
+
+# --- prompts from files (harness/prompt_override.py) ---------------------------------------------
+
+def test_prompts_from_files():
+    """A prompt with a file under --prompts-dir is converted as a fetched one; others reach Langfuse.
+
+    Needs workshops_ai and the Langfuse SDK importable, like the redaction tests.
+    """
+    try:
+        import langfuse.model  # noqa: F401
+        from workshops_ai.llm import langfuse_helper
+        from harness import prompt_override
+    except Exception:  # pragma: no cover - application not importable here
+        return
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _check_prompts_from_files(Path(tmp), langfuse_helper, prompt_override)
+
+
+def _check_prompts_from_files(tmp_path, langfuse_helper, prompt_override):
+    (tmp_path / "wizard").mkdir()
+    (tmp_path / "wizard" / "x.json").write_text(json.dumps({"type": "chat", "prompt": [
+        {"role": "system", "content": 'Rules. Output like {"name": "..."}.'},
+        {"role": "user", "content": "Company: {{organization}}"},
+    ]}), encoding="utf-8")
+    (tmp_path / "helper").mkdir()
+    (tmp_path / "helper" / "t.json").write_text(json.dumps({"type": "text", "prompt": "Search {{q}}"}),
+                                                encoding="utf-8")
+
+    asked = []
+
+    class Inner:
+        def get_prompt(self, name, **kwargs):
+            asked.append(name)
+            raise RuntimeError("not in Langfuse")
+
+        def flush(self):
+            return "flushed"
+
+    saved = langfuse_helper._langfuse_client, dict(prompt_override._served)
+    langfuse_helper._langfuse_client = Inner()
+    try:
+        assert sorted(prompt_override.install(tmp_path)) == ["helper/t", "wizard/x"]
+        chat = langfuse_helper.get_langchain_prompt_from_langfuse("wizard/x", label="development")
+        assert chat.input_variables == ["organization"], chat.input_variables
+        assert "Company: ACME" in chat.format(organization="ACME")
+        text = langfuse_helper.get_text_prompt_from_langfuse("helper/t", label="development")
+        assert text["prompt_source"] == "langfuse" and text["prompt_text"] == "Search {q}", text
+        assert langfuse_helper.get_langchain_prompt_from_langfuse("wizard/other") is None
+        assert asked == ["wizard/other"] and langfuse_helper.get_langfuse_client().flush() == "flushed"
+    finally:
+        langfuse_helper._langfuse_client = saved[0]
+        prompt_override._served.clear()
+        prompt_override._served.update(saved[1])
+
+
+# --- fallbacks and the asset agent (regressions found 2026-10-24, task 009) -------------------------------------
+
+def _calls(path, name):
+    import ast
+
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and getattr(n.func, "attr", getattr(n.func, "id", None)) == name]
+
+
+def test_fallback_calls_pass_what_their_callees_need():
+    """Static: each wizard fallback passes the arguments its callee or the hosted prompt needs.
+
+    Regressions: controls fallback copy 2 never passed controls_per_asset_json (KeyError, every asset without
+    controls); the risks fallback passed max_threats, which _select_relevant_threats does not take (TypeError,
+    every asset without risks); the impacts context split left out impacts_with_desc (TypeError), and its timeout
+    handler built AITimeoutError with arguments the class does not take.
+    """
+    base = Path(__file__).resolve().parents[2] / "workshops_ai" / "wizard"
+    for call in _calls(base / "control_generator.py", "format_messages"):
+        names = {k.arg for k in call.keywords}
+        if None not in names:  # **kwargs passes through what the caller gave
+            assert "controls_per_asset_json" in names, call.lineno
+    for call in _calls(base / "risk_generator.py", "_select_relevant_threats"):
+        assert "max_threats" not in {k.arg for k in call.keywords}, call.lineno
+    for call in _calls(base / "impact_generator.py", "_process_batch_with_recursive_splitting"):
+        assert "impacts_with_desc" in {k.arg for k in call.keywords}, call.lineno
+    for module in ("asset", "service", "impact", "risk", "control"):
+        for call in _calls(base / f"{module}_generator.py", "AITimeoutError"):
+            assert not call.args and {k.arg for k in call.keywords} == {"timeout_sec", "model"}, (module, call.lineno)
+
+
+def test_asset_limit_keeps_previous_assets():
+    """max_assets limits the new assets only. Regression: the cut ran over the whole list, previous assets first.
+
+    Needs workshops_ai importable, like the redaction tests.
+    """
+    try:
+        from uuid import uuid4
+        from workshops_ai.api.schema.asset import Asset
+        from workshops_ai.wizard.asset_generator import AssetGenerator
+    except Exception:  # pragma: no cover - application not importable here
+        return
+
+    def asset(name, with_id=True):
+        return Asset(id=uuid4() if with_id else None, name=name, assetType="Other", isPrimary=False)
+
+    previous = [asset("P1"), asset("P2"), asset("P3", with_id=False)]
+    returned = previous + [asset("N1", False), asset("N2", False), asset("N3", False)]
+    kept = AssetGenerator._limit_new_assets(returned, previous, max_assets=2)
+    assert [a.name for a in kept] == ["P1", "P2", "P3", "N1", "N2"], [a.name for a in kept]
+    assert [a.name for a in AssetGenerator._limit_new_assets(returned[3:], None, 1)] == ["N1"]
+
+
+def test_controls_fallback_keeps_catalog_id():
+    """A control from the per-asset fallback keeps its catalog id; a null id means a new catalog entry to the API.
+
+    Needs workshops_ai importable, like the redaction tests.
+    """
+    try:
+        from uuid import uuid4
+        from workshops_ai.api.schema.control import PlannedControl
+        from workshops_ai.wizard.control_generator import ControlGenerator
+    except Exception:  # pragma: no cover - application not importable here
+        return
+
+    catalog_id = uuid4()
+    catalog = [PlannedControl(id=catalog_id, name="Information backup", category="Operations security")]
+    relevant = [{"name": "Information backup", "description": "", "category": "Operations security",
+                 "risk_coverage": {"Data loss": 60}}]
+    generator = ControlGenerator.__new__(ControlGenerator)
+    generator.model_name = "test"
+    controls = generator._parse_and_validate_controls(
+        response_text=json.dumps({"controls": [{"name": "Information backup"}]}),
+        allowed_control_names=["Information backup"],
+        asset_risk_threats=["Data loss"],
+        relevant_controls=relevant,
+        catalog_controls=catalog,
+    )
+    assert [c.id for c in controls] == [catalog_id], controls
+
+
+def test_asset_tools_answer_and_do_not_end_the_turn():
+    """The agent's tools answer every call with a ToolMessage, keep a correctable mistake out of the state's error,
+    which ends the whole turn in AGENT_ERROR, and show the user's selection.
+
+    Needs workshops_ai importable, like the redaction tests.
+    """
+    try:
+        from workshops_ai.graph.assets.tools.assets import create_assets, list_assets, update_assets
+    except Exception:  # pragma: no cover - application not importable here
+        return
+
+    state = {"input_assets": [{"id": "a1", "name": "Customer records", "assetType": "Other", "isPrimary": True}],
+             "selected_assets": [{"id": "a1", "name": "Customer records"}],
+             "valid_asset_types": ["Other"]}
+    cmd = update_assets.func(asset_names=["Customer records"], confidentiality="HIGH", tool_call_id="t1", state=state)
+    assert "error" not in cmd.update and cmd.update["messages"][0].tool_call_id == "t1", cmd.update
+    cmd = update_assets.func(asset_names=["Unknown"], integrity="HIGH", tool_call_id="t2", state=state)
+    assert "error" not in cmd.update, cmd.update
+    cmd = create_assets.func(description="1. Customer records", tool_call_id="t3", state={"valid_asset_types": []})
+    assert cmd.update["messages"][0].tool_call_id == "t3", cmd.update
+    cmd = list_assets.func(tool_call_id="t4", state=state)
+    assert "Selected by the user: yes" in cmd.update["messages"][0].content
+
+
+def test_agent_prompt_carries_session_context():
+    """The agent's system prompt names the catalog's asset types, the services and the selection, which no tool
+    showed it. Needs workshops_ai importable, like the redaction tests.
+    """
+    try:
+        from workshops_ai.graph.assets.prompts import build_system_prompt
+    except Exception:  # pragma: no cover - application not importable here
+        return
+
+    text = build_system_prompt({"valid_asset_types": ["Equipment, machines", "Other"],
+                                "services": [{"name": "Freight forwarding"}],
+                                "organization": {"organizationName": "Northwind", "country": "SK"},
+                                "selected_assets": [{"name": "Customer records"}]}, "BASE")
+    assert text.startswith("BASE") and "Equipment, machines; Other" in text, text
+    assert "Freight forwarding" in text and "Northwind" in text and "Customer records" in text, text
+    assert build_system_prompt({}, "BASE") == "BASE"
+
+
+def test_agent_asset_types_matched_to_the_catalog():
+    """create_assets' generation runs on the request's model and keeps an asset only with a catalog type, matched
+    without regard to case and spaces; the others are reported. Needs workshops_ai importable, like the redaction
+    tests.
+    """
+    try:
+        from workshops_ai.graph.assets.tools import generator
+    except Exception:  # pragma: no cover - application not importable here
+        return
+
+    seen = {}
+
+    class FakeLLM:
+        def with_structured_output(self, schema):
+            return self
+
+        def invoke(self, prompt):
+            seen["prompt"] = prompt
+            return generator.CreateAssetsOutput(summary="s", assets=[
+                generator.GeneratedAsset(name="Servers", assetType=" server infrastructure", isPrimary=False,
+                                         reasoning="r"),
+                generator.GeneratedAsset(name="Customer DB", assetType="Database", isPrimary=True, reasoning="r"),
+            ])
+
+    original = generator.make_llm_client_from_settings
+    generator.make_llm_client_from_settings = lambda settings, override_model=None: (
+        seen.setdefault("model", override_model), FakeLLM())[1]
+    try:
+        result, rejected = generator.generate_assets_with_structured_output(
+            description="1. Servers", organization={"organizationName": "Northwind"}, existing_assets=[],
+            valid_types=["Server infrastructure", "Equipment, machines"], model="gpt-6-sol",
+            user_message="Vytvor aktivum pre servery")
+    finally:
+        generator.make_llm_client_from_settings = original
+    assert seen["model"] == "gpt-6-sol"
+    assert [(a.name, a.assetType) for a in result.assets] == [("Servers", "Server infrastructure")]
+    assert [a.name for a in rejected] == ["Customer DB"]
+    assert "- Equipment, machines" in seen["prompt"] and "Name: Northwind" in seen["prompt"]
+    assert 'language of the user\'s message: "Vytvor aktivum pre servery"' in seen["prompt"]
+
+
+def test_agent_llm_calls_tools_on_gpt6():
+    """The agent's client sends reasoning_effort none to GPT-6, which refuses function tools with reasoning on
+    chat completions (HTTP 400); other models keep their default. Needs workshops_ai importable, like the redaction
+    tests.
+    """
+    try:
+        from workshops_ai.graph.assets.agent import _agent_llm
+        from workshops_ai.settings import get_settings
+    except Exception:  # pragma: no cover - application not importable here
+        return
+
+    settings = get_settings()
+    if not settings.llm.api_key:  # pragma: no cover - no provider configured
+        return
+    assert _agent_llm(settings, "gpt-6-sol").reasoning_effort == "none"
+    assert _agent_llm(settings, "gpt-6-luna").reasoning_effort == "none"
+    assert _agent_llm(settings, "gpt-5.4-mini").reasoning_effort is None

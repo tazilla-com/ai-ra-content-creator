@@ -430,12 +430,16 @@ class ImpactGenerator:
         # Call LLM
         try:
             response = await batch_llm.ainvoke(messages, **invoke_kwargs)
-        except asyncio.TimeoutError as e:
-            raise AITimeoutError(
-                f"LLM timeout after {self.settings.wizard.llm_timeout_sec}s",
-                model=self.model_name,
-                timeout_sec=self.settings.wizard.llm_timeout_sec
-            ) from e
+        except Exception as e:
+            # asyncio's timeout or the provider's (OpenAI/httpx), as in the asset generator: the splitting
+            # below handles AITimeoutError, while any other exception ended the step with HTTP 500
+            error_msg = str(e).lower()
+            if isinstance(e, asyncio.TimeoutError) or "timeout" in error_msg or "timed out" in error_msg:
+                raise AITimeoutError(
+                    timeout_sec=self.settings.wizard.llm_timeout_sec,
+                    model=self.model_name
+                ) from e
+            raise
 
         # Extract response text
         response_text = response.content
@@ -811,6 +815,7 @@ class ImpactGenerator:
                     results1, tokens1_p, tokens1_c, text1 = await self._process_batch_with_recursive_splitting(
                         assets=first_half,
                         prompt=prompt,
+                        impacts_with_desc=impacts_with_desc,
                         ordered_catalog_names=ordered_catalog_names,
                         impacts_constraint=impacts_constraint,
                         language=language,
@@ -824,6 +829,7 @@ class ImpactGenerator:
                     results2, tokens2_p, tokens2_c, text2 = await self._process_batch_with_recursive_splitting(
                         assets=second_half,
                         prompt=prompt,
+                        impacts_with_desc=impacts_with_desc,
                         ordered_catalog_names=ordered_catalog_names,
                         impacts_constraint=impacts_constraint,
                         language=language,

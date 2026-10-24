@@ -208,6 +208,7 @@ async def run_agent(
     input_assets: Optional[list] = None,
     workshop_id: str = "assets",
     session_id: Optional[str] = None,
+    expect_proposal: bool = True,
 ) -> dict:
     """Drive the Asset-workshop agent and assert human-in-the-loop invariants."""
     from workshops_ai.graph.assets.agent import invoke_asset_agent
@@ -217,17 +218,13 @@ async def run_agent(
     session_id = session_id or new_session_id("agent")
     model = model or settings.llm.model
 
-    valid_types = None
-    try:
-        from workshops_ai.wizard.catalog_provider import get_catalog_provider
+    # The asset types as handle_chat loads them (routers/ws_router.py, _build_agent_state). The catalog provider has
+    # no get_catalog_names, so the earlier lookup failed silently and every run so far gave the agent no types.
+    from workshops_ai.wizard.prompt_context import PromptContextBuilder
 
-        provider = get_catalog_provider()
-        try:
-            valid_types = list(provider.get_catalog_names("asset_types", session_id=session_id))
-        except TypeError:
-            valid_types = list(provider.get_catalog_names("asset_types"))
-    except Exception:
-        valid_types = None
+    builder = PromptContextBuilder(session_id=session_id)
+    asset_types = await builder._get_cached_catalog("asset_types", builder.provider.load_asset_type_catalog)
+    valid_types = [at["name"] for at in asset_types]
 
     started = time.time()
     try:
@@ -239,18 +236,22 @@ async def run_agent(
             valid_asset_types=valid_types,
             model=model,
         )
-        checks = verify.verify_agent(result)
+        checks = verify.verify_agent(result, expect_proposal=expect_proposal)
         passed, total = verify.summarize(checks)
         tool_names = [
             getattr(m, "name", None)
             for m in result.get("messages", [])
             if type(m).__name__ == "ToolMessage"
         ]
+        messages = result.get("messages") or []
+        reply = getattr(messages[-1], "content", "") if messages else ""
         return {
             "kind": "agent",
             "status": "ok" if not result.get("error") else "error",
             "duration_sec": round(time.time() - started, 3),
             "message": message,
+            # the agent's final text, so a run without a proposal shows why (it may quote scraped website text)
+            "reply": str(reply)[:2000],
             "generated_assets": _dump_list(result.get("generated_assets"), limit=10),
             "deleted_asset_names": result.get("deleted_asset_names") or [],
             "tools_used": [t for t in tool_names if t],
