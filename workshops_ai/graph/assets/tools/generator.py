@@ -144,7 +144,7 @@ Rules:
 - Primary assets (isPrimary true) are information together with the business activity that uses it; each has
   confidentiality, integrity and availability. Supporting assets (isPrimary false) are what primary assets run on
   or depend on, such as systems, applications, servers, networks, devices, premises or staff; their CIA values
-  are null.
+  are null. A primary asset takes the type for electronic data with its business process, or the one for paper data.
 - Use the CIA values the description gives exactly. Infer the missing ones from what the asset holds and what
   its loss would cause.
 - Write name, description, reasoning and summary in the language of the user's message{language_hint}. Keep the
