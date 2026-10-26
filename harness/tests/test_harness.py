@@ -536,6 +536,42 @@ def test_fallback_calls_pass_what_their_callees_need():
             assert not call.args and {k.arg for k in call.keywords} == {"timeout_sec", "model"}, (module, call.lineno)
 
 
+def test_offline_prompts_take_what_the_code_passes():
+    """Static: each offline prompt that the code formats with str.format uses only the names that call passes.
+
+    The assets and services generators format their offline human template on every request, for the debug text
+    (_build_full_prompt_text), before Langfuse is asked: a name the call lacks raises KeyError, and every request
+    fails, with Langfuse up too. The web search formats its offline template when Langfuse is unavailable.
+    """
+    import ast
+    import re
+    import string
+
+    base = Path(__file__).resolve().parents[2] / "workshops_ai" / "wizard"
+    tree = ast.parse((base / "prompts.py").read_text(encoding="utf-8"))
+    prompts = {t.id: n.value.value for n in tree.body
+               if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)
+               for t in n.targets if isinstance(t, ast.Name)}
+
+    def fields(name):
+        return {f for _, f, _, _ in string.Formatter().parse(prompts[name]) if f}
+
+    def formats_of(path, receiver):
+        calls = [c for c in _calls(path, "format") if getattr(getattr(c.func, "value", None), "id", None) == receiver]
+        assert calls, (path.name, receiver)
+        return calls
+
+    for module, name, sections in (("asset_generator", "ASSETS_HUMAN_PROMPT_TEMPLATE", "asset_generator"),
+                                   ("service_generator", "SERVICES_HUMAN_PROMPT_TEMPLATE", "prompt_context")):
+        keys = set(re.findall(r'sections\["(\w+)"\]', (base / f"{sections}.py").read_text(encoding="utf-8")))
+        for call in formats_of(base / f"{module}.py", name):
+            passed = {k.arg for k in call.keywords if k.arg} | keys
+            assert fields(name) <= passed, (name, call.lineno, sorted(fields(name) - passed))
+    for call in formats_of(base / "web_search.py", "task_prompt_template"):
+        passed = {k.arg for k in call.keywords if k.arg}
+        assert fields("WEB_SEARCH_PROMPT_TEMPLATE") <= passed, sorted(fields("WEB_SEARCH_PROMPT_TEMPLATE") - passed)
+
+
 def test_asset_limit_keeps_previous_assets():
     """max_assets limits the new assets only. Regression: the cut ran over the whole list, previous assets first.
 
